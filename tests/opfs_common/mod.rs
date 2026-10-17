@@ -232,6 +232,26 @@ fn timer(ms: f64) -> JsFuture {
 	JsFuture::from(promise)
 }
 
+/// Waits `ms` milliseconds on the timer of the global scope. Other tasks of the worker run in
+/// the meantime, which is what a test needs to let a background task of the engine make progress.
+pub async fn sleep_ms(ms: f64) {
+	let _ = timer(ms).await;
+}
+
+/// Polls `condition` every few milliseconds until it holds, and fails the test with `what` if it
+/// does not within `limit_ms`. For things that a background task of the engine does (a flush, a
+/// compaction), which a test has to wait for and must not assume.
+pub async fn wait_until(what: &str, limit_ms: f64, mut condition: impl FnMut() -> bool) {
+	let started = js_sys::Date::now();
+	while !condition() {
+		assert!(
+			js_sys::Date::now() - started < limit_ms,
+			"{what}: did not happen within {limit_ms} ms"
+		);
+		sleep_ms(5.0).await;
+	}
+}
+
 /// Awaits `fut`, failing the test with a message if it takes longer than [`WATCHDOG_MS`].
 pub async fn watchdog<T>(what: &str, fut: impl Future<Output = T>) -> T {
 	tokio::select! {

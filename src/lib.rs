@@ -348,6 +348,28 @@ pub struct Options {
 	pub(crate) fs: Arc<dyn vfs::Fs>,
 }
 
+/// The sizes that `Options::default()` starts from. A native build has the memory of a server and
+/// these are the sizes it has always had. A browser worker is one thread in an address space of at
+/// most 4 GiB that the page and every other tab have a share of, with a flush and a compaction that
+/// each hold the worker for as long as they take (nothing else runs meanwhile), so its defaults are
+/// smaller: a memtable, a block cache and an output table of 16 MiB. The cache of a worker has
+/// four shards, and a shard admits an item of up to 97 percent of its share, which is about 4 MiB
+/// here, so a block of 64 KiB is admitted with room to spare. These are starting points and not
+/// measurements, and every one of them can be set.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod default_sizes {
+	pub(super) const MEMTABLE: usize = 100 * 1024 * 1024;
+	pub(super) const BLOCK_CACHE: u64 = 32 << 20;
+	pub(super) const TARGET_FILE: u64 = 64 * 1024 * 1024;
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod default_sizes {
+	pub(super) const MEMTABLE: usize = 16 * 1024 * 1024;
+	pub(super) const BLOCK_CACHE: u64 = 16 << 20;
+	pub(super) const TARGET_FILE: u64 = 16 * 1024 * 1024;
+}
+
 impl Default for Options {
 	fn default() -> Self {
 		let bf = LevelDBBloomFilter::new(10);
@@ -369,12 +391,15 @@ impl Default for Options {
 			// per-item weight limit derived from capacity/shards; below
 			// ~32MB that limit can reject ~16 KB index/filter partitions
 			// outright, forcing every lookup to re-read them from disk.
-			block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(32 << 20)),
+			// (16MB in a browser, where there are four shards: see `default_sizes`.)
+			block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(
+				default_sizes::BLOCK_CACHE,
+			)),
 			path: PathBuf::from(""),
 			level_count: 6,
-			max_memtable_size: 100 * 1024 * 1024,  // 100 MB
-			index_partition_size: 16384,           // 16KB
-			vlog_max_file_size: 256 * 1024 * 1024, // 256MB
+			max_memtable_size: default_sizes::MEMTABLE, // 100 MB (16 MB in a browser)
+			index_partition_size: 16384,                // 16KB
+			vlog_max_file_size: 256 * 1024 * 1024,      // 256MB
 			vlog_checksum_verification: VLogChecksumLevel::Disabled,
 			enable_vlog: false,
 			vlog_value_threshold: 1024, // 1KB default
@@ -386,7 +411,7 @@ impl Default for Options {
 			level0_max_files: 4,
 			max_bytes_for_level: 256 * 1024 * 1024, // 256MB
 			level_multiplier: 10.0,
-			target_file_size: 64 * 1024 * 1024, // 64MB
+			target_file_size: default_sizes::TARGET_FILE, // 64MB (16 MB in a browser)
 			memtable_stall_threshold: 2,
 			l0_stall_threshold: 12,
 			key_manager: None,

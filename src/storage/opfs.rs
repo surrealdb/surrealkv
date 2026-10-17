@@ -109,8 +109,6 @@ pub(crate) fn dom_error(error: &io::Error) -> Option<&DomError> {
 
 /// Whether the error is the lock of another holder: the file has an open sync access handle that
 /// is not ours.
-// Read by the tests today, and by the public mount that follows.
-#[allow(dead_code)]
 pub(crate) fn is_locked(error: &io::Error) -> bool {
 	dom_error(error).is_some_and(|e| e.name == "NoModificationAllowedError")
 }
@@ -293,10 +291,6 @@ impl OpfsSyncFile {
 	}
 
 	/// One write: how many bytes were written, which may be fewer than `buf` holds.
-	#[allow(
-		dead_code,
-		reason = "the raw file of a pool calls it, and no pool is mounted from here yet"
-	)]
 	pub(crate) fn write_some_at_io(&self, offset: u64, buf: &[u8]) -> io::Result<usize> {
 		self.handle.write(offset, buf)
 	}

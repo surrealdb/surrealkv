@@ -236,6 +236,12 @@ async fn the_exceptions_that_chrome_throws_map_as_the_table_says() {
 	let error = OpfsRaw::destroy("a/b").await.expect_err("a bad name");
 	assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 
+	// The directory that the test made is not a pool's, so the removal of the database leaves it
+	// and says so; the test takes it away itself.
+	let error = OpfsRaw::destroy(&name).await.expect_err("an entry that is not a pool's");
+	assert!(vfs::is_not_a_pool(&error), "{error}");
+	JsFuture::from(raw.dir.remove_entry("sub")).await.unwrap();
+
 	drop(raw);
 	destroy_and_verify(&name).await;
 }
@@ -1225,4 +1231,345 @@ async fn abandon_and_close_during_a_background_refill_leave_no_handle_open() {
 			destroy_and_verify(&name).await;
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// The late handle, the lock, and what is in the directory
+// ---------------------------------------------------------------------------------------------
+
+/// An open that is dropped after the call to the browser was issued, which is when a handle is on
+/// its way and nothing holds it. The test above drops opens at the points of their own polls, and
+/// passes without the closer of a late handle, so it cannot tell. This one issues the browser's
+/// call itself (the first poll of the open does), drops the future before the handle came and after
+/// it came and was not taken, and requires the file to be open again within half a second: without
+/// the closer it stays locked for seconds (the control above shows it).
+#[wasm_bindgen_test]
+async fn an_open_that_is_dropped_after_the_browser_call_was_issued_closes_the_handle_when_it_arrives(
+) {
+	let name = unique("late-issued");
+	let raw = OpfsRaw::open(&name).await.unwrap();
+	drop(raw.create("p00000000").await.unwrap());
+	let handle = get_file_handle_io(&raw.dir, "p00000000", false).await.unwrap();
+
+	async fn opens_within_half_a_second(raw: &OpfsRaw, what: &str) {
+		let started = rt::Instant::now();
+		loop {
+			match raw.open("p00000000").await {
+				Ok(file) => {
+					drop(file);
+					return;
+				}
+				Err(e) if is_locked(&e) && started.elapsed() < Duration::from_millis(500) => {
+					rt::sleep(Duration::from_millis(10)).await;
+				}
+				Err(e) => {
+					panic!("{what}: the file is still locked after {:?}: {e}", started.elapsed())
+				}
+			}
+		}
+	}
+
+	for round in 0..8 {
+		// Dropped while the handle is on its way.
+		let mut open = Box::pin(create_sync_access_handle_io(&handle, "p00000000"));
+		assert!(!poll_once(&mut open).await, "a handle does not arrive within one poll");
+		drop(open);
+		for _ in 0..30 {
+			rt::relax().await;
+		}
+		opens_within_half_a_second(&raw, &format!("dropped on its way, round {round}")).await;
+
+		// Dropped after it arrived and before the future was polled again to take it.
+		let mut open = Box::pin(create_sync_access_handle_io(&handle, "p00000000"));
+		assert!(!poll_once(&mut open).await);
+		rt::sleep(Duration::from_millis(40)).await;
+		drop(open);
+		opens_within_half_a_second(&raw, &format!("dropped after it arrived, round {round}")).await;
+	}
+	drop(raw);
+	destroy_and_verify(&name).await;
+}
+
+/// A backend that counts how often the lock was asked for.
+struct CountingLock {
+	inner: OpfsRaw,
+	tries: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Raw for CountingLock {
+	type File = OpfsRawFile;
+
+	fn list(&self) -> RawFut<'_, io::Result<Vec<String>>> {
+		self.inner.list()
+	}
+
+	fn open(&self, name: &str) -> RawFut<'_, io::Result<OpfsRawFile>> {
+		self.inner.open(name)
+	}
+
+	fn create(&self, name: &str) -> RawFut<'_, io::Result<OpfsRawFile>> {
+		self.inner.create(name)
+	}
+
+	fn open_lock(&self) -> RawFut<'_, io::Result<OpfsRawFile>> {
+		self.tries.fetch_add(1, Ordering::SeqCst);
+		self.inner.open_lock()
+	}
+}
+
+/// A mount of a pool whose lock another worker holds asks for it every few tens of milliseconds,
+/// for its deadline: a loop that does not wait would ask thousands of times and keep the worker
+/// busy, and a wait that is too long would ask a few times. The error says what the browser said.
+#[wasm_bindgen_test]
+async fn the_lock_that_another_worker_holds_is_asked_for_every_few_tens_of_milliseconds() {
+	let name = unique("cadence");
+	let holder = spawn_holder(&name, "idle").await;
+	let tries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+	let counting = CountingLock {
+		inner: OpfsRaw::open(&name).await.unwrap(),
+		tries: Arc::clone(&tries),
+	};
+	let cfg = PoolConfig {
+		lock_deadline: Duration::from_millis(300),
+		lock_poll: Duration::from_millis(25),
+		..config(2)
+	};
+	let started = rt::Instant::now();
+	let error = PoolFs::mount(counting, cfg).await.err().expect("another worker holds the lock");
+	let waited = started.elapsed();
+	let tries = tries.load(Ordering::SeqCst);
+	assert!(waited >= Duration::from_millis(300), "it kept trying for its deadline: {waited:?}");
+	// One try, and one more per 25 ms: 13 at the most; each costs a few milliseconds, so fewer. A
+	// loop that does not wait tries hundreds of times, so the floor can be low for a slow machine.
+	assert!((2..=14).contains(&tries), "{tries} tries in {waited:?}");
+	let Error::Io(io_error) = error else {
+		panic!("an I/O error was expected");
+	};
+	assert_eq!(io_error.kind(), io::ErrorKind::PermissionDenied);
+	assert!(vfs::is_database_locked(&io_error), "{io_error}");
+	assert!(Error::Io(Arc::clone(&io_error)).is_database_locked());
+	let cause = io_error
+		.get_ref()
+		.and_then(|inner| inner.downcast_ref::<vfs::DatabaseLocked>())
+		.expect("the payload says what the lock error is")
+		.cause();
+	assert!(is_locked(cause), "the exception of the browser is kept: {cause}");
+	assert_eq!(dom_error(cause).unwrap().name, "NoModificationAllowedError");
+
+	terminate(&holder);
+	let cfg = PoolConfig {
+		lock_deadline: Duration::from_secs(8),
+		lock_poll: Duration::from_millis(50),
+		..config(2)
+	};
+	let (fs, _) = mount_with(&name, cfg).await.expect("mount after the holder was terminated");
+	close(&fs);
+	drop(fs);
+	destroy_and_verify(&name).await;
+}
+
+/// A directory of the origin private file system that has the entries of a pool and, among them,
+/// ones that are not a pool's.
+async fn make_dir(
+	parent: &web_sys::FileSystemDirectoryHandle,
+	name: &str,
+) -> web_sys::FileSystemDirectoryHandle {
+	let options = web_sys::FileSystemGetDirectoryOptions::new();
+	options.set_create(true);
+	JsFuture::from(parent.get_directory_handle_with_options(name, &options))
+		.await
+		.unwrap_or_else(|e| panic!("make the directory {name}: {e:?}"))
+		.unchecked_into()
+}
+
+async fn make_file(parent: &web_sys::FileSystemDirectoryHandle, name: &str) {
+	get_file_handle_io(parent, name, true).await.unwrap();
+}
+
+async fn remove_entry(parent: &web_sys::FileSystemDirectoryHandle, name: &str) {
+	JsFuture::from(parent.remove_entry(name))
+		.await
+		.unwrap_or_else(|e| panic!("remove {name}: {e:?}"));
+}
+
+#[wasm_bindgen_test]
+async fn a_directory_that_is_not_a_pool_is_not_mounted_and_not_removed() {
+	let name = unique("foreign");
+	let root = opfs_root_io().await.unwrap();
+	let dir = make_dir(&root, &name).await;
+	make_file(&dir, "notes.txt").await;
+	make_dir(&dir, "photos").await;
+
+	// Not a pool: refused, and nothing is put in it, not even the lock.
+	let error = OpfsRaw::open_pool(&name).await.err().expect("it is somebody else's directory");
+	assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+	assert!(vfs::is_not_a_pool(&error), "{error}");
+	assert!(error.to_string().contains("notes.txt") && error.to_string().contains("photos"));
+	let mut listed = list_names(&dir).await.unwrap();
+	listed.sort();
+	assert_eq!(listed, ["notes.txt", "photos"], "nothing was added");
+	// And not removed.
+	let error = OpfsRaw::destroy(&name).await.expect_err("it is not a pool");
+	assert!(vfs::is_not_a_pool(&error), "{error}");
+	let mut listed = list_names(&dir).await.unwrap();
+	listed.sort();
+	assert_eq!(listed, ["notes.txt", "photos"], "nothing was removed");
+
+	// With a pool in it, the other entries are left alone and reported.
+	remove_entry(&dir, "photos").await;
+	let (fs, report) = mount(&name, 2).await;
+	assert_eq!(report.ignored, ["notes.txt"], "{report:?}");
+	assert_eq!(report.spares, 2);
+	close(&fs);
+	drop(fs);
+	// And removing it is still refused, with the entries named: they are not the pool's.
+	let error = OpfsRaw::destroy(&name).await.expect_err("a foreign entry is there");
+	assert!(vfs::is_not_a_pool(&error) && error.to_string().contains("notes.txt"), "{error}");
+	assert_eq!(list_names(&dir).await.unwrap().len(), 4, "the lock, two slots and the note");
+	remove_entry(&dir, "notes.txt").await;
+	destroy_and_verify(&name).await;
+
+	// A name that is a file is not a directory.
+	make_file(&root, &name).await;
+	let error = OpfsRaw::open_pool(&name).await.err().expect("a file");
+	assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+	remove_entry(&root, &name).await;
+}
+
+#[wasm_bindgen_test]
+async fn a_lock_or_a_slot_that_is_a_directory_does_not_stop_a_mount_or_a_removal_for_good() {
+	let name = unique("hostile");
+	let root = opfs_root_io().await.unwrap();
+	{
+		let (fs, _) = mount(&name, 3).await;
+		put(&fs, "/kept", b"kept");
+		close(&fs);
+	}
+	let dir = make_dir(&root, &name).await;
+
+	// A directory by the name of a slot: skipped, and its name is never used.
+	let hostile = make_dir(&dir, "p00000009").await;
+	make_file(&hostile, "inside").await;
+	let (fs, report) = mount(&name, 3).await;
+	assert_eq!(report.skipped, ["p00000009"], "{report:?}");
+	assert_eq!(fs.read(p("/kept")).unwrap(), b"kept", "the files of the pool are there");
+	refill_to(&fs, 6).await;
+	let listed = list_names(&dir).await.unwrap();
+	assert!(listed.contains(&"p0000000a".to_string()), "numbered above the entry: {listed:?}");
+	close(&fs);
+	drop(fs);
+
+	// A lock that is a directory: no lock can be taken, so no pool is mounted, and the error says
+	// so; the mount does not hang, and holds nothing.
+	remove_entry(&dir, "LOCK").await;
+	let lock = make_dir(&dir, "LOCK").await;
+	make_file(&lock, "inside").await;
+	let started = rt::Instant::now();
+	let error = mount_with(&name, config(3)).await.err().expect("the lock is a directory");
+	assert!(matches!(&error, Error::Io(e) if e.kind() == io::ErrorKind::InvalidInput), "{error:?}");
+	assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+
+	// Removing the database works all the same: the names of the pool are the pool's, whatever
+	// they are.
+	OpfsRaw::destroy(&name).await.expect("destroy a pool whose lock is a directory");
+	assert!(OpfsRaw::open_existing(&name).await.unwrap().is_none());
+}
+
+async fn refill_to(fs: &Arc<Pool>, target: usize) {
+	fs.refill(target).await.expect("a refill");
+}
+
+/// A slot that has the highest name there is: nothing numbered after it can be read back, so none
+/// is made, and the file of a pool in that directory is still there at the next mount.
+#[wasm_bindgen_test]
+async fn a_slot_with_the_highest_name_makes_no_slot_that_the_next_mount_could_not_read() {
+	let name = unique("highest");
+	let raw = OpfsRaw::open(&name).await.unwrap();
+	for slot in ["pffffffff", "p00000000"] {
+		let file = raw.create(slot).await.unwrap();
+		let page = Header::free(1).encode().unwrap();
+		assert_eq!(file.write_at(0, &page).unwrap(), PAGE_LEN);
+		assert_eq!(file.write_at(PAGE_LEN as u64, &page).unwrap(), PAGE_LEN);
+		file.flush().unwrap();
+		file.close().unwrap();
+	}
+	drop(raw);
+	let (fs, report) = mount(&name, 0).await;
+	assert_eq!(report.spares, 2, "{report:?}");
+	put(&fs, "/important", b"a named file");
+	put(&fs, "/another", b"and another");
+	let error = fs.refill(4).await.expect_err("no name is left");
+	assert!(error.to_string().contains("every slot name"), "{error}");
+	let error = fs.create_new(p("/more"), CreateOpts::default()).err().expect("no slot");
+	assert!(vfs::is_pool_exhausted(&error), "{error}");
+	let mut listed = names(&name).await;
+	listed.sort();
+	assert_eq!(listed, ["p00000000", "pffffffff"], "nothing was made with a name past the end");
+	close(&fs);
+	drop(fs);
+	let (fs, _) = mount(&name, 0).await;
+	assert_eq!(fs.read(p("/important")).unwrap(), b"a named file");
+	assert_eq!(fs.read(p("/another")).unwrap(), b"and another");
+	close(&fs);
+	drop(fs);
+	destroy_and_verify(&name).await;
+}
+
+/// A slot that a handle of this worker still holds when the pool is mounted: the lock is the
+/// pool's, so the handle is one that was closed and has not been released (the browser does that a
+/// little after the fact, as the late handle does), and the mount waits for it until its deadline,
+/// as it does for the lock.
+#[wasm_bindgen_test]
+async fn a_slot_that_is_still_held_is_tried_again_until_it_is_released() {
+	let name = unique("held-slot");
+	{
+		let (fs, _) = mount(&name, 4).await;
+		put(&fs, "/kept", b"kept");
+		close(&fs);
+	}
+	let raw = OpfsRaw::open(&name).await.unwrap();
+	let held = raw.open("p00000002").await.unwrap();
+	drop(raw);
+	rt::spawn(async move {
+		rt::sleep(Duration::from_millis(200)).await;
+		held.close().unwrap();
+	});
+	let cfg = PoolConfig {
+		lock_deadline: Duration::from_secs(5),
+		lock_poll: Duration::from_millis(25),
+		..config(0)
+	};
+	let started = rt::Instant::now();
+	let (fs, report) = mount_with(&name, cfg).await.expect("the mount waits for the slot");
+	assert!(started.elapsed() >= Duration::from_millis(150), "{:?}", started.elapsed());
+	assert_eq!(report.files, 1, "{report:?}");
+	assert_eq!(fs.read(p("/kept")).unwrap(), b"kept");
+	close(&fs);
+	drop(fs);
+
+	// One that stays held ends the mount at the deadline, with the lock error, and nothing is left
+	// open.
+	let raw = OpfsRaw::open(&name).await.unwrap();
+	let held = raw.open("p00000002").await.unwrap();
+	let cfg = PoolConfig {
+		lock_deadline: Duration::from_millis(200),
+		lock_poll: Duration::from_millis(25),
+		..config(0)
+	};
+	let error = mount_with(&name, cfg).await.err().expect("a slot that is held for good");
+	assert!(matches!(&error, Error::Io(e) if vfs::is_database_locked(e)), "{error:?}");
+	held.close().unwrap();
+	drop((held, raw));
+	let (fs, _) = mount(&name, 0).await;
+	close(&fs);
+	drop(fs);
+	destroy_and_verify(&name).await;
+}
+
+#[wasm_bindgen_test]
+async fn whether_the_storage_is_persistent_can_be_asked_in_a_worker() {
+	// The answer depends on the profile; what matters is that the question is answered, in a
+	// worker, without a feature of the browser that a worker does not have.
+	let persisted = storage_persisted().await.expect("persisted() works in a worker");
+	console_log!("the storage of this origin is persistent: {persisted}");
 }

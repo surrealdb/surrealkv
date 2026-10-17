@@ -62,9 +62,11 @@ use super::header::{
 	HEADER_BYTES,
 	HEADER_LEN,
 	MAX_PATH_LEN,
+	PAGE_LEN,
 };
 use super::mem::CrashMode;
 use super::{
+	database_locked,
 	into_io_error,
 	pool_exhausted,
 	pool_full,
@@ -263,6 +265,17 @@ pub struct MountReport {
 	pub blank_initialised: usize,
 	/// Slots that were free but had a payload, which was cut off.
 	pub cut_back: usize,
+	/// Entries of the directory that are not slots (and not the lock): somebody else's. They are
+	/// left as they are, and never used.
+	pub ignored: Vec<String>,
+	/// Entries that are named like a slot and could not be opened because they are not files (a
+	/// directory, by a name that a slot has). They are left as they are, and their names are never
+	/// used for a new slot.
+	pub skipped: Vec<String>,
+	/// How many slots the directory has that this pool has not made room for under its limit of
+	/// files: the slots of a database made with a higher limit. They are all kept and used; no new
+	/// slot is made until the pool is below the limit.
+	pub over_the_limit: usize,
 }
 
 /// What a pool holds now.
@@ -395,8 +408,20 @@ fn slot_name(index: u64) -> String {
 	format!("p{index:08x}")
 }
 
+/// The highest slot number whose name is still `p` and eight hexadecimal digits, which is the form
+/// that a mount reads: one more digit is a name that it would not find again.
+const MAX_SLOT_INDEX: u64 = 0xffff_ffff;
+
+/// The error of a pool that has used every slot name: a directory that a foreign writer filled up
+/// to the highest name. Not `StorageFull`, which the engine treats as something that passes.
+fn slot_names_used_up() -> io::Error {
+	io::Error::other(
+		"the pool has used every slot name that it can read back, and makes no more slots",
+	)
+}
+
 /// The number in `p[0-9a-f]{8}`, and nothing for any other name.
-fn parse_slot_name(name: &str) -> Option<u64> {
+pub(crate) fn parse_slot_name(name: &str) -> Option<u64> {
 	let digits = name.strip_prefix('p')?;
 	if digits.len() != 8
 		|| !digits.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -448,6 +473,26 @@ fn read_fully<F: RawFile>(raw: &F, offset: u64, buf: &mut [u8]) -> io::Result<us
 		}
 	}
 	Ok(done)
+}
+
+/// Whether a slot that is shorter than its two header pages has a first page that is a valid header
+/// of a named file.
+fn short_slot_names_a_file<R: Raw>(slot: &Slot<R>, size: u64) -> io::Result<bool> {
+	if size < PAGE_LEN as u64 {
+		return Ok(false);
+	}
+	let mut page = vec![0u8; PAGE_LEN];
+	let read = read_fully(&slot.raw, 0, &mut page)?;
+	if read < PAGE_LEN {
+		return Ok(false);
+	}
+	Ok(matches!(
+		Header::decode(&page),
+		Ok(Header {
+			state: HeaderState::Named(_),
+			..
+		})
+	))
 }
 
 /// Polls a future until it is done, with a waker that does nothing, and says nothing if it does not
@@ -890,6 +935,19 @@ impl<R: Raw> PoolShared<R> {
 		self.refilled.notify_waiters();
 	}
 
+	/// The name of the next slot to make. Every slot is made through here, so that a name that the
+	/// next mount would not read (a ninth digit) is never written: a file in such a slot would be
+	/// gone at the next mount, with no error.
+	fn next_slot_name(&self) -> io::Result<String> {
+		let index = self.next_phys.fetch_add(1, Ordering::AcqRel);
+		if index > MAX_SLOT_INDEX {
+			// Stays there, however often it is asked.
+			self.next_phys.store(MAX_SLOT_INDEX + 1, Ordering::Release);
+			return Err(slot_names_used_up());
+		}
+		Ok(slot_name(index))
+	}
+
 	/// Gives a slot that was claimed and not used back, as dead.
 	fn discard(&self, slot: Arc<Slot<R>>) {
 		// The header may have been written, whether or not the write was reported: make sure the
@@ -1045,7 +1103,13 @@ impl<R: Raw> PoolShared<R> {
 		if !self.reserve_slot() {
 			return Ok(None);
 		}
-		let name = slot_name(self.next_phys.fetch_add(1, Ordering::AcqRel));
+		let name = match self.next_slot_name() {
+			Ok(name) => name,
+			Err(e) => {
+				self.total.fetch_sub(1, Ordering::AcqRel);
+				return Err(e);
+			}
+		};
 		let raw = match self.raw.create_sync(&name) {
 			Some(Ok(raw)) => raw,
 			Some(Err(e)) => {
@@ -1175,12 +1239,28 @@ impl<R: Raw> PoolShared<R> {
 					Err(pool_full(self.cfg.max_files))
 				};
 			}
-			let names: Vec<String> = (0..reservation.left)
-				.map(|_| slot_name(self.next_phys.fetch_add(1, Ordering::AcqRel)))
-				.collect();
+			let wanted_now = reservation.left;
+			let mut names: Vec<String> = Vec::with_capacity(wanted_now);
+			let mut name_error = None;
+			for _ in 0..wanted_now {
+				match self.next_slot_name() {
+					Ok(name) => names.push(name),
+					Err(e) => {
+						name_error = Some(e);
+						break;
+					}
+				}
+			}
+			// The room of the slots that have no name is free again.
+			for _ in names.len()..wanted_now {
+				reservation.release();
+			}
+			if names.is_empty() {
+				return Err(name_error.unwrap_or_else(slot_names_used_up));
+			}
 			let futures: Vec<_> = names.iter().map(|name| self.raw.create(name)).collect();
 			let results = JoinAllSettled::new(futures).await;
-			let mut first_error = None;
+			let mut first_error = name_error;
 			for (name, result) in names.into_iter().zip(results) {
 				match result {
 					Ok(raw) => {
@@ -1525,13 +1605,9 @@ impl<R: Raw> PoolFs<R> {
 					rt::sleep(cfg.lock_poll).await;
 				}
 				Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-					return Err(Error::Io(Arc::new(io::Error::new(
-						io::ErrorKind::PermissionDenied,
-						format!(
-							"the database is open in another tab or worker (the page that holds it \
-							 may be in a long synchronous operation): {e}"
-						),
-					))));
+					// The error of the browser stays the source: a caller that has to tell the lock
+					// of another holder from anything else finds it there.
+					return Err(Error::Io(Arc::new(database_locked(e))));
 				}
 				Err(e) => return Err(e.into()),
 			}
@@ -1540,39 +1616,84 @@ impl<R: Raw> PoolFs<R> {
 		// 2. The slots. A failure from here on closes whatever was opened, which `held` does.
 		let names = backend.list().await?;
 		let mut found: Vec<(u64, String)> = Vec::new();
+		let mut ignored: Vec<String> = Vec::new();
 		for name in names {
 			match parse_slot_name(&name) {
 				Some(index) => found.push((index, name)),
-				None => tracing::warn!("the pool ignores {name:?}: it is not a slot"),
+				None => {
+					tracing::warn!("the pool ignores {name:?}: it is not a slot");
+					ignored.push(name);
+				}
 			}
 		}
 		found.sort();
+		ignored.sort();
 		let empty = found.is_empty();
 		let next_phys = found.last().map_or(0, |(index, _)| index + 1);
+		if next_phys > MAX_SLOT_INDEX {
+			tracing::warn!(
+				"the pool has a slot with the highest name there is, so it makes no new slots"
+			);
+		}
 
 		// Opened together, and every open is awaited to its end, so that none is dropped in
 		// flight: a handle that arrives late would stay locked. The results are handed to `held`
 		// one by one, so that those of a batch that was not finished are not lost with it.
-		let mut open_error = None;
-		for batch in found.chunks(OPEN_BATCH) {
-			let futures: Vec<_> = batch.iter().map(|(_, name)| backend.open(name)).collect();
-			for ((_, name), result) in batch.iter().zip(JoinAllSettled::new(futures).await) {
-				match result {
-					Ok(raw) => {
-						held.opened.push(Slot::new(name.clone(), raw, SlotInfo::fresh(0, 0), 0))
-					}
-					Err(e) => {
-						open_error.get_or_insert(e);
+		//
+		// The lock is ours by now, so a slot that is held by somebody else is a handle that was
+		// closed and has not been released yet (the browser releases the handles of a page that
+		// is gone, or of a pool that was abandoned a moment ago, a little after the fact): it is
+		// tried again until the same deadline as the lock. A slot that is not a file (a directory
+		// with the name of a slot) cannot be opened by waiting, and is not a slot: it is skipped
+		// and reported, so that one entry that somebody made does not stop the mount for good.
+		let mut skipped: Vec<String> = Vec::new();
+		let mut pending = found;
+		let slots_started = rt::Instant::now();
+		loop {
+			let mut busy: Vec<(u64, String)> = Vec::new();
+			let mut open_error = None;
+			for batch in pending.chunks(OPEN_BATCH) {
+				let futures: Vec<_> = batch.iter().map(|(_, name)| backend.open(name)).collect();
+				for ((index, name), result) in batch.iter().zip(JoinAllSettled::new(futures).await)
+				{
+					match result {
+						Ok(raw) => {
+							held.opened.push(Slot::new(name.clone(), raw, SlotInfo::fresh(0, 0), 0))
+						}
+						Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+							tracing::warn!("the pool skips {name:?}: it is not a file ({e})");
+							skipped.push(name.clone());
+						}
+						Err(e)
+							if e.kind() == io::ErrorKind::PermissionDenied
+								&& slots_started.elapsed() < cfg.lock_deadline =>
+						{
+							busy.push((*index, name.clone()));
+						}
+						Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+							open_error.get_or_insert(database_locked(e));
+						}
+						Err(e) => {
+							open_error.get_or_insert(e);
+						}
 					}
 				}
+				if open_error.is_some() {
+					break;
+				}
 			}
-			if open_error.is_some() {
+			if let Some(e) = open_error {
+				return Err(e.into());
+			}
+			if busy.is_empty() {
 				break;
 			}
+			rt::sleep(cfg.lock_poll).await;
+			pending = busy;
 		}
-		if let Some(e) = open_error {
-			return Err(e.into());
-		}
+		// In the order of their names, whichever order they were opened in.
+		held.opened.sort_by(|a, b| a.name.cmp(&b.name));
+		skipped.sort();
 
 		// The pool takes over what `held` has: from here the pool closes it.
 		let lock = held.lock.take();
@@ -1608,6 +1729,14 @@ impl<R: Raw> PoolFs<R> {
 			cfg: cfg.clone(),
 		});
 
+		if total > cfg.max_files {
+			tracing::warn!(
+				"the pool holds {total} slots, over its limit of {}: it makes no new slot until it is \
+				 below the limit",
+				cfg.max_files
+			);
+		}
+
 		// 3. The headers.
 		let mut report = match shared.settle(&opened) {
 			Ok(report) => report,
@@ -1625,6 +1754,9 @@ impl<R: Raw> PoolFs<R> {
 			}
 		}
 		report.spares = shared.avail.load(Ordering::Acquire);
+		report.ignored = ignored;
+		report.skipped = skipped;
+		report.over_the_limit = total.saturating_sub(cfg.max_files);
 		*shared.report.lock() = Some(report.clone());
 		if shared.avail.load(Ordering::Acquire) < cfg.low {
 			shared.kick();
@@ -1699,6 +1831,18 @@ impl<R: Raw> PoolShared<R> {
 			let size = slot.raw.size()?;
 			sizes.push(size);
 			if size < HEADER_LEN {
+				// A slot that a header names is not blank, whatever its length: the pool never
+				// shortens a file below its headers, so this is damage from outside, and a file
+				// that was named is not given up without a trace. Kept as it is, and reported.
+				if short_slot_names_a_file(slot, size)? {
+					tracing::warn!(
+						"the slot {} names a file and is shorter than its headers: kept",
+						slot.name
+					);
+					slot.st.lock().orphan = true;
+					report.orphans_kept.push(slot.name.clone());
+					continue;
+				}
 				// Never given a header: made by a refill that did not get as far as its first
 				// write. There is nothing in it.
 				self.reinitialise(slot, size > 0)?;
@@ -4672,5 +4816,338 @@ mod tests {
 		assert_eq!(raw.image("p00000000").unwrap(), root, "what is not understood is not touched");
 		assert_eq!(raw.image("p00000001").unwrap(), nothing);
 		assert!(logical(&fs).is_empty());
+	}
+
+	// ---- what a mount does with what it did not make -----------------------------------------
+
+	/// A backend that has entries which are not files, and that counts the tries for its lock.
+	struct Odd {
+		inner: MemRaw,
+		/// Names that the directory lists and that cannot be opened as a file.
+		not_files: Vec<String>,
+		lock_tries: Arc<AtomicUsize>,
+	}
+
+	impl Odd {
+		fn new(inner: MemRaw, not_files: &[&str]) -> Self {
+			Self {
+				inner,
+				not_files: not_files.iter().map(|name| name.to_string()).collect(),
+				lock_tries: Arc::new(AtomicUsize::new(0)),
+			}
+		}
+	}
+
+	impl Raw for Odd {
+		type File = <MemRaw as Raw>::File;
+
+		fn list(&self) -> RawFut<'_, io::Result<Vec<String>>> {
+			let names = self.not_files.clone();
+			let inner = self.inner.list();
+			Box::pin(async move {
+				let mut listed = inner.await?;
+				listed.extend(names);
+				Ok(listed)
+			})
+		}
+
+		fn open(&self, name: &str) -> RawFut<'_, io::Result<Self::File>> {
+			if self.not_files.iter().any(|not_file| not_file == name) {
+				return Box::pin(std::future::ready(Err(io::Error::new(
+					io::ErrorKind::InvalidInput,
+					"a directory, where a file was asked for",
+				))));
+			}
+			self.inner.open(name)
+		}
+
+		fn create(&self, name: &str) -> RawFut<'_, io::Result<Self::File>> {
+			self.inner.create(name)
+		}
+
+		fn open_lock(&self) -> RawFut<'_, io::Result<Self::File>> {
+			self.lock_tries.fetch_add(1, Ordering::SeqCst);
+			self.inner.open_lock()
+		}
+	}
+
+	#[test]
+	fn a_mount_reports_what_it_ignores() {
+		let raw = messy();
+		let (_, report) = PoolFs::mount_sync(raw, PoolConfig::strict(0, 64)).unwrap();
+		assert_eq!(report.ignored, ["junk", "p0000000"], "{report:?}");
+		assert!(report.skipped.is_empty());
+		assert_eq!(report.over_the_limit, 0);
+	}
+
+	#[test]
+	fn an_entry_that_is_named_like_a_slot_and_is_not_a_file_is_skipped_and_never_stops_the_mount() {
+		let raw = MemRaw::new();
+		for i in 0..3 {
+			raw.put(&slot_name(i), &slot_bytes(Some(Header::free(1)), None, b""));
+		}
+		let odd = Odd::new(raw.clone(), &["p00000009"]);
+		let (fs, report) = PoolFs::mount_sync(odd, PoolConfig::strict(0, 64))
+			.expect("one entry that somebody made does not stop a mount");
+		assert_eq!(report.skipped, ["p00000009"], "{report:?}");
+		assert_eq!(report.spares, 3);
+		assert_eq!(fs.stats().total, 3, "it is not a slot of this pool");
+		// The new slots are numbered above it, so its name is never one of theirs.
+		poll_ready(fs.refill(6)).unwrap().unwrap();
+		let names = raw.names();
+		assert!(!names.contains(&"p00000009".to_string()), "{names:?}");
+		assert!(names.contains(&"p0000000a".to_string()), "{names:?}");
+		assert_eq!(fs.stats().clean, 6);
+	}
+
+	#[test]
+	fn a_slot_that_is_still_held_is_tried_again_until_it_is_let_go() {
+		let raw = MemRaw::with_config(MemConfig::strict());
+		{
+			let (fs, _) = PoolFs::mount_sync(raw.clone(), PoolConfig::strict(4, 8)).unwrap();
+			fs.pool().unwrap().close().unwrap();
+		}
+		let cfg = PoolConfig {
+			lock_deadline: Duration::from_secs(10),
+			lock_poll: Duration::from_millis(10),
+			..PoolConfig::strict(0, 8)
+		};
+		// Somebody holds one of the slots for a while: a handle that was closed and is not released
+		// yet. The lock is ours, so the slot is not another page's.
+		let held = poll_ready(raw.open("p00000002")).unwrap().unwrap();
+		let releaser = std::thread::spawn(move || {
+			std::thread::sleep(Duration::from_millis(150));
+			held.close().unwrap();
+		});
+		let started = rt::Instant::now();
+		let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+		let (fs, report) =
+			runtime.block_on(PoolFs::mount(raw.clone(), cfg)).expect("it waits for the slot");
+		releaser.join().unwrap();
+		assert!(started.elapsed() >= Duration::from_millis(100), "{:?}", started.elapsed());
+		assert_eq!(report.spares, 4, "{report:?}");
+		assert_eq!(fs.stats().total, 4);
+		fs.pool().unwrap().close().unwrap();
+
+		// A slot that stays held ends the mount at the deadline, with the typed lock error.
+		let held = poll_ready(raw.open("p00000002")).unwrap().unwrap();
+		let cfg = PoolConfig {
+			lock_deadline: Duration::from_millis(100),
+			lock_poll: Duration::from_millis(10),
+			..PoolConfig::strict(0, 8)
+		};
+		let started = rt::Instant::now();
+		let error = runtime.block_on(PoolFs::mount(raw.clone(), cfg)).err().unwrap();
+		assert!(started.elapsed() >= Duration::from_millis(100));
+		assert!(matches!(&error, Error::Io(e) if vfs::is_database_locked(e)), "{error:?}");
+		assert_eq!(raw.open_handles(), 1, "only the one that the test holds");
+		held.close().unwrap();
+	}
+
+	#[test]
+	fn the_lock_is_tried_every_few_tens_of_milliseconds_and_not_in_a_loop() {
+		let raw = MemRaw::new();
+		let _lock = poll_ready(raw.open_lock()).unwrap().unwrap();
+		let odd = Odd::new(raw, &[]);
+		let tries = Arc::clone(&odd.lock_tries);
+		let cfg = PoolConfig {
+			lock_deadline: Duration::from_millis(300),
+			lock_poll: Duration::from_millis(25),
+			..PoolConfig::memory()
+		};
+		let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+		let started = rt::Instant::now();
+		let error = runtime.block_on(PoolFs::mount(odd, cfg)).expect_err("the lock is held");
+		let waited = started.elapsed();
+		assert!(matches!(&error, Error::Io(e) if vfs::is_database_locked(e)), "{error:?}");
+		let tries = tries.load(Ordering::SeqCst);
+		// 300 ms at one try per 25 ms, and the first try: 13. A loop that does not wait tries
+		// thousands of times; the floor is low because a busy machine oversleeps every wait.
+		assert!((2..=14).contains(&tries), "{tries} tries in {waited:?}");
+	}
+
+	#[test]
+	fn the_error_of_a_lock_that_is_held_has_the_cause_in_it() {
+		let raw = MemRaw::new();
+		let _lock = poll_ready(raw.open_lock()).unwrap().unwrap();
+		let error = PoolFs::mount_sync(raw, PoolConfig::memory()).err().unwrap();
+		let Error::Io(error) = error else {
+			panic!("an I/O error was expected");
+		};
+		assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+		assert!(vfs::is_database_locked(&error));
+		let cause = std::error::Error::source(error.get_ref().unwrap()).expect("a source");
+		let cause = cause.downcast_ref::<io::Error>().expect("it is the error of the backend");
+		assert_eq!(cause.kind(), io::ErrorKind::PermissionDenied);
+		assert!(!vfs::is_database_locked(cause), "the cause is not a locked database itself");
+		assert!(
+			Error::Io(Arc::new(vfs::database_locked(io::Error::other("x")))).is_database_locked()
+		);
+		assert!(!Error::Io(Arc::new(io::Error::other("x"))).is_database_locked());
+	}
+
+	#[test]
+	fn a_named_file_in_a_slot_shorter_than_its_headers_is_kept_and_reported() {
+		let mut whole = slot_bytes(Some(Header::named(4, "/d/e")), None, b"");
+		// Page A is whole and the file stops a little after it.
+		let named = {
+			whole.truncate(PAGE_LEN + 5);
+			whole
+		};
+		let free = {
+			let mut bytes = slot_bytes(Some(Header::free(4)), None, b"");
+			bytes.truncate(PAGE_LEN + 5);
+			bytes
+		};
+		let raw = MemRaw::new();
+		raw.put("p00000000", &named);
+		raw.put("p00000001", &free);
+		raw.put("p00000002", &named[..PAGE_LEN - 1]);
+		let (fs, report) = PoolFs::mount_sync(raw.clone(), PoolConfig::strict(0, 8)).unwrap();
+		assert_eq!(report.orphans_kept, ["p00000000"], "{report:?}");
+		assert_eq!(
+			report.blank_initialised, 2,
+			"a free page, and a page that is not whole: {report:?}"
+		);
+		assert_eq!(raw.image("p00000000").unwrap(), named, "it is not touched");
+		assert_eq!(fs.stats().orphans, 1);
+		assert_eq!(fs.stats().clean, 2);
+		// Never used, and never cleaned, however many are made.
+		for i in 0..2 {
+			fs.create_new(p(&format!("/n{i}")), CreateOpts::default()).unwrap();
+		}
+		assert!(fs.create_new(p("/n2"), CreateOpts::default()).is_err());
+		assert_eq!(raw.image("p00000000").unwrap(), named);
+		// And it is the same at the next mount.
+		fs.pool().unwrap().close().unwrap();
+		let (_, again) = PoolFs::mount_sync(raw.clone(), PoolConfig::strict(0, 8)).unwrap();
+		assert_eq!(again.orphans_kept, ["p00000000"]);
+		assert_eq!(raw.image("p00000000").unwrap(), named);
+	}
+
+	#[test]
+	fn a_pool_with_more_slots_than_its_limit_mounts_and_makes_no_more() {
+		let raw = MemRaw::new();
+		for i in 0..6 {
+			raw.put(&slot_name(i), &slot_bytes(Some(Header::free(1)), None, b""));
+		}
+		let (fs, report) = PoolFs::mount_sync(raw.clone(), PoolConfig::strict(0, 4)).unwrap();
+		assert_eq!(report.over_the_limit, 2, "{report:?}");
+		assert_eq!(fs.stats().total, 6);
+		// Every slot that is there can be used...
+		for i in 0..6 {
+			fs.create_new(p(&format!("/f{i}")), CreateOpts::default()).unwrap();
+		}
+		// ... and no more is made: the limit is typed, and is not a wait.
+		let error = fs.create_new(p("/f6"), CreateOpts::default()).err().unwrap();
+		assert!(vfs::is_pool_full(&error), "{error}");
+		let error = poll_ready(fs.refill(3)).unwrap().unwrap_err();
+		assert!(vfs::is_pool_full(&error), "{error}");
+		assert_eq!(raw.names().len(), 6 + 1, "six slots and the lock");
+	}
+
+	#[test]
+	fn a_slot_name_that_the_next_mount_cannot_read_is_never_made() {
+		for cfg in [PoolConfig::strict(0, 64), PoolConfig::memory()] {
+			let raw = MemRaw::new();
+			raw.put("pffffffff", &slot_bytes(Some(Header::free(1)), None, b""));
+			raw.put("p00000000", &slot_bytes(Some(Header::free(1)), None, b""));
+			let (fs, report) = PoolFs::mount_sync(raw.clone(), cfg.clone()).unwrap();
+			assert_eq!(report.spares, 2);
+			// Both slots are in use now, so a new file needs a new slot, which would be named past
+			// the end of the names that are read back.
+			put(&fs, "/important", b"a named file");
+			put(&fs, "/another", b"and another");
+			let error = fs.create_new(p("/more"), CreateOpts::default()).err().expect("no slot");
+			if cfg.inline_provision {
+				assert!(error.to_string().contains("every slot name"), "{error}");
+			} else {
+				assert!(
+					vfs::is_pool_exhausted(&error),
+					"a wait for a refill that cannot come: {error}"
+				);
+			}
+			assert!(!vfs::is_pool_full(&error) && error.kind() != io::ErrorKind::StorageFull);
+			let error = poll_ready(fs.refill(4)).unwrap().unwrap_err();
+			assert!(error.to_string().contains("every slot name"), "{error}");
+			assert_eq!(fs.stats().total, 2, "no room is counted for a slot that was not made");
+			assert_eq!(fs.shared.making.load(Ordering::Acquire), 0);
+			for name in raw.names() {
+				assert!(
+					name == LOCK_NAME || parse_slot_name(&name).is_some(),
+					"a slot name that is not read back: {name}"
+				);
+			}
+			// The files are there at the next mount: nothing was lost to a name that is not read.
+			fs.pool().unwrap().close().unwrap();
+			let (fs, _) = PoolFs::mount_sync(raw.clone(), PoolConfig::strict(0, 64)).unwrap();
+			assert_eq!(read(&fs, "/important").as_deref(), Some(&b"a named file"[..]));
+			assert_eq!(read(&fs, "/another").as_deref(), Some(&b"and another"[..]));
+		}
+	}
+
+	// ---- guards ------------------------------------------------------------------------------
+
+	#[test]
+	fn a_slot_that_arrives_after_the_pool_was_closed_is_closed_by_adopt() {
+		let raw = MemRaw::new();
+		let (fs, _) = PoolFs::mount_sync(raw.clone(), PoolConfig::strict(0, 8)).unwrap();
+		let file = raw.create_sync("p00000007").expect("made at once").unwrap();
+		let slot = Slot::<MemRaw>::new("p00000007".to_string(), file, SlotInfo::fresh(0, 0), 0);
+		fs.shared.closed.store(true, Ordering::Release);
+		fs.shared.adopt(&slot);
+		let error = slot.raw.size().unwrap_err();
+		assert_eq!(error.kind(), io::ErrorKind::NotConnected, "adopt closed it: {error}");
+		// And on a pool that is open it is kept, and left open.
+		let (open, _) = PoolFs::mount_sync(MemRaw::new(), PoolConfig::strict(0, 8)).unwrap();
+		let file = open.raw().create_sync("p00000007").expect("made at once").unwrap();
+		let slot = Slot::<MemRaw>::new("p00000007".to_string(), file, SlotInfo::fresh(0, 0), 0);
+		open.shared.adopt(&slot);
+		assert!(slot.raw.size().is_ok());
+		assert!(open.shared.slots.lock().iter().any(|held| Arc::ptr_eq(held, &slot)));
+	}
+
+	#[test]
+	fn a_reservation_counts_against_the_cap_and_gives_the_room_back() {
+		let (fs, _) = strict_pool(2, 10);
+		let shared = &fs.shared;
+		let before = (shared.total.load(Ordering::Acquire), shared.making.load(Ordering::Acquire));
+		assert_eq!(before, (2, 0));
+		let potential = shared.potential();
+		let mut reservation = Reservation::new(shared, 3);
+		assert_eq!(shared.total.load(Ordering::Acquire), 5);
+		assert_eq!(shared.making.load(Ordering::Acquire), 3);
+		// A slot on its way is not lost to the count of what could still be had.
+		assert_eq!(shared.potential(), potential, "making counts in `potential`");
+		// One that will not be a slot: the room is free at once.
+		reservation.release();
+		assert_eq!(shared.total.load(Ordering::Acquire), 4, "release gives the room back");
+		assert_eq!(shared.making.load(Ordering::Acquire), 2);
+		assert_eq!(shared.potential(), potential);
+		// One that is a slot stays counted, as a slot.
+		reservation.made();
+		assert_eq!(shared.total.load(Ordering::Acquire), 4);
+		assert_eq!(shared.making.load(Ordering::Acquire), 1);
+		drop(reservation);
+		assert_eq!(shared.total.load(Ordering::Acquire), 3, "what was left is given back");
+		assert_eq!(shared.making.load(Ordering::Acquire), 0);
+	}
+
+	#[test]
+	fn a_refill_that_fails_leaves_the_count_of_slots_true() {
+		let (fs, raw) = strict_pool(2, 20);
+		let slots = |fs: &Mem| fs.shared.slots.lock().len();
+		raw.fail_write_after(3);
+		let error = poll_ready(fs.refill(8)).unwrap().unwrap_err();
+		raw.clear_faults();
+		assert!(error.kind() != io::ErrorKind::NotConnected, "{error}");
+		let stats = fs.stats();
+		assert_eq!(stats.total, slots(&fs), "{stats:?}: every counted slot is one that exists");
+		assert_eq!(fs.shared.making.load(Ordering::Acquire), 0);
+		assert_eq!(raw.leaked(), 0);
+		// And the room that the failures gave back is there to be used.
+		poll_ready(fs.refill(8)).unwrap().unwrap();
+		assert_eq!(fs.stats().clean, 8);
+		assert_eq!(fs.stats().total, slots(&fs));
 	}
 }

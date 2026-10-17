@@ -13,10 +13,6 @@
 pub(crate) mod header;
 pub(crate) mod mem;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-#[allow(
-	dead_code,
-	reason = "no pool is mounted over the origin private file system until `FileSystem::opfs`"
-)]
 pub(crate) mod opfs_raw;
 pub(crate) mod pool;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -703,9 +699,125 @@ impl FileSystem {
 		}
 	}
 
+	/// The database `name` in the origin private file system of the browser: mounts it, or makes
+	/// it if it is not there. If another page has it open, it waits a few seconds for the lock,
+	/// which covers the usual release after a reload (see
+	/// [`opfs_with_lock_wait`](Self::opfs_with_lock_wait) for another wait).
+	///
+	/// This is the persistent file system of a browser. Give it to a tree with
+	/// [`TreeBuilder::with_file_system`](crate::TreeBuilder::with_file_system) and build the tree
+	/// with [`TreeBuilder::build_async`](crate::TreeBuilder::build_async).
+	///
+	/// # What the browser allows
+	///
+	/// * **A dedicated worker only.** The files are opened through synchronous access handles,
+	///   which exist only in a dedicated worker. On the main thread of a page, in a shared worker
+	///   or in a service worker, this fails with `Unsupported` before anything is made. Use
+	///   [`FileSystem::memory`] there, which is not persistent. There is no threads support: the
+	///   engine runs on the one thread of the worker.
+	/// * **One page at a time.** Opening a database takes an exclusive lock of its directory, so a
+	///   second tab, page or worker that mounts it fails once its wait for the lock is over, with
+	///   an error for which [`Error::is_database_locked`] is true. A page that is reloaded may
+	///   leave the lock held for a few seconds after it went, which is what the wait is for. If the
+	///   old page holds it for longer, the mount fails with the same error and a later mount
+	///   succeeds; [`opfs_with_lock_wait`](Self::opfs_with_lock_wait) sets a longer wait.
+	/// * **Close before the page goes away.** A database that was not closed is opened by replaying
+	///   its log, which is what happens after a crash, and the lock of the old page may still be
+	///   held when the new one asks. Await [`Tree::close`](crate::Tree::close) and then
+	///   [`FileSystem::close`] before the worker is terminated.
+	/// * **`flush` orders, it does not promise.** What a commit with
+	///   [`Durability::Immediate`](crate::Durability::Immediate) waits for is the flush of the
+	///   access handle of the browser, which puts the writes before it ahead of the writes after
+	///   it. What the browser promises about a power cut, on any platform, is not known, and this
+	///   crate does not claim it. [`Durability::Eventual`](crate::Durability::Eventual), the
+	///   default, does not wait for it at all.
+	/// * **The storage may be evicted** unless the browser has been told to keep it: see
+	///   [`FileSystem::persisted`]. A full origin fails a write with an error of kind
+	///   `StorageFull`. The background flush and compaction try again after it, and a commit that
+	///   meets it fails, and so may stop the database if part of its group was already applied.
+	///
+	/// # Errors
+	///
+	/// All are [`Error::Io`]: `Unsupported` where there are no synchronous access handles or no
+	/// file system for the origin (some private windows); `PermissionDenied`, for which
+	/// [`Error::is_database_locked`] is true, if the database is open elsewhere; `StorageFull` if
+	/// the origin has no room for the files of a new database; `InvalidInput` if `name` is not one
+	/// path component, or the directory of that name holds entries that are not a database's
+	/// (it is left as it is).
+	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	pub async fn opfs(name: &str) -> Result<Self> {
+		Self::mount_opfs(name, PoolConfig::default()).await
+	}
+
+	/// [`FileSystem::opfs`] with the time that it waits for a database that another page has open
+	/// before it gives up: it tries every few tens of milliseconds until `wait` has passed. A
+	/// `wait` of zero tries once.
+	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	pub async fn opfs_with_lock_wait(name: &str, wait: std::time::Duration) -> Result<Self> {
+		Self::mount_opfs(
+			name,
+			PoolConfig {
+				lock_deadline: wait,
+				..PoolConfig::default()
+			},
+		)
+		.await
+	}
+
+	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	async fn mount_opfs(name: &str, cfg: PoolConfig) -> Result<Self> {
+		// Before anything is made: a context that cannot open the files must not leave a directory
+		// behind.
+		if !crate::storage::opfs::sync_access_handles_available() {
+			return Err(Error::Io(Arc::new(io::Error::new(
+				io::ErrorKind::Unsupported,
+				"the origin private file system can be used only in a dedicated worker: a page, a \
+				 shared worker and a service worker have no synchronous access handles",
+			))));
+		}
+		let raw = opfs_raw::OpfsRaw::open_pool(name).await?;
+		let (fs, _report) = PoolFs::mount(raw, cfg).await?;
+		Ok(Self(fs))
+	}
+
+	/// Removes the database `name` of the origin private file system, with everything in it. A
+	/// database that is not there is already removed, so this can be repeated.
+	///
+	/// The database must be closed ([`FileSystem::close`]) here and open nowhere else. If it is
+	/// open, this fails with an error for which [`Error::is_database_locked`] is true, and nothing
+	/// is removed. A directory that holds entries that are not a database's is refused with
+	/// `InvalidInput` and left as it is: only the lock and the files of a pool are removed. The
+	/// browser does not promise that a removal that fails changed nothing.
+	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	pub async fn destroy_opfs(name: &str) -> Result<()> {
+		match opfs_raw::OpfsRaw::destroy(name).await {
+			Ok(()) => Ok(()),
+			Err(e) if crate::storage::opfs::is_locked(&e) => {
+				Err(Error::Io(Arc::new(database_locked(e))))
+			}
+			Err(e) => Err(Error::from(e)),
+		}
+	}
+
+	/// Whether the browser keeps the storage of this origin until the user clears it, which is what
+	/// stops it from evicting the databases when the disk fills. It is `false` until a page has
+	/// asked for it with `navigator.storage.persist()`, which a worker cannot call: the page asks,
+	/// and a database can check here that it was granted. `Unsupported` where the browser has no
+	/// such question.
+	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	pub async fn persisted() -> Result<bool> {
+		opfs_raw::storage_persisted().await.map_err(Error::from)
+	}
+
 	/// Flushes what has to be flushed, cleans the files that were removed, and releases every
-	/// handle of the file system. A file that is read or written after it fails with
-	/// `NotConnected`. Nothing to do for a file system that is not a pool.
+	/// handle of the file system, and with them the lock of a database in a browser. Calling it
+	/// again does nothing. A file that is read or written after it fails with `NotConnected`, so
+	/// close the trees first: a tree whose file system is closed under it fails what it does next.
+	/// Nothing to do for a file system that is not a pool.
+	///
+	/// The flushes are made in one go, and take longer the more files the database has, so a page
+	/// that is going away calls this early and does not leave it to the last moment. The last
+	/// reference to a file system that was not closed releases the handles too, without the flush.
 	pub async fn close(&self) -> Result<()> {
 		match self.0.pool() {
 			Some(pool) => pool.close().map_err(Error::from),
@@ -860,6 +972,122 @@ pub(crate) fn is_pool_full(error: &io::Error) -> bool {
 /// Whether `error` is the one that [`pool_exhausted`] makes.
 pub(crate) fn is_pool_exhausted(error: &io::Error) -> bool {
 	error.get_ref().is_some_and(|inner| inner.is::<PoolExhausted>())
+}
+
+/// The payload of the error of a mount that found the lock of the pool held by somebody else, and
+/// went on trying until its deadline: another tab or worker has the database open, or the page that
+/// had it is gone and the browser has not released what it held yet. The kind is
+/// `PermissionDenied`. The error of the browser that said so is kept as the source of this one, so
+/// that a caller that wants the exception finds it.
+#[derive(Debug)]
+pub(crate) struct DatabaseLocked {
+	cause: io::Error,
+}
+
+impl DatabaseLocked {
+	/// What the file system answered when the lock was asked for the last time.
+	#[allow(dead_code, reason = "read by the browser tests of the mount")]
+	pub(crate) fn cause(&self) -> &io::Error {
+		&self.cause
+	}
+}
+
+impl fmt::Display for DatabaseLocked {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(
+			f,
+			"the database is open in another tab or worker (the page that holds it may be in a long \
+			 synchronous operation): {}",
+			self.cause
+		)
+	}
+}
+
+impl std::error::Error for DatabaseLocked {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		Some(&self.cause)
+	}
+}
+
+/// The error of a mount that could not take the lock of the pool before its deadline.
+pub(crate) fn database_locked(cause: io::Error) -> io::Error {
+	io::Error::new(
+		io::ErrorKind::PermissionDenied,
+		DatabaseLocked {
+			cause,
+		},
+	)
+}
+
+/// Whether `error` is the one that [`database_locked`] makes.
+pub(crate) fn is_database_locked(error: &io::Error) -> bool {
+	error.get_ref().is_some_and(|inner| inner.is::<DatabaseLocked>())
+}
+
+impl Error {
+	/// Whether this is the error of a file system that could not be mounted, or a database that
+	/// could not be removed, because another tab, page or worker (or the page that was there
+	/// before a reload, which the browser has not finished releasing) has it open. Only one page
+	/// can use a database in a browser at a time. Waiting and trying again is the right answer.
+	pub fn is_database_locked(&self) -> bool {
+		matches!(self, Error::Io(e) if is_database_locked(e))
+	}
+}
+
+/// The payload of the error that a mount or a removal answers with for a directory that holds
+/// entries that are not a pool's: `InvalidInput`. They belong to somebody else, so a mount does not
+/// put a pool among them and a removal does not delete them.
+#[cfg_attr(
+	not(all(target_arch = "wasm32", target_os = "unknown")),
+	allow(
+		dead_code,
+		reason = "the directory of a pool is only checked over a browser's file system"
+	)
+)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NotAPool {
+	pub(crate) name: String,
+	/// The entries that are not a pool's, or the first few of them.
+	pub(crate) entries: Vec<String>,
+}
+
+impl fmt::Display for NotAPool {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(
+			f,
+			"the directory {:?} is not a database: it holds entries that are not a pool's ({}), which are left as they are",
+			self.name,
+			self.entries.join(", ")
+		)
+	}
+}
+
+impl std::error::Error for NotAPool {}
+
+/// The error for a directory that holds `entries` that are not a pool's.
+#[cfg_attr(
+	not(all(target_arch = "wasm32", target_os = "unknown")),
+	allow(
+		dead_code,
+		reason = "the directory of a pool is only checked over a browser's file system"
+	)
+)]
+pub(crate) fn not_a_pool(name: &str, mut entries: Vec<String>) -> io::Error {
+	entries.sort();
+	entries.truncate(8);
+	io::Error::new(
+		io::ErrorKind::InvalidInput,
+		NotAPool {
+			name: name.to_string(),
+			entries,
+		},
+	)
+}
+
+/// Whether `error` is the one that [`not_a_pool`] makes.
+#[allow(dead_code, reason = "read by the browser tests of the mount")]
+pub(crate) fn is_not_a_pool(error: &io::Error) -> bool {
+	error.get_ref().is_some_and(|inner| inner.is::<NotAPool>())
 }
 
 /// The error of an operation on a file system that has nothing mounted: `Unsupported`, with a

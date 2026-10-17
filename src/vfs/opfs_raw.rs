@@ -22,9 +22,12 @@
 //! loops over that, with the count of the bytes that landed, so [`RawFile::write_at`] here is one
 //! call and does not loop.
 //!
-//! What this file does not do: decide how many slots a pool has, wait for the lock (the mount does,
-//! at 50 to 100 ms for at least five seconds, which is how long the previous page of a reload may
-//! hold it), or open the public `FileSystem` (that is a later change).
+//! What this file does not do: decide how many slots a pool has, or wait for the lock (the mount
+//! does, at 50 to 100 ms for at least five seconds, which is how long the previous page of a reload
+//! may hold it). What it adds for the public `FileSystem::opfs` and `FileSystem::destroy_opfs` is
+//! the check that a directory is a pool before one is mounted in it or removed (see
+//! [`OpfsRaw::open_pool`] and [`OpfsRaw::destroy`]), and the question whether the browser keeps the
+//! storage of the origin (see [`storage_persisted`]).
 
 use std::io;
 
@@ -32,7 +35,8 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{FileSystemDirectoryHandle, FileSystemGetDirectoryOptions, FileSystemRemoveOptions};
 
-use super::pool::{Raw, RawFile, RawFut, LOCK_NAME};
+use super::not_a_pool;
+use super::pool::{parse_slot_name, Raw, RawFile, RawFut, LOCK_NAME};
 use crate::storage::opfs::{
 	create_sync_access_handle_io,
 	get_file_handle_io,
@@ -174,13 +178,46 @@ async fn open_file(
 	Ok(OpfsRawFile::from_sync_file(OpfsSyncFile::new(sync)))
 }
 
+/// Whether an entry of a pool directory is one that a pool makes: the lock, or a slot. Whatever its
+/// kind: these names are the pool's, and a directory by one of them is damage and not something
+/// of somebody else.
+fn is_pool_entry(name: &str) -> bool {
+	name == LOCK_NAME || parse_slot_name(name).is_some()
+}
+
 impl OpfsRaw {
-	/// The pool directory `name`, made if it is not there.
+	/// The pool directory `name`, made if it is not there. Does not look at what is in it: see
+	/// [`OpfsRaw::open_pool`].
 	pub(crate) async fn open(name: &str) -> io::Result<Self> {
 		Ok(Self {
 			dir: directory_io(name, true).await?,
 			name: name.to_string(),
 		})
+	}
+
+	/// The pool directory `name`, made if it is not there, and refused if it is there and is not a
+	/// pool: a directory that holds entries, none of which is the lock or a slot, is somebody
+	/// else's, and mounting a pool in it would put a lock and slots among them, and a later
+	/// `destroy` would have to decide what to do with what was there. `InvalidInput`, with
+	/// [`not_a_pool`] as the payload. A directory with a lock or a slot is a pool, whatever else
+	/// is in it: the mount leaves the other entries alone and reports them.
+	///
+	/// A name that is a file and not a directory is `InvalidInput` too, from the browser.
+	pub(crate) async fn open_pool(name: &str) -> io::Result<Self> {
+		match directory_io(name, false).await {
+			Ok(dir) => {
+				let names = list_names(&dir).await?;
+				if !names.is_empty() && !names.iter().any(|entry| is_pool_entry(entry)) {
+					return Err(not_a_pool(name, names));
+				}
+				Ok(Self {
+					dir,
+					name: name.to_string(),
+				})
+			}
+			Err(e) if e.kind() == io::ErrorKind::NotFound => Self::open(name).await,
+			Err(e) => Err(e),
+		}
 	}
 
 	/// The pool directory `name` if it is there, and `None` if it is not.
@@ -195,6 +232,7 @@ impl OpfsRaw {
 		}
 	}
 
+	#[cfg_attr(not(test), allow(dead_code, reason = "read by the tests"))]
 	pub(crate) fn name(&self) -> &str {
 		&self.name
 	}
@@ -202,23 +240,26 @@ impl OpfsRaw {
 	/// Removes the pool directory `name` with everything in it, which is how a database is
 	/// deleted. Removing what is not there is `Ok`, so that a delete can be repeated.
 	///
-	/// A pool that is mounted holds `LOCK`, and so does a page that has it open: this takes the
-	/// lock first, and if it cannot, fails with `PermissionDenied` (see
-	/// [`crate::storage::opfs::is_locked`]) and removes nothing. A handle on a slot that is still
-	/// open somewhere fails the removal of the directory in the same way. Nothing is removed in
-	/// part on purpose, but the browser does not promise that either.
+	/// What it removes is decided before anything is: a directory that holds an entry which is not
+	/// the lock or a slot is not removed, and the error ([`not_a_pool`], `InvalidInput`) names the
+	/// entries, because they are somebody else's. The lock and the slots go whatever they are,
+	/// also a lock or a slot that is a directory: the names are the pool's.
+	///
+	/// A pool that is mounted holds `LOCK`, and so does a page that has it open. The directory is
+	/// then removed in one call that the browser refuses as a whole (measured: with one file held
+	/// among sixteen, at four positions, all sixteen stayed) and that fails with
+	/// `PermissionDenied` (see [`crate::storage::opfs::is_locked`]). Nothing is removed in part on
+	/// purpose, but the browser does not promise that. A slot that is open somewhere and not by
+	/// a pool fails the removal in the same way.
 	pub(crate) async fn destroy(name: &str) -> io::Result<()> {
 		let Some(pool) = Self::open_existing(name).await? else {
 			return Ok(());
 		};
-		// The lock, without making it: a directory that was never mounted has none.
-		match get_file_handle_io(&pool.dir, LOCK_NAME, false).await {
-			Ok(handle) => {
-				let sync = create_sync_access_handle_io(&handle, LOCK_NAME).await?;
-				OpfsSyncFile::new(sync).close();
-			}
-			Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-			Err(e) => return Err(e),
+		let names = list_names(&pool.dir).await?;
+		let foreign: Vec<String> =
+			names.into_iter().filter(|entry| !is_pool_entry(entry)).collect();
+		if !foreign.is_empty() {
+			return Err(not_a_pool(name, foreign));
 		}
 		let root = opfs_root_io().await?;
 		let options = FileSystemRemoveOptions::new();
@@ -235,6 +276,41 @@ impl OpfsRaw {
 			}
 		}
 	}
+}
+
+/// Whether the browser keeps the storage of this origin until the user clears it
+/// (`navigator.storage.persisted()`, which works in a worker). Without it the browser may evict
+/// the whole origin under storage pressure. Asking for it (`navigator.storage.persist()`) is not
+/// possible from a worker, so the page does. `Unsupported` where the browser has no such call.
+pub(crate) async fn storage_persisted() -> io::Result<bool> {
+	let unsupported = |what: &str| {
+		io::Error::new(io::ErrorKind::Unsupported, format!("this browser has no {what}"))
+	};
+	let global = js_sys::global();
+	let navigator = js_sys::Reflect::get(&global, &"navigator".into())
+		.ok()
+		.filter(|value| !value.is_undefined())
+		.ok_or_else(|| unsupported("navigator"))?;
+	let storage = js_sys::Reflect::get(&navigator, &"storage".into())
+		.ok()
+		.filter(|value| !value.is_undefined())
+		.ok_or_else(|| unsupported("navigator.storage"))?;
+	let persisted: js_sys::Function = js_sys::Reflect::get(&storage, &"persisted".into())
+		.ok()
+		.and_then(|value| value.dyn_into().ok())
+		.ok_or_else(|| unsupported("navigator.storage.persisted"))?;
+	let promise = persisted
+		.call0(&storage)
+		.map_err(|e| map_js_error("ask whether the storage is persistent", &e))?;
+	let promise: js_sys::Promise = promise.dyn_into().map_err(|_| {
+		io::Error::new(io::ErrorKind::InvalidData, "persisted() did not return a promise")
+	})?;
+	let answer = JsFuture::from(promise)
+		.await
+		.map_err(|e| map_js_error("ask whether the storage is persistent", &e))?;
+	answer.as_bool().ok_or_else(|| {
+		io::Error::new(io::ErrorKind::InvalidData, "persisted() did not answer with a boolean")
+	})
 }
 
 impl Raw for OpfsRaw {
