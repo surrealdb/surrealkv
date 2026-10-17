@@ -123,7 +123,7 @@ fn check_name(name: &str) -> io::Result<()> {
 			io::ErrorKind::InvalidInput,
 			format!(
 				"{name:?} is not a name for a database in the origin private file system: it \
-				 must be one non-empty path component"
+				 must be one non-empty path component of at most {MAX_NAME_LEN} bytes"
 			),
 		));
 	}
@@ -246,8 +246,8 @@ impl OpfsRaw {
 	/// also a lock or a slot that is a directory: the names are the pool's.
 	///
 	/// A pool that is mounted holds `LOCK`, and so does a page that has it open. The directory is
-	/// then removed in one call that the browser refuses as a whole (measured: with one file held
-	/// among sixteen, at four positions, all sixteen stayed) and that fails with
+	/// then removed in one call that the browser refuses as a whole (Chrome refuses the whole
+	/// removal while one file is held) and that fails with
 	/// `PermissionDenied` (see [`crate::storage::opfs::is_locked`]). Nothing is removed in part on
 	/// purpose, but the browser does not promise that. A slot that is open somewhere and not by
 	/// a pool fails the removal in the same way.

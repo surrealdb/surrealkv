@@ -356,6 +356,12 @@ pub struct Options {
 /// four shards, and a shard admits an item of up to 97 percent of its share, which is about 4 MiB
 /// here, so a block of 64 KiB is admitted with room to spare. These are starting points and not
 /// measurements, and every one of them can be set.
+///
+/// The size of a memtable is the size of its arena, which holds the keys and the structure of the
+/// entries. The values are on the heap and are not counted in it, so it is not a bound on the
+/// memory that a memtable holds: that grows with the values that are written to it until it is
+/// flushed, and a memtable of large values is flushed late. A worker that stores large values
+/// should enable the value log, which keeps the values over its threshold out of the memtable.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod default_sizes {
 	pub(super) const MEMTABLE: usize = 100 * 1024 * 1024;

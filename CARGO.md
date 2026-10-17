@@ -439,9 +439,9 @@ SurrealKV builds for WebAssembly (`wasm32-unknown-unknown`). In a browser, a `Tr
 
 ### What works
 
-- A `Tree` in a dedicated Web Worker, over files in the OPFS: open, commit, read, flush, compaction, `close`, and open again, in the same worker or after a reload.
+- A `Tree` in a dedicated Web Worker, over files in the OPFS: open, commit, read, flush, compaction, `close`, and open again, in the same worker or, once the old worker has released its files, in a new one.
 - Write-ahead log replay when a database was not closed, with repair of a torn tail of the log.
-- The value log (`with_enable_vlog(true)`), versioned queries, and the zstd, lz4 and snappy block codecs.
+- The value log (`with_enable_vlog(true)`), which the browser tests cover. Versioned queries and the zstd, lz4 and snappy block codecs are built for the browser and tested over the memory file system on a native build, but not yet in a browser.
 - `FileSystem::memory()`, on any target and in any thread of a browser, including the main thread of a page. It keeps a database in memory and loses it with the page.
 
 The code runs on one thread. There is no async runtime to start, no thread to spawn and no `affinitypool` to install. A build with WebAssembly threads (`atomics`) is refused at compile time.
@@ -451,17 +451,18 @@ The code runs on one thread. There is no async runtime to start, no thread to sp
 - **A dedicated worker only.** The browser gives the synchronous file handles that the engine needs to dedicated workers only. A `Tree` over the OPFS cannot run on the main thread of a page, and the other kinds of worker are not supported.
 - **One tab per database.** A mount takes an exclusive lock on the database. It waits about five seconds for a worker that is closing, and then a second mount of the same name fails with an error for which `Error::is_database_locked` is true.
 - **Chrome is the only browser that is tested.** Firefox and Safari have not been examined.
-- **Not available yet:** encryption at rest, `create_checkpoint` and `restore_from_checkpoint`, the path-based tools (`inspect_db`, `describe_file` and `scrub_db`), and every migrator (RocksDB, SurrealKV v0.x and IndexedDB). Encryption and the two checkpoint calls fail with `Error::InvalidArgument` before they create anything. A directory in the file system that holds a RocksDB database, an IndexedDB dump or an interrupted migration is refused with `Error::MigrationFailed`, and nothing is read or moved. The path-based tools read the files of the operating system, which a browser does not have, and fail with an I/O error. Data in IndexedDB is not moved to the OPFS, and SurrealKV never deletes it.
+- **Not available yet:** encryption at rest, `create_checkpoint` and `restore_from_checkpoint`, the path-based tools (`inspect_db`, `describe_file` and `scrub_db`), and every migrator (RocksDB, SurrealKV v0.x and IndexedDB). Encryption and the two checkpoint calls fail with `Error::InvalidArgument` before they create anything. A directory in the file system that holds a RocksDB database, an IndexedDB dump or an interrupted migration is refused with `Error::MigrationFailed`, and nothing is moved or created. The path-based tools read the files of the operating system, which a browser does not have, and fail with an I/O error. Data in IndexedDB is not moved to the OPFS, and SurrealKV never deletes it.
 - **The files are not a database directory.** The files of a database in the OPFS are kept in a pool of files with their own format. A native build cannot open them, and there is no export yet.
-- **A fixed number of files.** The pool holds a fixed maximum number of files. A database that reaches it fails with an error that says so.
+- **A fixed number of files.** The pool holds a fixed maximum number of files. A database that reaches it fails with an error that says so. A session that writes and ends without a close leaves its records to the next open, which puts them in a table, and small tables are merged only as the database grows, so a database that is opened, written to a little and left thousands of times can reach the limit. Close the `Tree` when the application ends.
 - **The browser can evict the storage.** Unless the page has asked the browser to keep the storage of the origin (`navigator.storage.persist()`, which a worker cannot call), the browser can remove it when the disk fills. `FileSystem::persisted().await` tells the worker whether the request was granted.
-- **A full disk is an error.** When the browser refuses more storage (`QuotaExceededError`), a flush or a compaction fails with a storage-full error. That error does not stop the database.
+- **A full disk is an error.** When the browser refuses more storage (`QuotaExceededError`), the write fails with an error of kind `StorageFull`. A flush or a compaction that meets it fails and is tried again later, without stopping the database. A commit that meets it fails, and if part of its commit group was already applied the database can stop: close it and open it again. The first commit after the space returns can fail once.
+- **Memory is not bounded by the size of the memtable.** `max_memtable_size` counts the keys and the structure of the entries, not the values, which are on the heap. A worker that writes large values holds them in memory until the memtable is flushed. Enable the value log to keep the values over its threshold out of the memtable, and size the worker's data with its address space (at most 4 GiB) in mind.
 - **Long jobs block the worker.** A flush and a compaction run without a pause, so the worker does not answer other messages while one runs.
-- **Close the tree.** The worker cannot wait for an asynchronous close in a page-unload handler. Close the `Tree`, and then the `FileSystem`, when your application knows that it is ending, for example on a message from the page, and do it early: closing a `FileSystem` takes longer the more files the database has. A database that was not closed is opened again like one that a crash left behind.
+- **Close the tree.** The worker cannot wait for an asynchronous close in a page-unload handler. Close the `Tree`, and then the `FileSystem`, when your application knows that it is ending, for example on a message from the page, and do it early: closing a `FileSystem` takes longer the more files the database has. A database that was not closed is opened again like one that a crash left behind. After a reload without a close, the browser can take longer than the default wait to release the lock: the mount then fails with `Error::is_database_locked`, and can be tried again, or use `FileSystem::opfs_with_lock_wait` to wait longer.
 
 ### Durability in a browser
 
-`Durability::Eventual` is the default on every platform, in a browser too. With `Durability::Immediate`, a commit asks the browser to flush the file handle of the log before it returns. In a browser, `flush()` on a file handle puts the writes in order, and the specification does not say that the data is on stable storage. Do not rely on it to keep a commit through a power cut or a crash of the operating system, on any browser.
+`Durability::Eventual` is the default on every platform, in a browser too. With `Durability::Immediate`, a commit asks the browser to flush the file handle of the log before it returns. In a browser, `flush()` on a file handle asks the browser to try to transfer the cached changes to the storage device. The specification calls it an attempt and says that it can do nothing on some file systems, and browsers do not document what survives a power cut or a crash of the operating system. Do not rely on it to keep a commit through either, on any browser.
 
 ### Use
 
@@ -510,7 +511,7 @@ rustup target add wasm32-unknown-unknown
 cargo build --target wasm32-unknown-unknown
 ```
 
-No `RUSTFLAGS` are needed. The engine links zstd, which is C code, so a build that links an application or a test needs a C compiler and an archiver that write WebAssembly archives correctly. The archiver that comes with macOS writes an archive that has no members for WebAssembly objects, and the link then fails with undefined zstd symbols. On macOS, use the compiler and the archiver of LLVM:
+No `RUSTFLAGS` are needed. The engine links zstd, which is C code, so a build that links an application or a test needs a C compiler and an archiver that write WebAssembly archives correctly. The archiver that comes with macOS writes an archive that has no members for WebAssembly objects, and the link can then fail. On macOS, use the compiler and the archiver of LLVM:
 
 ```bash
 brew install llvm
@@ -533,7 +534,7 @@ WASM_BINDGEN_TEST_TIMEOUT=300 WASM_BINDGEN_USE_DEDICATED_WORKER=1 \
 
 `opfs_engine_test` runs a `Tree` over the real OPFS: it commits enough data to rotate the log, flush and compact, closes and opens the database again, mounts the files again, opens a database that was left without a close, and repairs a torn log tail, with and without the value log. The tests that simulate a crash release the file handles without flushing. They do not terminate a worker, and they do not cut the power.
 
-CI runs these tests (every `tests/opfs_*.rs` target and the `--lib` unit tests) in headless Chrome on Linux, and the IndexedDB reader in Chrome and in Node.js. It also checks, lints and builds the crate for `wasm32-unknown-unknown`, and fails if the zstd archive of that build has no members. The native test suite also runs over the memory file system, the same pool of files that the browser uses.
+CI runs these tests (every `tests/opfs_*.rs` target and the `--lib` unit tests) in headless Chrome on Linux. The tests of the IndexedDB reader run in Node.js only: the Chrome run skips them. CI also checks, lints and builds the crate for `wasm32-unknown-unknown`, and checks the zstd archive of that build when one is present, and fails if it has no members. The unit tests of the library also run in CI over the memory file system, which uses the same pool logic as the browser over a memory backend instead of the OPFS. The tests that need a real directory, encryption or checkpoints skip themselves.
 
 ---
 

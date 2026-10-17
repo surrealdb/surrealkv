@@ -725,12 +725,14 @@ impl FileSystem {
 	///   its log, which is what happens after a crash, and the lock of the old page may still be
 	///   held when the new one asks. Await [`Tree::close`](crate::Tree::close) and then
 	///   [`FileSystem::close`] before the worker is terminated.
-	/// * **`flush` orders, it does not promise.** What a commit with
+	/// * **`flush` is an attempt, not a promise.** What a commit with
 	///   [`Durability::Immediate`](crate::Durability::Immediate) waits for is the flush of the
-	///   access handle of the browser, which puts the writes before it ahead of the writes after
-	///   it. What the browser promises about a power cut, on any platform, is not known, and this
-	///   crate does not claim it. [`Durability::Eventual`](crate::Durability::Eventual), the
-	///   default, does not wait for it at all.
+	///   access handle of the browser, which asks the browser to try to transfer the cached changes
+	///   to the storage device. The specification calls it an attempt and says that it can do
+	///   nothing on some file systems. What the browser promises about a power cut, on any
+	///   platform, is not known, and this crate does not claim it.
+	///   [`Durability::Eventual`](crate::Durability::Eventual), the default, does not wait for it
+	///   at all.
 	/// * **The storage may be evicted** unless the browser has been told to keep it: see
 	///   [`FileSystem::persisted`]. A full origin fails a write with an error of kind
 	///   `StorageFull`. The background flush and compaction try again after it, and a commit that
@@ -742,8 +744,8 @@ impl FileSystem {
 	/// file system for the origin (some private windows); `PermissionDenied`, for which
 	/// [`Error::is_database_locked`] is true, if the database is open elsewhere; `StorageFull` if
 	/// the origin has no room for the files of a new database; `InvalidInput` if `name` is not one
-	/// path component, or the directory of that name holds entries that are not a database's
-	/// (it is left as it is).
+	/// path component of at most 200 bytes, or the directory of that name holds entries that are
+	/// not a database's (it is left as it is).
 	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 	pub async fn opfs(name: &str) -> Result<Self> {
 		Self::mount_opfs(name, PoolConfig::default()).await
@@ -811,8 +813,10 @@ impl FileSystem {
 
 	/// Flushes what has to be flushed, cleans the files that were removed, and releases every
 	/// handle of the file system, and with them the lock of a database in a browser. Calling it
-	/// again does nothing. A file that is read or written after it fails with `NotConnected`, so
-	/// close the trees first: a tree whose file system is closed under it fails what it does next.
+	/// again does nothing. A file that is read after it fails with `NotConnected`. A commit or a
+	/// flush that meets it fails too, with the error of the browser for a closed handle, which
+	/// is not always of that kind. So close the trees first: a tree whose file system is closed
+	/// under it fails what it does next.
 	/// Nothing to do for a file system that is not a pool.
 	///
 	/// The flushes are made in one go, and take longer the more files the database has, so a page

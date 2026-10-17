@@ -891,17 +891,11 @@ async fn a_pool_mounts_after_the_worker_that_held_it_was_terminated() {
 	destroy_and_verify(&name).await;
 }
 
-/// The same with a worker that is in the middle of a loop, which the browser stops about two
-/// seconds late. Measured in Chrome 155 on one Mac (headless, polling every 50 to 75 ms): a loop in
-/// JavaScript released the lock after 2.00 to 2.09 s in 13 samples. A loop that writes and flushes
-/// released it after 2.13 to 2.49 s in 12 samples, after 6.3 s in one, and after more than 10 s in
-/// one (a mount that gave up at 10 s); and one run that held a worker of each mode took 47.5 s
-/// altogether, one of the two about 45 s (which one is not recorded). The slow samples were in the
-/// first runs, while other builds were using the machine, and none came in the last 8 runs: the
-/// cause is not established. What it shows is that the lock of a page that was killed in the middle
-/// of a write may be held for much longer than the five seconds that the mount polls for by
-/// default. The mount then fails with the lock error and a later one succeeds, so the test polls
-/// for up to 90 s, prints how long it took, and holds the mount to no time.
+/// The same with a worker that is in the middle of a loop, which the browser stops late. The
+/// lock of a page that was killed in the middle of a write may be held for much longer than the
+/// five seconds that the mount polls for by default. The mount then fails with the lock error and
+/// a later one succeeds, so the test polls for up to 90 s, prints how long it took, and holds the
+/// mount to no time.
 #[wasm_bindgen_test]
 async fn a_pool_mounts_after_a_busy_worker_that_held_it_was_terminated() {
 	for mode in ["spin", "write"] {
@@ -1339,7 +1333,7 @@ async fn the_lock_that_another_worker_holds_is_asked_for_every_few_tens_of_milli
 	let waited = started.elapsed();
 	let tries = tries.load(Ordering::SeqCst);
 	assert!(waited >= Duration::from_millis(300), "it kept trying for its deadline: {waited:?}");
-	// One try, and one more per 25 ms: 13 at the most; each costs a few milliseconds, so fewer. A
+	// One try, and one more per 25 ms: 13 at the most; each takes a moment, so fewer. A
 	// loop that does not wait tries hundreds of times, so the floor can be low for a slow machine.
 	assert!((2..=14).contains(&tries), "{tries} tries in {waited:?}");
 	let Error::Io(io_error) = error else {

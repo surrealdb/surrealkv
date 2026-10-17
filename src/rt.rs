@@ -20,7 +20,7 @@
 //! * A loop that yields through the microtask queue ([`yield_now`]) starves the event loop: the
 //!   completion of an OPFS call, a timer or a message waits until the loop ends. [`relax`] yields
 //!   through a macrotask, over one `MessageChannel` port. `setTimeout(0)` is not an option for it:
-//!   a chain of them is clamped to 4 ms or more each (measured: 4.9 ms per yield in Chrome).
+//!   browsers clamp a chain of them to a delay of several milliseconds each.
 //!
 //! `scripts/check-rt-guard.sh` fails if `tokio::spawn`, `tokio::time`, `std::time`'s `Instant`
 //! or `SystemTime`, `affinitypool::spawn`, `std::thread::spawn` and `sleep` and the other calls
@@ -482,8 +482,8 @@ mod browser {
 
 	/// Lets the event loop run: the completions of OPFS calls, timers and messages that are
 	/// waiting are delivered before this returns, which a loop that yields with [`yield_now`]
-	/// alone never lets happen. A macrotask yield over one persistent `MessageChannel` port, at
-	/// about 4 microseconds a yield (measured in Chrome 155).
+	/// alone never lets happen. A macrotask yield over one persistent `MessageChannel` port, which
+	/// is cheap enough to call in a loop.
 	pub(crate) fn relax() -> Relax {
 		Relax {
 			waiting: Rc::new(Waiting {
