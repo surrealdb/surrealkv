@@ -7,6 +7,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use test_log::test;
 
+use super::tfs;
 use crate::vlog::{
 	VLog,
 	VLogFileHeader,
@@ -32,7 +33,7 @@ fn create_test_vlog(opts: Option<Options>) -> (VLog, TempDir, Arc<Options>) {
 	opts.path = temp_dir.path().to_path_buf();
 
 	// Create vlog subdirectory
-	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+	crate::test::tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
 
 	let opts = Arc::new(opts);
 	let opts_clone = Arc::clone(&opts);
@@ -472,6 +473,9 @@ async fn test_vlog_with_file_header() {
 
 #[test(tokio::test)]
 async fn test_vlog_restart_continues_last_file() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let temp_dir = TempDir::new().unwrap();
 	let vlog_max_file_size = 2048;
 	let opts = Options {
@@ -482,7 +486,7 @@ async fn test_vlog_restart_continues_last_file() {
 	};
 
 	// Create vlog subdirectory
-	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+	crate::test::tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
 
 	let opts = Arc::new(opts);
 
@@ -622,7 +626,7 @@ async fn test_vlog_restart_with_multiple_files() {
 	};
 
 	// Create vlog subdirectory
-	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+	crate::test::tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
 
 	let opts = Arc::new(opts);
 
@@ -763,6 +767,9 @@ async fn test_vlog_restart_with_multiple_files() {
 
 #[test(tokio::test)]
 async fn test_vlog_writer_reopen_append_only_behavior() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let temp_dir = TempDir::new().unwrap();
 	let vlog_max_file_size = 2048;
 	let opts = Arc::new(Options {
@@ -1230,6 +1237,9 @@ async fn a_sync_leaves_a_file_that_rolled_over_while_it_ran_queued() {
 /// window as a restore that runs in the middle of the fsync.
 #[test(tokio::test)]
 async fn a_sync_that_outlasts_a_reload_leaves_the_queued_file_that_has_the_id_it_fsynced() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (vlog, dir, _) = create_test_vlog(Some(Options {
 		vlog_max_file_size: 1024,
 		vlog_checksum_verification: VLogChecksumLevel::Full,
@@ -1293,6 +1303,9 @@ async fn a_sync_that_outlasts_a_reload_leaves_the_queued_file_that_has_the_id_it
 /// must fsync them instead of returning because a sync that ran across the reload completed.
 #[test(tokio::test)]
 async fn a_sync_that_outlasts_a_reload_does_not_settle_what_came_after_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (vlog, dir, _) = create_test_vlog(Some(Options {
 		vlog_max_file_size: 1024,
 		vlog_checksum_verification: VLogChecksumLevel::Full,
@@ -1341,6 +1354,9 @@ async fn a_sync_that_outlasts_a_reload_does_not_settle_what_came_after_it() {
 /// are not used for it.
 #[test(tokio::test)]
 async fn a_reload_makes_the_reads_of_a_file_id_go_to_the_restored_file() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (vlog, _dir, _) = create_test_vlog(None);
 	let old = vlog.append(b"key", &value_of(1, 300)).unwrap();
 	vlog.sync().unwrap();
@@ -1550,6 +1566,9 @@ async fn a_reopened_log_fsyncs_its_active_file_once() {
 /// leaves it for the next one.
 #[test(tokio::test)]
 async fn a_sync_fsyncs_the_directory_once_for_the_files_created_since_the_last() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (vlog, _dir, _) = create_test_vlog(Some(Options {
 		vlog_max_file_size: 1024,
 		vlog_checksum_verification: VLogChecksumLevel::Full,
@@ -1630,6 +1649,9 @@ impl Rng {
 ///   did.
 #[test]
 fn a_random_sequence_of_appends_failures_rollovers_and_syncs_matches_the_model() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let sizes = [0usize, 1, 40, 40, 300, 700, 700, 2_000, 4_000, 8_180, 8_192, 9_000, 15_000];
 	let (mut failed_appends, mut failed_syncs, mut rollovers) = (0, 0, 0);
 	for seed in 1..=4u64 {
@@ -1832,6 +1854,9 @@ fn names_in(dir: &Path) -> Vec<String> {
 /// new file.
 #[test]
 fn a_plaintext_file_that_a_crash_left_without_its_header_is_set_aside() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let header = VLogFileHeader::new(2, 1 << 20, 0).encode();
 	let torn: [(&str, Vec<u8>); 5] = [
 		("a byte of the magic", header[..1].to_vec()),
@@ -1847,7 +1872,7 @@ fn a_plaintext_file_that_a_crash_left_without_its_header_is_set_aside() {
 			vlog_max_file_size: 1 << 20,
 			..Default::default()
 		});
-		std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+		crate::test::tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
 		let pointer = {
 			let vlog = VLog::new(Arc::clone(&opts)).unwrap();
 			let pointer = vlog.append(b"key", &value_of(1, 100)).unwrap();
@@ -1885,6 +1910,9 @@ fn a_plaintext_file_that_a_crash_left_without_its_header_is_set_aside() {
 /// the directory as it is.
 #[test]
 fn a_plaintext_file_is_set_aside_only_for_the_start_of_its_own_header() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let header = VLogFileHeader::new(2, 1 << 20, 0).encode();
 	let other = VLogFileHeader::new(7, 1 << 20, 0).encode();
 	let mut flipped = header[..20].to_vec();
@@ -1901,7 +1929,7 @@ fn a_plaintext_file_is_set_aside_only_for_the_start_of_its_own_header() {
 			vlog_max_file_size: 1 << 20,
 			..Default::default()
 		});
-		std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+		crate::test::tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
 		// A file 1 with an entry, or a file 3 when file 1 is the one under test.
 		let whole = if file_id == 1 {
 			3

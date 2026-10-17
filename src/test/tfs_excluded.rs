@@ -377,6 +377,20 @@ pub(crate) static EXCLUDED: &[Rule] = &[
 	rule("test::wal_sealed_writer_tests::a_tree_replaces_a_failed_sealed_segment_with_one_that_has_its_own_salt", Why::Encryption),
 	rule("test::wal_sealed_writer_tests::a_tree_that_is_opened_again_writes_to_a_new_segment_and_leaves_the_old_one_alone", Why::Encryption),
 	rule("test::wal_stale_rounds_tests::a_storm_of_checkpoints_and_seals_never_fails_a_logged_commit", Why::Checkpoint),
+	rule("test::legacy_migration_tests::an_unversioned_database_keeps_the_timestamps_of_its_versions_too", Why::Migrator),
+	rule("test::legacy_migration_tests::the_migration_keeps_every_version_with_its_timestamp_and_sequence_number", Why::Migrator),
+	rule("test::rocksdb_migration_tests::a_database_a_rocksdb_process_has_open_is_not_migrated", Why::Migrator),
+	rule("test::rocksdb_migration_tests::a_versioned_database_keeps_every_version_with_its_converted_timestamp", Why::Migrator),
+	rule("test::rocksdb_migration_tests::an_unversioned_database_keeps_the_newest_value_of_each_key_and_no_timestamps", Why::Migrator),
+	rule("test::vlog_tests::a_plaintext_file_is_set_aside_only_for_the_start_of_its_own_header", Why::StdFiles),
+	rule("test::vlog_tests::a_plaintext_file_that_a_crash_left_without_its_header_is_set_aside", Why::StdFiles),
+	rule("test::vlog_tests::a_random_sequence_of_appends_failures_rollovers_and_syncs_matches_the_model", Why::StdFiles),
+	rule("test::vlog_tests::a_reload_makes_the_reads_of_a_file_id_go_to_the_restored_file", Why::StdFiles),
+	rule("test::vlog_tests::a_sync_fsyncs_the_directory_once_for_the_files_created_since_the_last", Why::StdFiles),
+	rule("test::vlog_tests::a_sync_that_outlasts_a_reload_does_not_settle_what_came_after_it", Why::StdFiles),
+	rule("test::vlog_tests::a_sync_that_outlasts_a_reload_leaves_the_queued_file_that_has_the_id_it_fsynced", Why::StdFiles),
+	rule("test::vlog_tests::test_vlog_restart_continues_last_file", Why::StdFiles),
+	rule("test::vlog_tests::test_vlog_writer_reopen_append_only_behavior", Why::StdFiles),
 ];
 
 /// The tests that are left out of `mem-strict` only. A pool there is refilled by what waits for

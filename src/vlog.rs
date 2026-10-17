@@ -1379,9 +1379,10 @@ impl VLog {
 		self.opts.vlog_file_path(file_id as u64)
 	}
 
-	/// Creates a new VLog instance on the operating system's file system.
+	/// Creates a new VLog instance in the file system of the options, which is the operating
+	/// system's unless the options say otherwise.
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
-		Self::new_in(vfs::default_fs(), opts)
+		Self::new_in(Arc::clone(&opts.fs), opts)
 	}
 
 	/// Creates a new VLog instance in `fs`.

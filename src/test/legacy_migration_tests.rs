@@ -392,6 +392,9 @@ async fn opening_a_v0_21_4_database_migrates_it_and_every_key_reads_as_it_did() 
 
 #[test]
 fn the_migration_keeps_every_version_with_its_timestamp_and_sequence_number() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for name in ["tiny-versioned", "tiny-versioned-wal-only", "tiny-versioned-wal-tail"] {
 		let (_dir, opts, oracle) = database(name, true);
 		let report = migrate_if_needed(&opts).unwrap().expect("a legacy database");
@@ -402,6 +405,9 @@ fn the_migration_keeps_every_version_with_its_timestamp_and_sequence_number() {
 
 #[test]
 fn an_unversioned_database_keeps_the_timestamps_of_its_versions_too() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for name in ["tiny-plain", "tiny-wal-only", "tiny-wal-tail"] {
 		let (_dir, opts, oracle) = database(name, true);
 		let report = migrate_if_needed(&opts).unwrap().expect("a legacy database");

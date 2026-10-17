@@ -296,6 +296,9 @@ async fn opening_a_rocksdb_database_migrates_it_and_every_key_reads_as_rocksdb_r
 
 #[test]
 fn a_versioned_database_keeps_every_version_with_its_converted_timestamp() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for name in ["tiny-versioned", "tiny-versioned-wal-only", "tiny-versioned-wal-tail"] {
 		let (_dir, opts, dump) = database(name, true);
 		let report = migrate_if_needed(&opts).unwrap().expect("a RocksDB database");
@@ -307,6 +310,9 @@ fn a_versioned_database_keeps_every_version_with_its_converted_timestamp() {
 
 #[test]
 fn an_unversioned_database_keeps_the_newest_value_of_each_key_and_no_timestamps() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for name in ["tiny-plain", "tiny-plain-wal-only"] {
 		let (_dir, opts, dump) = database(name, true);
 		let report = migrate_if_needed(&opts).unwrap().expect("a RocksDB database");
@@ -437,6 +443,9 @@ async fn a_migration_cut_short_at_any_step_is_resumed() {
 #[cfg(unix)]
 #[test]
 fn a_database_a_rocksdb_process_has_open_is_not_migrated() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (dir, opts, _) = database("tiny-versioned", true);
 	let lock = dir.path().join("LOCK");
 	let child = Command::new("python3")

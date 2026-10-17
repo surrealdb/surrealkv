@@ -27,6 +27,9 @@ fn options(dir: &Path) -> Arc<Options> {
 		..Default::default()
 	};
 	opts.path = dir.to_path_buf();
+	// The files of these tests are on the disk by design: what the log leaves is compared with
+	// what it left on `std` before the move onto the seam, and the other group counts its calls.
+	opts.fs = crate::vfs::default_fs();
 	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
 	Arc::new(opts)
 }

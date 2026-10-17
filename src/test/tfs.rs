@@ -94,6 +94,9 @@ pub(crate) enum Why {
 	StdOnlyApi,
 	/// The test is about `std` being the default file system, or runs the engine on it by name.
 	StdDefault,
+	/// The test makes, copies, damages or counts the files of the value log with `std::fs` and
+	/// the fsyncs of the disk itself, and the log it drives is on the disk with them.
+	StdFiles,
 	/// A pool does this differently on purpose (it replaces the manifest without a temporary
 	/// name).
 	PoolDesign,
@@ -118,6 +121,7 @@ impl Why {
 			Why::Allocations => "allocations",
 			Why::StdOnlyApi => "std-only-api",
 			Why::StdDefault => "std-default",
+			Why::StdFiles => "std-files",
 			Why::PoolDesign => "pool-design",
 			Why::StrictByHand => "strict-by-hand",
 			Why::EngineBug(_) => "engine-bug",
@@ -135,6 +139,7 @@ impl Why {
 			Why::Allocations => "the test counts the allocations of the write path",
 			Why::StdOnlyApi => "the API under test reads the disk with std::fs",
 			Why::StdDefault => "the test is about std being the default file system",
+			Why::StdFiles => "the test makes and damages the files of the log with std::fs",
 			Why::PoolDesign => "a pool does this differently on purpose",
 			Why::StrictByHand => "the test drives the work by hand, which waits for no spare files",
 			Why::EngineBug(text) => text,
