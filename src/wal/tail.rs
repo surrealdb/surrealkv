@@ -1,0 +1,207 @@
+//! What the open holds the last segment of the log to: the values its records point to are in the
+//! value log.
+//!
+//! A commit that waited for a sync made the value log and the log durable up to its record, and a
+//! rotation of the log and the flush of a memtable do the same for what lies before them. So the
+//! records of the last segment are the only ones whose values the open has to look for. A record
+//! whose value is not in the value log ends the log there: it and the records after it were not
+//! acknowledged as durable.
+//!
+//! The open reads the records of that segment before it replays them, and holds the entry that
+//! each pointer names to what the pointer says, see [`VLog::check_entry`]. The segment ends at the
+//! first record that fails, as far as the recovery mode lets it:
+//!
+//! * `AbsoluteConsistency` fails the open, and names the segment and the offset of the record.
+//! * `SalvageValidPrefix` ends the segment before that record.
+//! * `TolerateTornTail` does the same if no record after it points to a value that is in the log,
+//!   which is what a value log that lost its tail looks like, and refuses otherwise.
+//!
+//! An encrypted log is held to the same rule: the records of its segment are authenticated when
+//! they are read, and an entry of a sealed file is held to its length and to the checksum of what
+//! is stored, which is what can be told without the key.
+//!
+//! The records that are kept are made durable before the open starts another segment: the files
+//! that their pointers name, and the segment itself, see [`TailCheck::make_durable`].
+
+use std::collections::BTreeSet;
+use std::path::Path;
+
+use super::reader::Reader;
+use super::{directory_present, Error as WalError, SegmentRef, WalContext};
+use crate::batch::Batch;
+use crate::error::{Error, Result};
+use crate::vfs::Fs;
+use crate::vlog::{VLog, ValuePointer};
+use crate::WalRecoveryMode;
+
+/// Where the last segment of the log ends, once the values that its records point to were looked
+/// for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TailEnd {
+	/// Every record is kept.
+	Whole,
+	/// The segment ends before the record `record` (the first is 0), at byte `offset`. That record
+	/// and the ones after it, `dropped` in all, are left out.
+	Cut {
+		record: usize,
+		offset: usize,
+		dropped: usize,
+	},
+}
+
+/// The check of the last segment of the log against the value log.
+pub(crate) struct TailCheck<'a> {
+	vlog: &'a VLog,
+	/// The one buffer that every entry is read into.
+	buf: Vec<u8>,
+	/// The files that the pointers of the records that are kept name.
+	files: BTreeSet<u32>,
+	/// The files that the pointers of the record that is looked at name.
+	record_files: Vec<u32>,
+	/// The segment that was read, if a record of it that is kept points into the value log.
+	segment: Option<SegmentRef>,
+}
+
+/// The last segment of the log in `wal_dir`, if the replay reads it: one that is not below
+/// `min_wal_number`, which is in tables.
+pub(crate) fn last_segment(
+	fs: &dyn Fs,
+	wal_dir: &Path,
+	min_wal_number: u64,
+) -> Result<Option<SegmentRef>> {
+	if !directory_present(fs, wal_dir)? {
+		return Ok(None);
+	}
+	let mut segments = SegmentRef::read_segments_from_directory_in(fs, wal_dir, Some("wal"))?;
+	Ok(segments.pop().filter(|segment| segment.id >= min_wal_number))
+}
+
+impl<'a> TailCheck<'a> {
+	pub(crate) fn new(vlog: &'a VLog) -> Self {
+		Self {
+			vlog,
+			buf: Vec::new(),
+			files: BTreeSet::new(),
+			record_files: Vec::new(),
+			segment: None,
+		}
+	}
+
+	/// The first pointer of `batch` whose entry is not in the value log, if there is one. The
+	/// files of the pointers that precede it are in `record_files`.
+	fn first_missing(&mut self, batch: &Batch) -> Result<Option<ValuePointer>> {
+		self.record_files.clear();
+		for pointer in batch.value_pointers() {
+			if !self.vlog.check_entry(&pointer, &mut self.buf)? {
+				return Ok(Some(pointer));
+			}
+			self.record_files.push(pointer.file_id);
+		}
+		Ok(None)
+	}
+
+	/// Whether an entry that a pointer of `batch` names is in the value log.
+	fn holds_a_value(&mut self, batch: &Batch) -> Result<bool> {
+		for pointer in batch.value_pointers() {
+			if self.vlog.check_entry(&pointer, &mut self.buf)? {
+				return Ok(true);
+			}
+		}
+		Ok(false)
+	}
+
+	/// Reads the records of `segment`, the last one of the log, and says where it ends.
+	///
+	/// A read that stops before the end of the segment, because the segment is damaged, ends the
+	/// check there: the replay that follows meets the same damage and repairs it as it always
+	/// did, and what was read is what is kept.
+	pub(crate) fn run(
+		&mut self,
+		context: &WalContext,
+		segment: &SegmentRef,
+		mode: WalRecoveryMode,
+	) -> Result<TailEnd> {
+		self.files.clear();
+		self.segment = None;
+
+		let file = context.fs.open_read(&segment.file_path)?;
+		let mut reader = Reader::with_context(file, None, segment.id, context);
+		let segment_id = segment.id as usize;
+
+		// Where the record that is read begins: the end of the one before it.
+		let mut start = 0;
+		let mut record = 0;
+		let mut failed: Option<(usize, usize)> = None;
+		let mut dropped = 0;
+		loop {
+			let (data, end) = match reader.read() {
+				Ok(read) => read,
+				// The end of the segment, or damage that the replay that follows meets again and
+				// repairs as it always did.
+				Err(WalError::Corruption(_)) => break,
+				Err(WalError::IO(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+				Err(e) => return Err(e.into()),
+			};
+			let end = end as usize;
+			let batch = Batch::decode(data)?;
+			match failed {
+				None => {
+					if let Some(missing) = self.first_missing(&batch)? {
+						let place = format!(
+							"the value that record {record} points to is not in the value log \
+							 (file {}, offset {})",
+							missing.file_id, missing.offset
+						);
+						if mode == WalRecoveryMode::AbsoluteConsistency {
+							return Err(Error::wal_corruption(segment_id, start, place));
+						}
+						failed = Some((record, start));
+						dropped = 1;
+					} else {
+						self.files.extend(self.record_files.iter().copied());
+					}
+				}
+				Some((first, offset)) => {
+					dropped += 1;
+					if mode == WalRecoveryMode::TolerateTornTail && self.holds_a_value(&batch)? {
+						return Err(Error::Other(format!(
+							"WAL segment {:020}.wal at offset {offset}: the value that record {first} \
+							 points to is not in the value log, and a record after it points to one \
+							 that is. The log is not cut automatically: configure \
+							 WalRecoveryMode::SalvageValidPrefix to end it at that record.",
+							segment.id
+						)));
+					}
+				}
+			}
+			start = end;
+			record += 1;
+		}
+
+		if !self.files.is_empty() {
+			self.segment = Some(segment.clone());
+		}
+		Ok(match failed {
+			None => TailEnd::Whole,
+			Some((record, offset)) => TailEnd::Cut {
+				record,
+				offset,
+				dropped,
+			},
+		})
+	}
+
+	/// Makes durable what the records that are kept point to: the files of the value log that
+	/// their pointers name, and then the segment, so that no record of it is on disk without its
+	/// value. Nothing is synced if no kept record points into the value log. Called once the
+	/// segment has been cut if it was to be, and before the open starts another segment: a
+	/// segment that is not the last one is not checked when the database is opened again.
+	pub(crate) fn make_durable(&self, fs: &dyn Fs) -> Result<()> {
+		let Some(segment) = &self.segment else {
+			return Ok(());
+		};
+		self.vlog.sync_files(&self.files)?;
+		fs.sync_file(&segment.file_path)?;
+		Ok(())
+	}
+}

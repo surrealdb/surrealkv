@@ -1,11 +1,11 @@
 //! LSM Recovery Integration Tests
 
-use std::fs;
 use std::path::PathBuf;
 
 use tempfile::TempDir;
 use test_log::test;
 
+use super::{sfs, sfs as fs};
 use crate::test::recovery_test_helpers::RecoveryTestHelper;
 use crate::TreeBuilder;
 
@@ -599,7 +599,7 @@ async fn test_recovery_with_no_wal_files() {
 	}
 
 	// Manually delete all WAL files (simulating cleanup)
-	if wal_dir.exists() {
+	if sfs::exists(&wal_dir) {
 		for entry in fs::read_dir(&wal_dir).unwrap().flatten() {
 			if entry.path().extension().and_then(|s| s.to_str()) == Some("wal") {
 				fs::remove_file(entry.path()).ok();

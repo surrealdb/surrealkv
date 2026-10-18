@@ -28,6 +28,7 @@ use super::encryption_open_tests::{
 	SUITES,
 };
 use super::sstable_encryption_tests::{first_of, flip, walk};
+use super::tfs;
 use crate::error::{EncryptionError, KeyProviderFailure};
 use crate::sstable::block_io::{BlockKind, TrailerLayout};
 use crate::tde::{
@@ -231,6 +232,9 @@ fn added_files(
 
 #[tokio::test]
 async fn a_flush_that_waits_for_the_key_provider_runs_again_until_the_data_is_in_a_table() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let km = SwitchManager::new();
@@ -289,6 +293,9 @@ async fn a_flush_that_waits_for_the_key_provider_runs_again_until_the_data_is_in
 
 #[tokio::test]
 async fn a_compaction_that_waits_for_the_key_provider_runs_again_and_the_database_goes_on() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let km = SwitchManager::new();
@@ -340,6 +347,9 @@ async fn a_compaction_that_waits_for_the_key_provider_runs_again_and_the_databas
 
 #[tokio::test]
 async fn a_key_error_that_trying_again_cannot_cure_stops_writes_at_a_flush_and_changes_no_file() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		for (mode, expected) in [
 			(Mode::Refuses, EncryptionError::KeyProvider(KeyProviderFailure::Failed)),
@@ -416,6 +426,9 @@ async fn a_key_error_that_trying_again_cannot_cure_stops_writes_at_a_flush_and_c
 #[tokio::test]
 async fn a_key_error_that_trying_again_cannot_cure_stops_writes_at_a_compaction_and_changes_no_file(
 ) {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let km = SwitchManager::new();
@@ -463,6 +476,9 @@ async fn a_key_error_that_trying_again_cannot_cure_stops_writes_at_a_compaction_
 
 #[tokio::test]
 async fn a_table_that_fails_authentication_in_a_compaction_is_reported_as_such_and_is_left_alone() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let km = SwitchManager::new();

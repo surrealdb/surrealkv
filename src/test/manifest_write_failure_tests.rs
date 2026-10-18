@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use tempdir::TempDir;
 use test_log::test;
 
-use super::collect_transaction_all;
+use super::{collect_transaction_all, sfs, tfs};
 use crate::error::{BackgroundErrorReason, ErrorSeverity, Result};
 use crate::levels::{fail_replacements, heal_replacements, ReplaceFailure};
 use crate::lsm::FlushHook;
@@ -124,7 +124,7 @@ pub(super) fn manifest_path(tree: &Tree) -> PathBuf {
 
 /// The files a failed replacement leaves next to the manifest.
 pub(super) fn temp_files(manifest: &Path) -> Vec<String> {
-	std::fs::read_dir(manifest.parent().unwrap())
+	sfs::read_dir(manifest.parent().unwrap())
 		.unwrap()
 		.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
 		.filter(|name| name.starts_with(".tmp_"))
@@ -132,8 +132,8 @@ pub(super) fn temp_files(manifest: &Path) -> Vec<String> {
 }
 
 pub(super) fn copy_dir_all(src: &Path, dst: &Path) {
-	std::fs::create_dir_all(dst).unwrap();
-	for entry in std::fs::read_dir(src).unwrap() {
+	sfs::create_dir_all(dst).unwrap();
+	for entry in sfs::read_dir(src).unwrap() {
 		let entry = entry.unwrap();
 		if entry.file_name() == "LOCK" {
 			continue;
@@ -142,7 +142,7 @@ pub(super) fn copy_dir_all(src: &Path, dst: &Path) {
 		if entry.file_type().unwrap().is_dir() {
 			copy_dir_all(&entry.path(), &to);
 		} else {
-			std::fs::copy(entry.path(), &to).unwrap();
+			sfs::copy(entry.path(), &to).unwrap();
 		}
 	}
 }
@@ -239,6 +239,9 @@ async fn stopped_by(tree: &Tree) -> Error {
 /// listed once, in the live tree, in a crash image and after a close and reopen.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_manifest_write_that_fails_once_is_retried_and_the_database_resumes() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_fail_once").unwrap();
 	let images = TempDir::new("manifest_fail_once_image").unwrap();
 	let tree = open(dir.path());
@@ -292,6 +295,9 @@ async fn a_manifest_write_that_fails_once_is_retried_and_the_database_resumes() 
 /// database reopened.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_manifest_write_that_keeps_failing_keeps_the_database_stopped_and_close_returns() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_fail_always").unwrap();
 	let tree = open(dir.path());
 	let expected = put(&tree, 0..300).await;
@@ -326,6 +332,9 @@ async fn a_manifest_write_that_keeps_failing_keeps_the_database_stopped_and_clos
 /// manifest, reopens with every commit and the table listed once.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_manifest_write_that_may_have_replaced_the_manifest_stays_fatal() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_fail_after").unwrap();
 	let images = TempDir::new("manifest_fail_after_image").unwrap();
 	let tree = open(dir.path());
@@ -371,6 +380,9 @@ async fn a_manifest_write_that_may_have_replaced_the_manifest_stays_fatal() {
 /// recorded before the flush failed, however severe it is, and one that came while it was failing.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_flush_that_recovers_does_not_clear_another_failure() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_fail_other").unwrap();
 	let tree = open(dir.path());
 	let mut expected = put(&tree, 0..200).await;
@@ -480,6 +492,9 @@ async fn a_checkpoint_that_cannot_write_the_manifest_does_not_stop_the_database(
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_that_fails_before_the_rename_does_not_stop_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	a_checkpoint_that_cannot_write_the_manifest_does_not_stop_the_database(
 		ReplaceFailure::BeforeRename,
 	)
@@ -488,6 +503,9 @@ async fn a_checkpoint_that_fails_before_the_rename_does_not_stop_the_database() 
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_that_fails_after_the_rename_does_not_stop_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	a_checkpoint_that_cannot_write_the_manifest_does_not_stop_the_database(
 		ReplaceFailure::AfterRename,
 	)

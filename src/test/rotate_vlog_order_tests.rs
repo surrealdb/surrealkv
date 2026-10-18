@@ -12,7 +12,6 @@
 //! * opening a tree continues in a fresh segment by rotating the WAL, and that rotation goes
 //!   through the same hook as every other.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,6 +20,7 @@ use std::time::{Duration, Instant};
 use tempdir::TempDir;
 use test_log::test;
 
+use super::{sfs as fs, tfs};
 use crate::ring::PipelineHook;
 use crate::vlog::{VLog, SYNCED_VLOG_FILES};
 use crate::{Durability, Mode, Options, Tree};
@@ -96,8 +96,8 @@ fn crash(tree: Tree) {
 async fn a_value_appended_while_a_sync_runs_is_not_covered_by_it() {
 	let dir = TempDir::new("rotate_vlog_sync_prove").unwrap();
 	let opts = vlog_opts(dir.path());
-	fs::create_dir_all(opts.vlog_dir()).unwrap();
-	let vlog = Arc::new(VLog::new(opts).unwrap());
+	tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
+	let vlog = Arc::new(tfs::vlog_new(opts).unwrap());
 	let first = vlog.append(b"key-0", &payload(0, 100)).unwrap();
 	let file = vlog.vlog_file_path(first.file_id);
 
@@ -267,8 +267,9 @@ fn copy_dir(src: &Path, dst: &Path) {
 /// Opening a tree continues in a fresh segment by rotating the WAL, through the same hook as every
 /// other rotation. A log reopened on files an earlier run left holds its active file's bytes as
 /// unsynced, so the hook fsyncs that file once; a tree that has no value log file has nothing to
-/// fsync. The files older than the active one are not covered (a known gap, which this does not
-/// assert either way).
+/// fsync. The files older than the active one that the records of the last segment point into are
+/// synced before the rotation, by the open, which syncs the active file with them: it is synced
+/// once in all (see `wal_tail_check_tests` for the others).
 #[test(tokio::test)]
 async fn opening_a_tree_rotates_through_the_value_log_sync_and_fsyncs_its_active_file_once() {
 	let dir = TempDir::new("rotate_vlog_sync_prove").unwrap();
@@ -304,6 +305,11 @@ async fn opening_a_tree_rotates_through_the_value_log_sync_and_fsyncs_its_active
 	let active_file = vlog_files(&image).pop().unwrap();
 	let fsyncs = fsynced_vlog_files(&image).iter().filter(|file| **file == active_file).count();
 	assert_eq!(fsyncs, 1, "opening the tree fsynced the active value log file {fsyncs} times");
+	// The file before it, which the records of the segment point into, is synced too.
+	let older_file = vlog_files(&image).first().cloned().unwrap();
+	assert_ne!(older_file, active_file);
+	let fsyncs = fsynced_vlog_files(&image).iter().filter(|file| **file == older_file).count();
+	assert_eq!(fsyncs, 1, "opening the tree fsynced the older value log file {fsyncs} times");
 	for (key, value) in &values {
 		assert_eq!(get(&recovered, key).as_ref(), Some(value), "{key} was not recovered");
 	}

@@ -1,3 +1,15 @@
+// A guard of a `std` or `parking_lot` lock that lives across an `.await` blocks the one thread of a
+// browser's worker, or every task on a runtime that has few threads: the new awaits of the engine
+// (the waits for the spare files of a pool) hold none, and this keeps it so.
+#![deny(clippy::await_holding_lock)]
+// Every call that names the operating system's file system is denied (`clippy.toml`, `Cargo.toml`),
+// so that the engine goes through the file system seam in `src/vfs` and runs in a browser. The code
+// of the tests builds and inspects directories on a disk on purpose, and is allowed here; the code
+// of the engine that stays on `std::fs` is allowed where it is, each with a reason.
+#![cfg_attr(
+	test,
+	allow(clippy::disallowed_methods, reason = "tests build and inspect directories on a disk")
+)]
 pub mod autotune;
 mod batch;
 pub use byteslice::{self, ByteSlice};
@@ -19,6 +31,7 @@ pub mod memory;
 mod memtable;
 mod migrate;
 mod ring;
+mod rt;
 // The background scrubber is planned, not implemented: nothing constructs it outside tests.
 #[cfg(test)]
 mod scrubber;
@@ -44,6 +57,9 @@ mod wal;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod test;
+// The tests that need a browser: see the module for how to run them.
+#[cfg(all(test, target_arch = "wasm32", target_os = "unknown"))]
+mod wasm_tests;
 
 use std::cmp::Ordering;
 use std::fmt::Debug;
@@ -72,6 +88,18 @@ pub use crate::error::{
 	WriteStallReason,
 };
 pub use crate::lsm::{Tree, TreeBuilder};
+// The move of a legacy IndexedDB database into a database of the origin private file system,
+// which needs both of them, so it exists in a browser only. Its tests run everywhere, in this
+// crate.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub use crate::migrate::indexeddb::{migrate_from_indexeddb, IndexedDbMigration};
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[doc(hidden)]
+pub use crate::migrate::indexeddb::{
+	migrate_from_indexeddb_with_tuning,
+	ImportReport,
+	ImportTuning,
+};
 pub use crate::stall::WriteStallInfo;
 use crate::tde::EncryptionContext;
 #[doc(hidden)]
@@ -84,6 +112,9 @@ pub use crate::transaction::{
 	Transaction,
 	WriteOptions,
 };
+pub use crate::vfs::FileSystem;
+#[doc(hidden)]
+pub use crate::vfs::{CrashMode, MountReport};
 pub use crate::wal::WalRecoveryReport;
 
 /// An optimised trait for converting values to bytes only when needed
@@ -211,15 +242,19 @@ pub enum VLogChecksumLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WalRecoveryMode {
 	/// Trim only a proven torn tail in the last segment. Refuse interior corruption
-	/// or corruption in any earlier segment.
+	/// or corruption in any earlier segment. A record of the last segment whose value is
+	/// not in the value log is trimmed with the records after it if none of them points to a
+	/// value that is, and refused otherwise.
 	#[default]
 	TolerateTornTail,
 
-	/// Fail immediately on any WAL corruption (no repair or trimming attempted).
+	/// Fail immediately on any WAL corruption (no repair or trimming attempted), and on a
+	/// record of the last segment whose value is not in the value log.
 	AbsoluteConsistency,
 
 	/// Salvage any valid prefix before corruption in any segment, discarding
-	/// all subsequent records.
+	/// all subsequent records. The same for a record of the last segment whose value is
+	/// not in the value log.
 	SalvageValidPrefix,
 
 	/// Backward-compatible alias for `SalvageValidPrefix`.
@@ -323,6 +358,38 @@ pub struct Options {
 	/// `..Default::default()`.
 	#[doc(hidden)]
 	pub encryption_context: Option<Arc<EncryptionContext>>,
+
+	/// The file system the database lives in. `std::fs` on a native build, and nothing in a
+	/// browser, where one has to be mounted and given with `with_file_system`.
+	pub(crate) fs: Arc<dyn vfs::Fs>,
+}
+
+/// The sizes that `Options::default()` starts from. A native build has the memory of a server and
+/// these are the sizes it has always had. A browser worker is one thread in an address space of at
+/// most 4 GiB that the page and every other tab have a share of, with a flush and a compaction that
+/// each hold the worker for as long as they take (nothing else runs meanwhile), so its defaults are
+/// smaller: a memtable, a block cache and an output table of 16 MiB. The cache of a worker has
+/// four shards, and a shard admits an item of up to 97 percent of its share, which is about 4 MiB
+/// here, so a block of 64 KiB is admitted with room to spare. These are starting points and not
+/// measurements, and every one of them can be set.
+///
+/// The size of a memtable is the size of its arena, which holds the keys and the structure of the
+/// entries. The values are on the heap and are not counted in it, so it is not a bound on the
+/// memory that a memtable holds: that grows with the values that are written to it until it is
+/// flushed, and a memtable of large values is flushed late. A worker that stores large values
+/// should enable the value log, which keeps the values over its threshold out of the memtable.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod default_sizes {
+	pub(super) const MEMTABLE: usize = 100 * 1024 * 1024;
+	pub(super) const BLOCK_CACHE: u64 = 32 << 20;
+	pub(super) const TARGET_FILE: u64 = 64 * 1024 * 1024;
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod default_sizes {
+	pub(super) const MEMTABLE: usize = 16 * 1024 * 1024;
+	pub(super) const BLOCK_CACHE: u64 = 16 << 20;
+	pub(super) const TARGET_FILE: u64 = 16 * 1024 * 1024;
 }
 
 impl Default for Options {
@@ -346,12 +413,15 @@ impl Default for Options {
 			// per-item weight limit derived from capacity/shards; below
 			// ~32MB that limit can reject ~16 KB index/filter partitions
 			// outright, forcing every lookup to re-read them from disk.
-			block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(32 << 20)),
+			// (16MB in a browser, where there are four shards: see `default_sizes`.)
+			block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(
+				default_sizes::BLOCK_CACHE,
+			)),
 			path: PathBuf::from(""),
 			level_count: 6,
-			max_memtable_size: 100 * 1024 * 1024,  // 100 MB
-			index_partition_size: 16384,           // 16KB
-			vlog_max_file_size: 256 * 1024 * 1024, // 256MB
+			max_memtable_size: default_sizes::MEMTABLE, // 100 MB (16 MB in a browser)
+			index_partition_size: 16384,                // 16KB
+			vlog_max_file_size: 256 * 1024 * 1024,      // 256MB
 			vlog_checksum_verification: VLogChecksumLevel::Disabled,
 			enable_vlog: false,
 			vlog_value_threshold: 1024, // 1KB default
@@ -363,12 +433,13 @@ impl Default for Options {
 			level0_max_files: 4,
 			max_bytes_for_level: 256 * 1024 * 1024, // 256MB
 			level_multiplier: 10.0,
-			target_file_size: 64 * 1024 * 1024, // 64MB
+			target_file_size: default_sizes::TARGET_FILE, // 64MB (16 MB in a browser)
 			memtable_stall_threshold: 2,
 			l0_stall_threshold: 12,
 			key_manager: None,
 			encryption_cipher: CipherPreference::default(),
 			encryption_context: None,
+			fs: vfs::options_default_fs(),
 		}
 	}
 }
@@ -390,6 +461,14 @@ impl Options {
 
 	pub fn with_filter_policy(mut self, value: Option<Arc<dyn FilterPolicy>>) -> Self {
 		self.filter_policy = value;
+		self
+	}
+
+	/// Puts the database in `fs`. The default is the operating system's files on a native build,
+	/// and in a browser there is no default: a file system has to be mounted and given here, or
+	/// building a tree fails with an error that says so before it touches anything.
+	pub fn with_file_system(mut self, fs: FileSystem) -> Self {
+		self.fs = fs.0;
 		self
 	}
 
@@ -702,6 +781,22 @@ impl Options {
 	/// This should be called when the store starts to catch configuration
 	/// errors early
 	pub fn validate(&self) -> Result<()> {
+		self.validate_for_pointer_width(usize::BITS)
+	}
+
+	/// `validate`, for a target with `pointer_bits`-bit pointers. The limits that depend on the
+	/// address space are checked against it, so that a 32-bit target's limits are tested on any
+	/// host.
+	fn validate_for_pointer_width(&self, pointer_bits: u32) -> Result<()> {
+		// A pool is refused until every part of the engine that asks the file system whether a
+		// database exists goes through it (see `vfs::POOL_FS_PORT_COMPLETE`). Nothing is created
+		// before this, so the refusal leaves nothing behind.
+		if !vfs::POOL_FS_PORT_COMPLETE && self.fs.kind() == vfs::FsKind::Pool {
+			return Err(Error::InvalidArgument(
+				"a pooled file system is not supported by this build of the engine yet".to_string(),
+			));
+		}
+
 		// A build without the `encryption` feature must not seal anything, so it refuses a key
 		// manager rather than writing plaintext to a database that was asked to be encrypted.
 		// Refuse here, which is the first thing `Tree::new` does, so a rejection creates nothing
@@ -735,8 +830,29 @@ impl Options {
 			)));
 		}
 
+		check_memtable_size_is_addressable(self.max_memtable_size, pointer_bits)?;
+
 		Ok(())
 	}
+}
+
+/// The first `max_memtable_size` that a target with 32-bit pointers cannot give a memtable: the
+/// arena is one allocation of at most `isize::MAX` bytes there, which is 2 GiB less one, and its
+/// size is rounded down to a multiple of 64. A size from here up is refused rather than let the
+/// allocation abort the process, which in a browser traps the whole instance.
+const MEMTABLE_SIZE_LIMIT_32_BIT: u64 = (1 << 31) - 64;
+
+/// Refuses a `max_memtable_size` that a target with `pointer_bits`-bit pointers cannot allocate
+/// as one memtable arena. Nothing is refused on a 64-bit target, whose arenas are limited by
+/// artmap alone (4 GiB).
+fn check_memtable_size_is_addressable(max_memtable_size: usize, pointer_bits: u32) -> Result<()> {
+	if pointer_bits <= 32 && max_memtable_size as u64 >= MEMTABLE_SIZE_LIMIT_32_BIT {
+		return Err(Error::InvalidArgument(format!(
+			"max_memtable_size ({max_memtable_size}) must be less than {MEMTABLE_SIZE_LIMIT_32_BIT} \
+			 bytes on a target with 32-bit pointers"
+		)));
+	}
+	Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -1275,3 +1391,47 @@ pub trait LSMIterator {
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
+
+#[cfg(test)]
+mod options_bound_tests {
+	use super::*;
+
+	const GIB: usize = 1 << 30;
+
+	#[test]
+	fn a_32_bit_target_refuses_a_memtable_it_cannot_allocate() {
+		for size in [2 * GIB, 2 * GIB - 64, 3 * GIB, u32::MAX as usize] {
+			let error = check_memtable_size_is_addressable(size, 32)
+				.expect_err("a memtable of 2 GiB or more cannot be allocated with 32-bit pointers");
+			assert!(matches!(error, Error::InvalidArgument(_)), "{error:?}");
+		}
+	}
+
+	#[test]
+	fn a_32_bit_target_accepts_what_it_can_allocate() {
+		for size in [0, 64, 16 * 1024 * 1024, GIB, 2 * GIB - 128, 2 * GIB - 65] {
+			check_memtable_size_is_addressable(size, 32).expect("the arena fits");
+		}
+	}
+
+	#[test]
+	fn a_64_bit_target_refuses_nothing() {
+		for size in [0, 100 * 1024 * 1024, 2 * GIB, 3 * GIB] {
+			check_memtable_size_is_addressable(size, 64).expect("no 32-bit limit applies");
+		}
+	}
+
+	#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+	#[test]
+	fn validate_applies_the_bound_of_the_pointer_width() {
+		let options = Options::default().with_max_memtable_size(2 * GIB);
+		options.validate_for_pointer_width(32).expect_err("2 GiB is refused with 32-bit pointers");
+		options.validate_for_pointer_width(64).expect("2 GiB is fine with 64-bit pointers");
+		// The default and the size of a browser's memtable pass either way.
+		for size in [Options::default().max_memtable_size, 16 * 1024 * 1024] {
+			let options = Options::default().with_max_memtable_size(size);
+			options.validate_for_pointer_width(32).expect("within the 32-bit limit");
+			options.validate().expect("valid on this target");
+		}
+	}
+}

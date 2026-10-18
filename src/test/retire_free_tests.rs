@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use tempdir::TempDir;
 
+use super::tfs;
 use crate::lsm::Tree;
 use crate::ring::{
 	FreeStats,
@@ -1113,6 +1114,9 @@ async fn close_during_the_drain_returns_and_the_flusher_stops_freeing() {
 /// drain ends (nothing is left), the pipeline keeps validating, and the flusher parks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restore_part_way_through_the_drain_leaves_a_working_pipeline() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (store, _dir) = create_store();
 	let pipeline = &store.core.commit_pipeline;
 	commit_unique(&store, "base", 10).await;

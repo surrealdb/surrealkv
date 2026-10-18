@@ -182,6 +182,10 @@ pub fn describe_manifest(prefix: &[u8]) -> Result<ManifestDescription> {
 
 /// Reads the start of the manifest file at `path` and describes it, see [`describe_manifest`].
 /// Only the prefix is read, however long the file is.
+#[allow(
+	clippy::disallowed_methods,
+	reason = "std-path tooling that reads the clear prefix of a manifest on a disk, for a tool that holds no file system handle"
+)]
 pub fn describe_manifest_file(path: impl AsRef<Path>) -> Result<ManifestDescription> {
 	let mut prefix = Vec::with_capacity(MANIFEST_PREFIX_LEN);
 	File::open(path.as_ref())?.take(MANIFEST_PREFIX_LEN as u64).read_to_end(&mut prefix)?;

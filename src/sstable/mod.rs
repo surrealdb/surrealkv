@@ -10,3 +10,8 @@ pub(crate) mod ribbon;
 pub(crate) mod sealed;
 pub(crate) mod table;
 pub(crate) mod verify;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod fs_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) mod recording_fs;

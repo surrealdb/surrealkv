@@ -96,6 +96,7 @@ use crate::compaction::leveled::Strategy;
 use crate::sstable::block_io::BlockSource;
 use crate::tde::{CipherSuite, SoftwareKeyManager};
 use crate::test::sstable_encryption_tests::walk;
+use crate::test::tfs;
 use crate::{CompressionType, Durability, Mode, Options, Tree, WalRecoveryMode};
 
 /// The root key of every encrypted database of the matrix. It is not a run of one byte, so that
@@ -818,16 +819,25 @@ async fn the_whole_product_for(compression: CompressionType) {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn no_marker_is_in_any_file_of_a_database_whose_tables_are_not_compressed() {
+	if tfs::skip_listed() {
+		return;
+	}
 	the_whole_product_for(CompressionType::None).await;
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn no_marker_is_in_any_file_of_a_database_whose_tables_are_compressed_with_snappy() {
+	if tfs::skip_listed() {
+		return;
+	}
 	the_whole_product_for(CompressionType::SnappyCompression).await;
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn no_marker_is_in_any_file_of_a_database_whose_tables_are_compressed_with_zstd() {
+	if tfs::skip_listed() {
+		return;
+	}
 	the_whole_product_for(CompressionType::ZstdCompression).await;
 }
 
@@ -835,6 +845,9 @@ async fn no_marker_is_in_any_file_of_a_database_whose_tables_are_compressed_with
 /// them under: both suites have seen them all.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn the_configurations_that_touch_every_surface_are_clean_under_the_other_suite_as_well() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let seed = Markers::from_environment().seed();
 	for (compression, durability) in [
 		(CompressionType::ZstdCompression, Durability::Eventual),
@@ -877,6 +890,9 @@ async fn small_database(run: &mut Run) {
 /// marker from the scan.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn the_canary_fails_for_a_plaintext_file_that_is_planted_in_an_encrypted_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let seed = Markers::from_environment().seed();
 	for compression in [CompressionType::None, CompressionType::ZstdCompression] {
 		let config = Config {

@@ -2,7 +2,7 @@ mod bloom;
 mod commit_ring;
 mod pipeline;
 mod queue;
-mod sync;
+pub(crate) mod sync;
 
 pub(crate) use pipeline::CommitPipeline;
 #[cfg(all(test, not(target_arch = "wasm32")))]

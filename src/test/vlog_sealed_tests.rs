@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use test_log::test;
 
+use super::tfs;
 use crate::error::{EncryptionError, Error, KeyProviderFailure};
 use crate::tde::{
 	CipherSuite,
@@ -52,7 +53,7 @@ fn options(dir: &Path, ctx: Option<&Arc<EncryptionContext>>) -> Arc<Options> {
 		..Default::default()
 	};
 	opts.encryption_context = ctx.cloned();
-	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+	tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
 	Arc::new(opts)
 }
 
@@ -137,6 +138,9 @@ fn with_crc_of(pointer: &ValuePointer, file: &Path) -> ValuePointer {
 
 #[test]
 fn a_sealed_log_reads_back_what_was_sealed() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let ctx = context(suite);
@@ -182,6 +186,9 @@ fn a_sealed_log_reads_back_what_was_sealed() {
 
 #[test]
 fn the_newest_sealed_file_is_fsynced_by_the_first_sync() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let ctx = context(CipherSuite::Aes256Gcm);
 	let opts = options(dir.path(), Some(&ctx));
@@ -205,6 +212,9 @@ fn the_newest_sealed_file_is_fsynced_by_the_first_sync() {
 
 #[test]
 fn a_sealed_entry_is_authenticated_whatever_the_checksum_level_says() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		for level in [VLogChecksumLevel::Disabled, VLogChecksumLevel::Full] {
 			let dir = TempDir::new().unwrap();
@@ -240,6 +250,9 @@ fn a_sealed_entry_is_authenticated_whatever_the_checksum_level_says() {
 
 #[test]
 fn a_failed_authentication_keeps_its_kind_through_resolve_value() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let ctx = context(CipherSuite::XChaCha20Poly1305);
 	let opts = options(dir.path(), Some(&ctx));
@@ -284,6 +297,9 @@ fn open_flipped(
 
 #[test]
 fn damage_and_forgery_in_the_header_are_told_apart_and_leave_every_file_as_it_is() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let vlog_dir = |dir: &TempDir| dir.path().join("vlog");
 
@@ -327,6 +343,9 @@ fn damage_and_forgery_in_the_header_are_told_apart_and_leave_every_file_as_it_is
 
 #[test]
 fn a_key_that_does_not_fit_is_an_error_and_never_a_reason_to_touch_a_file() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let ctx = context(suite);
@@ -378,6 +397,9 @@ fn a_key_that_does_not_fit_is_an_error_and_never_a_reason_to_touch_a_file() {
 
 #[test]
 fn a_key_id_the_manager_has_never_held_is_named() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	// The files are sealed under key 2.
 	let km = Arc::new(SoftwareKeyManager::new([0x11; 32]));
@@ -400,6 +422,9 @@ fn a_key_id_the_manager_has_never_held_is_named() {
 
 #[test]
 fn a_log_reads_the_kind_of_file_it_is_configured_for_and_refuses_the_other() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let ctx = context(suite);
 
@@ -447,6 +472,9 @@ fn a_log_reads_the_kind_of_file_it_is_configured_for_and_refuses_the_other() {
 
 #[test]
 fn a_file_that_turns_up_after_the_log_was_opened_is_held_to_the_same_rule() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let ctx = context(CipherSuite::Aes256Gcm);
 
 	// A sealed log meets a plaintext file at a read.
@@ -469,6 +497,9 @@ fn a_file_that_turns_up_after_the_log_was_opened_is_held_to_the_same_rule() {
 
 #[test]
 fn a_pointer_and_a_file_that_disagree_about_being_sealed_read_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let ctx = context(CipherSuite::XChaCha20Poly1305);
 	let opts = options(dir.path(), Some(&ctx));
@@ -496,6 +527,9 @@ fn a_pointer_and_a_file_that_disagree_about_being_sealed_read_nothing() {
 
 #[test]
 fn a_pointer_with_absurd_sizes_or_offset_is_an_error_and_allocates_nothing_for_them() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let ctx = context(CipherSuite::Aes256Gcm);
 	let opts = options(dir.path(), Some(&ctx));
@@ -534,6 +568,9 @@ fn a_pointer_with_absurd_sizes_or_offset_is_an_error_and_allocates_nothing_for_t
 
 #[test]
 fn an_entry_that_was_moved_or_copied_between_positions_and_files_does_not_open() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let ctx = context(suite);
@@ -577,6 +614,9 @@ fn an_entry_that_was_moved_or_copied_between_positions_and_files_does_not_open()
 
 #[test]
 fn a_file_under_another_id_does_not_open() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let ctx = context(CipherSuite::Aes256Gcm);
 	let opts = options(dir.path(), Some(&ctx));
@@ -602,6 +642,9 @@ fn a_file_under_another_id_does_not_open() {
 
 #[test]
 fn a_file_that_a_crash_left_without_its_header_is_set_aside_and_never_deleted() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let ctx = context(CipherSuite::Aes256Gcm);
 	let header = {
 		let dir = TempDir::new().unwrap();
@@ -645,6 +688,9 @@ fn a_file_that_a_crash_left_without_its_header_is_set_aside_and_never_deleted() 
 
 #[test]
 fn only_the_newest_file_can_be_set_aside_and_only_for_a_header_that_was_not_completed() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let ctx = context(CipherSuite::XChaCha20Poly1305);
 
 	// An older file with entries and a newer one that was cut off: the older one is read, the
@@ -670,6 +716,16 @@ fn only_the_newest_file_can_be_set_aside_and_only_for_a_header_that_was_not_comp
 	let before = snapshot(&opts.vlog_dir());
 	assert_eq!(encryption_error(VLog::new(Arc::clone(&opts))), EncryptionError::MalformedHeader);
 	assert_eq!(snapshot(&opts.vlog_dir()), before);
+
+	// A file of zeros that is not the newest, short or long: the header of a sealed file is made
+	// durable before the file holds an entry, so what a crash leaves does not look like that, and
+	// it is not taken for a file that was never synced.
+	for len in [127, 127 + 60] {
+		std::fs::write(opts.vlog_file_path(1), vec![0u8; len]).unwrap();
+		let before = snapshot(&opts.vlog_dir());
+		assert!(is_corruption(VLog::new(Arc::clone(&opts))), "{len} bytes of zeros");
+		assert_eq!(snapshot(&opts.vlog_dir()), before, "{len} bytes of zeros");
+	}
 
 	// An empty file that is not the newest.
 	std::fs::write(opts.vlog_file_path(1), b"").unwrap();
@@ -709,6 +765,9 @@ fn only_the_newest_file_can_be_set_aside_and_only_for_a_header_that_was_not_comp
 /// nothing, and the file is set aside once the log has opened.
 #[test]
 fn a_torn_file_is_set_aside_only_when_every_other_file_has_opened() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let ctx = context(suite);
 		let other_db = Arc::new(EncryptionContext::new(
@@ -765,6 +824,9 @@ fn a_torn_file_is_set_aside_only_when_every_other_file_has_opened() {
 
 #[test]
 fn a_name_the_log_set_aside_is_not_read_as_a_file() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let ctx = context(CipherSuite::Aes256Gcm);
 	let opts = options(dir.path(), Some(&ctx));
@@ -777,6 +839,9 @@ fn a_name_the_log_set_aside_is_not_read_as_a_file() {
 
 #[test]
 fn a_plaintext_log_is_left_as_it_was_found() {
+	if tfs::skip_listed() {
+		return;
+	}
 	// An empty newest file in a plaintext log is reused as it always was, and is not set aside.
 	let dir = TempDir::new().unwrap();
 	let opts = options(dir.path(), None);
@@ -790,6 +855,9 @@ fn a_plaintext_log_is_left_as_it_was_found() {
 
 #[test]
 fn a_restore_makes_the_reads_of_a_sealed_file_id_go_to_the_restored_file() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let ctx = context(suite);
@@ -828,6 +896,9 @@ fn a_restore_makes_the_reads_of_a_sealed_file_id_go_to_the_restored_file() {
 
 #[test]
 fn a_key_manager_without_a_resolved_context_is_refused_instead_of_writing_plaintext() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let mut opts = (*options(dir.path(), None)).clone();
 	opts.key_manager = Some(Arc::new(SoftwareKeyManager::new([0x11; 32])));
@@ -866,6 +937,9 @@ fn small_files(dir: &Path, ctx: &Arc<EncryptionContext>, max_file_size: u64) -> 
 
 #[test]
 fn appended_values_read_back_across_rollovers_and_restarts() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let ctx = context(suite);
@@ -928,6 +1002,9 @@ fn appended_values_read_back_across_rollovers_and_restarts() {
 
 #[test]
 fn a_new_sealed_file_has_its_header_and_its_name_on_disk_before_its_first_entry() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let ctx = context(CipherSuite::Aes256Gcm);
 	let opts = options(dir.path(), Some(&ctx));
@@ -954,6 +1031,9 @@ fn a_new_sealed_file_has_its_header_and_its_name_on_disk_before_its_first_entry(
 
 #[test]
 fn a_failed_append_poisons_the_file_and_the_next_append_goes_to_a_file_of_its_own() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let ctx = context(suite);
@@ -1115,6 +1195,9 @@ fn a_writer_that_is_asked_to_seal_a_position_again_is_refused_and_poisoned() {
 
 #[test]
 fn a_restart_never_reopens_a_sealed_file_and_starts_a_new_one_with_a_new_salt() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let ctx = context(suite);
@@ -1181,6 +1264,9 @@ fn a_sealed_file_is_never_reopened_for_appending() {
 
 #[test]
 fn a_file_that_is_in_the_way_is_an_error_and_is_never_appended_to() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let ctx = context(CipherSuite::Aes256Gcm);
 	let opts = options(dir.path(), Some(&ctx));
@@ -1228,6 +1314,9 @@ impl KeyManager for Flaky {
 
 #[test]
 fn a_key_provider_that_fails_at_a_rollover_fails_that_append_and_creates_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let provider = Arc::new(Flaky {
 		fail: AtomicBool::new(true),
@@ -1256,6 +1345,9 @@ fn a_key_provider_that_fails_at_a_rollover_fails_that_append_and_creates_nothing
 
 #[test]
 fn a_rotation_of_the_key_between_two_files_leaves_the_older_one_readable() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let km = Arc::new(SoftwareKeyManager::new([0x11; 32]));
@@ -1292,6 +1384,9 @@ fn a_rotation_of_the_key_between_two_files_leaves_the_older_one_readable() {
 
 #[test]
 fn a_plaintext_log_still_writes_the_bytes_it_always_did() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let opts = options(dir.path(), None);
 	let vlog = VLog::new(Arc::clone(&opts)).unwrap();

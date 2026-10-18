@@ -8,6 +8,7 @@ use rand::{Rng, SeedableRng};
 use tempdir::TempDir;
 use test_log::test;
 
+use super::sfs;
 use crate::sstable::table::{Table, TableWriter};
 use crate::{CompressionType, InternalKey, InternalKeyKind, LSMIterator, Options};
 
@@ -866,12 +867,12 @@ async fn test_lsm_compression_disk_size_comparison() {
 }
 
 fn calculate_directory_size(dir: &PathBuf) -> u64 {
-	if !dir.exists() {
+	if !sfs::exists(dir) {
 		return 0;
 	}
 
 	let mut total_size = 0u64;
-	if let Ok(entries) = std::fs::read_dir(dir) {
+	if let Ok(entries) = sfs::read_dir(dir) {
 		for entry in entries.flatten() {
 			if let Ok(metadata) = entry.metadata() {
 				if metadata.is_file() {

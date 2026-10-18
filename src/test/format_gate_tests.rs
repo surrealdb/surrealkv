@@ -7,7 +7,6 @@
 //! `tests/fixtures/legacy`), because a hand-built table would only prove that the gate agrees with
 //! its own idea of the format.
 
-use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,6 +14,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use test_log::test;
 
+use super::sfs as fs;
 use crate::levels::{
 	MANIFEST_FORMAT_VERSION,
 	MANIFEST_FORMAT_VERSION_V1,
@@ -71,7 +71,7 @@ fn sstables(opts: &Options) -> Vec<PathBuf> {
 }
 
 fn open_file(path: &Path) -> (Arc<dyn File>, usize) {
-	let file = std::fs::File::open(path).unwrap();
+	let file = fs::File::open(path).unwrap();
 	let size = file.metadata().unwrap().len() as usize;
 	(Arc::new(file), size)
 }
@@ -118,14 +118,15 @@ fn set_manifest_version(opts: &Options, version: u16) {
 	fs::write(&path, bytes).unwrap();
 }
 
+/// Copies a directory of the disk (a fixture) into the file system of the test.
 fn copy_dir(from: &Path, to: &Path) {
 	fs::create_dir_all(to).unwrap();
-	for entry in fs::read_dir(from).unwrap().flatten() {
+	for entry in std::fs::read_dir(from).unwrap().flatten() {
 		let target = to.join(entry.file_name());
 		if entry.file_type().unwrap().is_dir() {
 			copy_dir(&entry.path(), &target);
 		} else {
-			fs::copy(entry.path(), target).unwrap();
+			fs::write(target, std::fs::read(entry.path()).unwrap()).unwrap();
 		}
 	}
 }

@@ -33,14 +33,14 @@ use std::time::{Duration, Instant};
 use tempdir::TempDir;
 use test_log::test;
 
-use super::collect_transaction_all;
 use super::wal_group_budget_tests::{mark_closed, release_lock};
+use super::{collect_transaction_all, sfs, tfs};
 use crate::checkpoint::{CheckpointMetadata, CheckpointStage};
 use crate::compaction::compactor::CompactionStage;
 use crate::compaction::leveled::Strategy;
 use crate::lsm::cleanup_vlog;
 use crate::vfs::sync_tracker;
-use crate::vlog::{VLog, ValueLocation, ValuePointer, SYNCED_VLOG_LENGTHS};
+use crate::vlog::{ValueLocation, ValuePointer, SYNCED_VLOG_LENGTHS};
 use crate::{Durability, LSMIterator, Mode, Options, Transaction, Tree, VLogChecksumLevel};
 
 /// How long a test waits for something it expects to happen.
@@ -236,7 +236,7 @@ fn assert_model(tree: &Tree, model: &Model, what: &str) {
 
 /// The ids of the value-log files in `path`, in order.
 fn vlog_files(path: &Path) -> Vec<u32> {
-	let mut ids: Vec<u32> = std::fs::read_dir(path.join("vlog"))
+	let mut ids: Vec<u32> = sfs::read_dir(path.join("vlog"))
 		.unwrap()
 		.filter_map(|e| {
 			let name = e.unwrap().file_name().to_string_lossy().into_owned();
@@ -253,16 +253,13 @@ fn vlog_file_path(path: &Path, id: u32) -> PathBuf {
 
 /// The bytes the value-log files of `path` take.
 fn vlog_bytes(path: &Path) -> u64 {
-	vlog_files(path)
-		.iter()
-		.map(|&id| std::fs::metadata(vlog_file_path(path, id)).unwrap().len())
-		.sum()
+	vlog_files(path).iter().map(|&id| sfs::metadata(vlog_file_path(path, id)).unwrap().len()).sum()
 }
 
 /// A copy of the data directory as a crash would leave it.
 fn copy_dir_all(src: &Path, dst: &Path) {
-	std::fs::create_dir_all(dst).unwrap();
-	for entry in std::fs::read_dir(src).unwrap() {
+	sfs::create_dir_all(dst).unwrap();
+	for entry in sfs::read_dir(src).unwrap() {
 		let entry = entry.unwrap();
 		if entry.file_name() == "LOCK" {
 			continue;
@@ -271,7 +268,7 @@ fn copy_dir_all(src: &Path, dst: &Path) {
 		if entry.file_type().unwrap().is_dir() {
 			copy_dir_all(&entry.path(), &to);
 		} else {
-			std::fs::copy(entry.path(), &to).unwrap();
+			sfs::copy(entry.path(), &to).unwrap();
 		}
 	}
 }
@@ -439,7 +436,12 @@ fn assert_same_contents(got: &Contents, want: &Contents, what: &str) {
 /// which only Linux has.
 #[cfg(target_os = "linux")]
 fn deleted_files_held_open(dir: &Path) -> Vec<String> {
+	// A file of a pool is no descriptor of the process.
+	if sfs::on_pool() {
+		return Vec::new();
+	}
 	let dir = dir.join("vlog").canonicalize().unwrap().to_string_lossy().into_owned();
+	// The descriptors of the process are the disk's, whatever file system the database is in.
 	std::fs::read_dir("/proc/self/fd")
 		.unwrap()
 		.filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
@@ -463,7 +465,7 @@ fn assert_tables_match_manifest(tree: &Tree, dir: &Path, what: &str) {
 	let mut listed: Vec<u64> =
 		tree.core.inner.level_manifest.read().unwrap().iter().map(|t| t.id).collect();
 	listed.sort_unstable();
-	let mut on_disk: Vec<u64> = std::fs::read_dir(dir.join("sstables"))
+	let mut on_disk: Vec<u64> = sfs::read_dir(dir.join("sstables"))
 		.unwrap()
 		.filter_map(|e| {
 			let name = e.unwrap().file_name().to_string_lossy().into_owned();
@@ -670,7 +672,6 @@ async fn churn_over_the_oldest_keys_removes_exactly_the_files_nothing_references
 /// logged to the WAL, and no WAL segment is claimed.
 fn register_table_past_the_memtables(tree: &Tree, keys: Range<usize>, round: usize) -> Contents {
 	use crate::batch::Batch;
-	use crate::levels::write_manifest_to_disk;
 	use crate::InternalKeyKind;
 
 	let inner = &tree.core.inner;
@@ -693,7 +694,7 @@ fn register_table_past_the_memtables(tree: &Tree, keys: Range<usize>, round: usi
 	let mut manifest = inner.level_manifest.write().unwrap();
 	if manifest.get_log_number() != log_number {
 		manifest.log_number = log_number;
-		write_manifest_to_disk(&manifest).unwrap();
+		tfs::write_manifest_to_disk(&manifest).unwrap();
 	}
 	drop(manifest);
 	inner.visible_seq_num.fetch_max(seq + count - 1, Ordering::SeqCst);
@@ -832,8 +833,8 @@ async fn the_cleanup_removes_exactly_the_files_below_its_bound_and_never_the_act
 	let dir = TempDir::new("vlog_gc_bound").unwrap();
 	let mut opts = base_options(dir.path());
 	opts.vlog_max_file_size = 1024;
-	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
-	let vlog = VLog::new(Arc::new(opts)).unwrap();
+	tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
+	let vlog = tfs::vlog_new(Arc::new(opts)).unwrap();
 
 	// One value to a file: six values, files 1 to 6.
 	let pointers: Vec<ValuePointer> =
@@ -1229,7 +1230,7 @@ fn run_reader(
 
 /// The lowest value-log file id in `dir`, or 0 when there is none.
 fn oldest_vlog_file(dir: &Path) -> u32 {
-	let Ok(listing) = std::fs::read_dir(dir.join("vlog")) else {
+	let Ok(listing) = sfs::read_dir(dir.join("vlog")) else {
 		return 0;
 	};
 	listing
@@ -1405,7 +1406,7 @@ async fn readers_race_everything(manual_compaction: bool) {
 		 rounds {finals:?}, {rounds} rounds by hand, {} level-0 tables, {} files in the value log, \
 		 readers' reads {:?}",
 		l0_tables(&tree),
-		std::fs::read_dir(dir.path().join("vlog")).map(|d| d.count()).unwrap_or(0),
+		sfs::read_dir(dir.path().join("vlog")).map(|d| d.count()).unwrap_or(0),
 		ops.iter().map(|c| c.load(Ordering::SeqCst)).collect::<Vec<_>>(),
 	);
 
@@ -1454,6 +1455,9 @@ async fn two_rounds_in_two_tables(tree: &Tree) -> Model {
 /// the copy must hold every file. The files go with the next cleanup once the checkpoint is done.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_compaction_after_the_manifest_is_released_deletes_no_file_before_the_copy() {
+	if tfs::skip_listed() {
+		return;
+	}
 	static RELEASED: [CheckpointStage; 1] = [CheckpointStage::ManifestReleased];
 	let dir = TempDir::new("vlog_gc_checkpoint").unwrap();
 	let ckpt = TempDir::new("vlog_gc_checkpoint_copy").unwrap();
@@ -1499,6 +1503,9 @@ async fn a_compaction_after_the_manifest_is_released_deletes_no_file_before_the_
 /// compaction has run, the copy still holds every file.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_checkpoint_that_holds_the_manifest_keeps_every_file_until_its_copy_is_done() {
+	if tfs::skip_listed() {
+		return;
+	}
 	static STAGES: [CheckpointStage; 2] =
 		[CheckpointStage::SstablesCopied, CheckpointStage::ManifestReleased];
 	let dir = TempDir::new("vlog_gc_checkpoint_held").unwrap();
@@ -1551,6 +1558,9 @@ async fn a_checkpoint_that_holds_the_manifest_keeps_every_file_until_its_copy_is
 /// after it go to files that are not any of the restored ones.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_checkpoint_restored_into_a_live_tree_reads_every_value_and_new_values_get_new_files() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("vlog_gc_restore_source").unwrap();
 	let ckpt = TempDir::new("vlog_gc_restore_copy").unwrap();
 	let target = TempDir::new("vlog_gc_restore_target").unwrap();
@@ -1588,6 +1598,9 @@ async fn a_checkpoint_restored_into_a_live_tree_reads_every_value_and_new_values
 /// reporting success while every such read fails until the directory is opened again.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_checkpoint_with_values_in_the_value_log_is_refused_by_a_tree_without_one() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("vlog_gc_restore_refused_source").unwrap();
 	let ckpt = TempDir::new("vlog_gc_restore_refused_copy").unwrap();
 	let target = TempDir::new("vlog_gc_restore_refused_target").unwrap();
@@ -1606,7 +1619,7 @@ async fn a_checkpoint_with_values_in_the_value_log_is_refused_by_a_tree_without_
 
 	let err = other.restore_from_checkpoint(&dest).expect_err("the tree has no value log");
 	assert!(matches!(&err, crate::Error::InvalidArgument(m) if m.contains("value log")), "{err:?}");
-	assert!(!target.path().join("RESTORE_IN_PROGRESS").exists(), "nothing was started");
+	assert!(!sfs::exists(target.path().join("RESTORE_IN_PROGRESS")), "nothing was started");
 	assert_model(&other, &kept, "after the refused restore");
 	crash(&other);
 	crash(&tree);
@@ -1616,6 +1629,9 @@ async fn a_checkpoint_with_values_in_the_value_log_is_refused_by_a_tree_without_
 /// without one: nothing in it needs the log.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_checkpoint_with_no_pointers_restores_into_a_tree_without_a_value_log() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("vlog_gc_restore_inline_source").unwrap();
 	let ckpt = TempDir::new("vlog_gc_restore_inline_copy").unwrap();
 	let target = TempDir::new("vlog_gc_restore_inline_target").unwrap();
@@ -1650,11 +1666,11 @@ async fn a_checkpoint_with_no_pointers_restores_into_a_tree_without_a_value_log(
 /// Truncates what a power loss may leave empty in an image of `live`: the tables that were never
 /// fsynced, and the value-log files after the length of their last fsync.
 fn lose_what_was_never_synced(image: &Path, live: &Path) {
-	for entry in std::fs::read_dir(image.join("sstables")).unwrap() {
+	for entry in sfs::read_dir(image.join("sstables")).unwrap() {
 		let entry = entry.unwrap();
 		let live_path = live.join("sstables").join(entry.file_name());
 		if !sync_tracker::was_synced(&live_path) {
-			std::fs::OpenOptions::new().write(true).open(entry.path()).unwrap().set_len(0).unwrap();
+			sfs::OpenOptions::new().write(true).open(entry.path()).unwrap().set_len(0).unwrap();
 		}
 	}
 	let lengths = SYNCED_VLOG_LENGTHS.lock().clone();
@@ -1667,14 +1683,9 @@ fn lose_what_was_never_synced(image: &Path, live: &Path) {
 			.max()
 			.unwrap_or(0);
 		let image_path = vlog_file_path(image, id);
-		let len = std::fs::metadata(&image_path).unwrap().len();
+		let len = sfs::metadata(&image_path).unwrap().len();
 		if synced < len {
-			std::fs::OpenOptions::new()
-				.write(true)
-				.open(image_path)
-				.unwrap()
-				.set_len(synced)
-				.unwrap();
+			sfs::OpenOptions::new().write(true).open(image_path).unwrap().set_len(synced).unwrap();
 		}
 	}
 }
@@ -1779,24 +1790,36 @@ async fn crash_at_stage(stage: CompactionStage, lossy: bool) {
 
 #[test(tokio::test)]
 async fn a_crash_before_the_manifest_write_keeps_every_acknowledged_key() {
+	if tfs::skip_listed() {
+		return;
+	}
 	crash_at_stage(CompactionStage::OutputsDurable, false).await;
 	crash_at_stage(CompactionStage::OutputsDurable, true).await;
 }
 
 #[test(tokio::test)]
 async fn a_crash_after_the_manifest_write_keeps_every_acknowledged_key() {
+	if tfs::skip_listed() {
+		return;
+	}
 	crash_at_stage(CompactionStage::ManifestWritten, false).await;
 	crash_at_stage(CompactionStage::ManifestWritten, true).await;
 }
 
 #[test(tokio::test)]
 async fn a_crash_after_the_input_files_are_removed_keeps_every_acknowledged_key() {
+	if tfs::skip_listed() {
+		return;
+	}
 	crash_at_stage(CompactionStage::InputsRemoved, false).await;
 	crash_at_stage(CompactionStage::InputsRemoved, true).await;
 }
 
 #[test(tokio::test)]
 async fn a_crash_after_the_value_log_cleanup_keeps_every_acknowledged_key() {
+	if tfs::skip_listed() {
+		return;
+	}
 	crash_at_stage(CompactionStage::VlogCleaned, false).await;
 	crash_at_stage(CompactionStage::VlogCleaned, true).await;
 }
@@ -2014,6 +2037,9 @@ async fn file_ids_keep_growing_across_reopens_and_the_active_file_survives_every
 /// write goes on in, with a new id.
 #[test(tokio::test)]
 async fn one_cleanup_removes_a_hundred_files_and_never_the_active_one() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("vlog_gc_many").unwrap();
 	let tree = quiet_tree_with(Options {
 		// One value to a file.
@@ -2087,7 +2113,7 @@ async fn a_missing_value_log_file_fails_the_reads_that_need_it_and_only_those() 
 	let (contents, pointers) = closed_database_with_four_files(dir.path()).await;
 	let files: BTreeSet<u32> = pointers.values().map(|p| p.file_id).collect();
 	let victim = *files.iter().nth(1).unwrap();
-	std::fs::remove_file(vlog_file_path(dir.path(), victim)).unwrap();
+	sfs::remove_file(vlog_file_path(dir.path(), victim)).unwrap();
 
 	let tree = quiet_tree(dir.path()).await;
 	let txn = tree.begin_with_mode(Mode::ReadOnly).unwrap();
@@ -2124,7 +2150,7 @@ async fn truncated_file_case(level: VLogChecksumLevel) {
 	entries.sort_by_key(|p| p.offset);
 	let cut_entry = entries[1];
 	let cut = cut_entry.offset + 8 + cut_entry.key_size as u64 + cut_entry.value_size as u64 / 2;
-	std::fs::OpenOptions::new()
+	sfs::OpenOptions::new()
 		.write(true)
 		.open(vlog_file_path(dir.path(), victim))
 		.unwrap()

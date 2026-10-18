@@ -1,25 +1,18 @@
-use std::fs::{self, File as SysFile};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use test_log::test;
 
-use crate::levels::{
-	write_manifest_to_disk,
-	LevelManifest,
-	ManifestChangeSet,
-	SnapshotInfo,
-	MANIFEST_FORMAT_VERSION_V2,
-};
+use super::tfs;
+use crate::levels::{LevelManifest, ManifestChangeSet, SnapshotInfo, MANIFEST_FORMAT_VERSION_V2};
 use crate::sstable::table::{Table, TableWriter};
-use crate::vfs::File;
 use crate::{InternalKey, InternalKeyKind, Options, Result};
 
 // Helper function to create a test table with direct file IO
 fn create_test_table(table_id: u64, num_items: u64, opts: Arc<Options>) -> Result<Arc<Table>> {
 	let table_file_path = opts.sstable_file_path(table_id);
 
-	let mut file = SysFile::create(&table_file_path)?;
+	let mut file = tfs::create_file(&opts, &table_file_path)?;
 
 	// Create TableWriter that writes directly to the file
 	let mut writer = TableWriter::new(&mut file, table_id, Arc::clone(&opts), 0); // L0 for test
@@ -38,9 +31,7 @@ fn create_test_table(table_id: u64, num_items: u64, opts: Arc<Options>) -> Resul
 	let size = writer.finish()?;
 
 	// Open the file for reading
-	let file = SysFile::open(&table_file_path)?;
-	file.sync_all()?;
-	let file: Arc<dyn File> = Arc::new(file);
+	let file = tfs::open_synced(&opts, &table_file_path)?;
 
 	// Create the table
 	let table = Table::new(table_id, opts, file, size as u64)?;
@@ -60,10 +51,10 @@ fn test_level_manifest_persistence() {
 
 	// Create sstables directory
 	let sstable_path = opts.sstable_dir();
-	fs::create_dir_all(&sstable_path).expect("Failed to create sstables directory");
+	tfs::create_dir_all(&opts, &sstable_path).expect("Failed to create sstables directory");
 
 	// Create manifest directory
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest directory");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest directory");
 
 	// Create a new manifest with 3 levels
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
@@ -122,7 +113,7 @@ fn test_level_manifest_persistence() {
 	assert_eq!(manifest.get_last_sequence(), 300, "last_sequence should be 300");
 
 	// Persist the manifest with our custom next_table_id
-	write_manifest_to_disk(&manifest).expect("Failed to write to disk");
+	tfs::write_manifest_to_disk(&manifest).expect("Failed to write to disk");
 
 	// Load the manifest directly to verify persistence
 	let manifest_path = opts.manifest_file_path(0);
@@ -367,7 +358,7 @@ fn create_test_table_with_seq_nums(
 ) -> Result<Arc<Table>> {
 	let table_file_path = opts.sstable_file_path(table_id);
 
-	let mut file = SysFile::create(&table_file_path)?;
+	let mut file = tfs::create_file(&opts, &table_file_path)?;
 
 	// Create TableWriter that writes directly to the file
 	let mut writer = TableWriter::new(&mut file, table_id, Arc::clone(&opts), 0); // L0 for test
@@ -386,9 +377,7 @@ fn create_test_table_with_seq_nums(
 	let size = writer.finish()?;
 
 	// Open the file for reading
-	let file = SysFile::open(&table_file_path)?;
-	file.sync_all()?;
-	let file: Arc<dyn File> = Arc::new(file);
+	let file = tfs::open_synced(&opts, &table_file_path)?;
 
 	// Create the table
 	let table = Table::new(table_id, opts, file, size as u64)?;
@@ -408,10 +397,10 @@ fn test_lsn_with_multiple_l0_tables() {
 
 	// Create sstables directory
 	let sstable_path = opts.sstable_dir();
-	fs::create_dir_all(&sstable_path).expect("Failed to create sstables directory");
+	tfs::create_dir_all(&opts, &sstable_path).expect("Failed to create sstables directory");
 
 	// Create manifest directory
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest directory");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest directory");
 
 	// Create a new manifest
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
@@ -580,10 +569,10 @@ fn test_last_sequence_persistence_across_manifest_reload() {
 
 	// Create sstables directory
 	let sstable_path = opts.sstable_dir();
-	fs::create_dir_all(&sstable_path).expect("Failed to create sstables directory");
+	tfs::create_dir_all(&opts, &sstable_path).expect("Failed to create sstables directory");
 
 	// Create manifest directory
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest directory");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest directory");
 
 	let expected_last_sequence = 50;
 
@@ -617,7 +606,7 @@ fn test_last_sequence_persistence_across_manifest_reload() {
 		);
 
 		// Persist the manifest
-		write_manifest_to_disk(&manifest).expect("Failed to write manifest to disk");
+		tfs::write_manifest_to_disk(&manifest).expect("Failed to write manifest to disk");
 	}
 
 	// Reload manifest and verify last_sequence is preserved
@@ -665,8 +654,8 @@ fn test_manifest_v1_with_log_number_and_last_sequence() {
 	let opts = Arc::new(opts);
 
 	// Create required directories
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	tfs::create_dir_all(&opts, opts.sstable_dir()).expect("Failed to create sstables dir");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest dir");
 
 	// Create a manifest with log_number and last_sequence set
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
@@ -690,7 +679,7 @@ fn test_manifest_v1_with_log_number_and_last_sequence() {
 	assert_eq!(manifest.get_last_sequence(), 200, "last_sequence should be updated by changeset");
 
 	// Persist to disk
-	write_manifest_to_disk(&manifest).expect("Failed to write manifest");
+	tfs::write_manifest_to_disk(&manifest).expect("Failed to write manifest");
 
 	// Reload and verify
 	let loaded_manifest = LevelManifest::new(opts).expect("Failed to reload manifest");
@@ -719,8 +708,8 @@ fn test_revert_empty_changeset() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	tfs::create_dir_all(&opts, opts.sstable_dir()).expect("Failed to create sstables dir");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest dir");
 
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 
@@ -754,8 +743,8 @@ fn test_revert_added_tables_only() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	tfs::create_dir_all(&opts, opts.sstable_dir()).expect("Failed to create sstables dir");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest dir");
 
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 
@@ -802,8 +791,8 @@ fn test_revert_deleted_tables_only() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	tfs::create_dir_all(&opts, opts.sstable_dir()).expect("Failed to create sstables dir");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest dir");
 
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 
@@ -863,8 +852,8 @@ fn test_revert_mixed_add_delete() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	tfs::create_dir_all(&opts, opts.sstable_dir()).expect("Failed to create sstables dir");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest dir");
 
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 
@@ -918,8 +907,8 @@ fn test_revert_preserves_table_ordering_l0() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	tfs::create_dir_all(&opts, opts.sstable_dir()).expect("Failed to create sstables dir");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest dir");
 
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 
@@ -967,8 +956,8 @@ fn test_revert_preserves_table_ordering_l1() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	tfs::create_dir_all(&opts, opts.sstable_dir()).expect("Failed to create sstables dir");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest dir");
 
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 
@@ -1016,8 +1005,8 @@ fn test_revert_log_number_change() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	tfs::create_dir_all(&opts, opts.sstable_dir()).expect("Failed to create sstables dir");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest dir");
 
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 
@@ -1047,8 +1036,8 @@ fn test_revert_log_number_not_changed() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	tfs::create_dir_all(&opts, opts.sstable_dir()).expect("Failed to create sstables dir");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest dir");
 
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 
@@ -1091,8 +1080,8 @@ fn test_revert_last_sequence() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	tfs::create_dir_all(&opts, opts.sstable_dir()).expect("Failed to create sstables dir");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest dir");
 
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 
@@ -1128,8 +1117,8 @@ fn test_revert_manifest_version() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	tfs::create_dir_all(&opts, opts.sstable_dir()).expect("Failed to create sstables dir");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest dir");
 
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 
@@ -1165,8 +1154,8 @@ fn test_revert_snapshots_added() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	tfs::create_dir_all(&opts, opts.sstable_dir()).expect("Failed to create sstables dir");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest dir");
 
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 
@@ -1214,8 +1203,8 @@ fn test_revert_snapshots_deleted() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	tfs::create_dir_all(&opts, opts.sstable_dir()).expect("Failed to create sstables dir");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest dir");
 
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 
@@ -1272,8 +1261,8 @@ fn test_revert_multiple_tables_same_level() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	tfs::create_dir_all(&opts, opts.sstable_dir()).expect("Failed to create sstables dir");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest dir");
 
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 
@@ -1309,8 +1298,8 @@ fn test_revert_table_only_one_in_level() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	tfs::create_dir_all(&opts, opts.sstable_dir()).expect("Failed to create sstables dir");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest dir");
 
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 
@@ -1349,8 +1338,8 @@ fn test_revert_idempotent() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	tfs::create_dir_all(&opts, opts.sstable_dir()).expect("Failed to create sstables dir");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest dir");
 
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 
@@ -1383,8 +1372,8 @@ fn test_apply_revert_apply_cycle() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	tfs::create_dir_all(&opts, opts.sstable_dir()).expect("Failed to create sstables dir");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest dir");
 
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 
@@ -1428,8 +1417,8 @@ fn test_revert_after_disk_write_failure_simulation() {
 	opts.level_count = 3;
 	let opts = Arc::new(opts);
 
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+	tfs::create_dir_all(&opts, opts.sstable_dir()).expect("Failed to create sstables dir");
+	tfs::create_dir_all(&opts, opts.manifest_dir()).expect("Failed to create manifest dir");
 
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 

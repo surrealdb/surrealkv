@@ -79,6 +79,69 @@ pub fn expect_err<T: Debug, E: Debug>(r: Result<T, E>, what: &str) -> String {
 	}
 }
 
+/// The directory `name` of the origin private file system, or `None` if there is no such
+/// directory. It does not make the directory.
+pub async fn directory(name: &str) -> Option<FileSystemDirectoryHandle> {
+	let root = root().await;
+	let options = web_sys::FileSystemGetDirectoryOptions::new();
+	options.set_create(false);
+	match JsFuture::from(root.get_directory_handle_with_options(name, &options)).await {
+		Ok(dir) => Some(dir.unchecked_into()),
+		Err(e) => {
+			let not_found = e
+				.dyn_ref::<web_sys::DomException>()
+				.is_some_and(|exception| exception.name() == "NotFoundError");
+			assert!(not_found, "getDirectoryHandle({name:?}) failed: {e:?}");
+			None
+		}
+	}
+}
+
+/// The names in the directory `name` of the origin private file system, sorted, or `None` if there
+/// is no such directory. It does not make the directory and does not open any file in it, so it
+/// can look at a database that a worker has mounted.
+pub async fn list_directory(name: &str) -> Option<Vec<String>> {
+	let dir = directory(name).await?;
+	let iterator = dir.keys();
+	let mut names = Vec::new();
+	loop {
+		let next = iterator.next().unwrap_or_else(|e| panic!("listing {name:?} failed: {e:?}"));
+		let step: js_sys::IteratorNext = JsFuture::from(next)
+			.await
+			.unwrap_or_else(|e| panic!("listing {name:?} failed: {e:?}"))
+			.unchecked_into();
+		if step.done() {
+			break;
+		}
+		names.push(step.value().as_string().expect("the browser lists names as strings"));
+	}
+	names.sort();
+	Some(names)
+}
+
+/// Removes the database `name` of the origin private file system once no worker holds it, trying
+/// again while the removal fails with the lock error (the browser releases the files of a worker
+/// that was terminated in its own time), and checks that the directory is gone. Fails the test if
+/// the files are still held after `limit_ms`.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub async fn destroy_when_released(name: &str, limit_ms: f64) {
+	let started = js_sys::Date::now();
+	loop {
+		match surrealkv::FileSystem::destroy_opfs(name).await {
+			Ok(()) => break,
+			Err(e) if e.is_database_locked() => {
+				assert!(
+					js_sys::Date::now() - started < limit_ms,
+					"{name} was still held {limit_ms} ms after the workers were ended: {e}"
+				);
+				sleep_ms(250.0).await;
+			}
+			Err(e) => panic!("removing {name} failed: {e}"),
+		}
+	}
+	assert!(list_directory(name).await.is_none(), "{name} is still there after its removal");
+}
+
 /// Reads the whole file by reading until a read returns nothing, so the length it finds is the
 /// real length of the file and does not come from `size()`. A read that never stops returning
 /// data (an ignored offset, for example) fails the test instead of looping forever.
@@ -230,6 +293,26 @@ fn timer(ms: f64) -> JsFuture {
 		set_timeout.call2(&global, &resolve, &JsValue::from_f64(ms)).expect("setTimeout failed");
 	});
 	JsFuture::from(promise)
+}
+
+/// Waits `ms` milliseconds on the timer of the global scope. Other tasks of the worker run in
+/// the meantime, which is what a test needs to let a background task of the engine make progress.
+pub async fn sleep_ms(ms: f64) {
+	let _ = timer(ms).await;
+}
+
+/// Polls `condition` every few milliseconds until it holds, and fails the test with `what` if it
+/// does not within `limit_ms`. For things that a background task of the engine does (a flush, a
+/// compaction), which a test has to wait for and must not assume.
+pub async fn wait_until(what: &str, limit_ms: f64, mut condition: impl FnMut() -> bool) {
+	let started = js_sys::Date::now();
+	while !condition() {
+		assert!(
+			js_sys::Date::now() - started < limit_ms,
+			"{what}: did not happen within {limit_ms} ms"
+		);
+		sleep_ms(5.0).await;
+	}
 }
 
 /// Awaits `fut`, failing the test with a message if it takes longer than [`WATCHDOG_MS`].

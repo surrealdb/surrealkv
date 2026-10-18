@@ -72,6 +72,7 @@ use crate::tde::{
 	MANIFEST_PREFIX_LEN,
 };
 use crate::test::sstable_encryption_tests::{first_of, flip, walk};
+use crate::test::tfs;
 use crate::test::wal_sealed_tests::{fix_checksum, physical_records};
 use crate::wal::{BLOCK_SIZE, HEADER_SIZE};
 use crate::{Durability, Mode, Options, Tree, WalRecoveryMode};
@@ -473,6 +474,9 @@ fn assert_caught(what: &str, work: &Path, before: &DirImage, outcome: Outcome, s
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_key_that_does_not_fit_is_refused_with_its_error_and_no_file_changes() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let tables = tables_db(suite, &Auth::Right).await;
 		let wal = wal_db(suite).await;
@@ -556,6 +560,9 @@ async fn a_key_that_does_not_fit_is_refused_with_its_error_and_no_file_changes()
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_file_of_the_other_kind_is_refused_in_either_direction_and_nothing_changes() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let sealed = tables_db(suite, &Auth::Right).await;
 		let plain = tables_db(suite, &Auth::None).await;
@@ -610,6 +617,9 @@ async fn a_file_of_the_other_kind_is_refused_in_either_direction_and_nothing_cha
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_file_of_another_database_with_the_same_key_is_refused_for_its_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let ours = tables_db(suite, &Auth::Right).await;
 		// Made the same way, so its files have the names of ours, and its own identity.
@@ -671,6 +681,9 @@ fn with_header_checksum(mut bytes: Vec<u8>) -> Vec<u8> {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_changed_manifest_is_the_error_of_the_part_that_changed_and_no_file_changes() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let db = tables_db(suite, &Auth::Right).await;
 		let pristine = Pristine {
@@ -741,6 +754,9 @@ fn table_id(path: &Path) -> u64 {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_changed_byte_in_a_block_of_each_kind_fails_authentication_where_the_block_is_read() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let db = tables_db(suite, &Auth::Right).await;
 		let context = db.context.clone().expect("an encrypted database has a context");
@@ -798,6 +814,9 @@ async fn a_changed_byte_in_a_block_of_each_kind_fails_authentication_where_the_b
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_changed_entry_of_the_value_log_is_a_corrupt_value_and_never_a_wrong_one() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let db = tables_db(suite, &Auth::Right).await;
 		let log = first_file(db.dir.path(), "vlog", "vlog");
@@ -835,29 +854,50 @@ async fn a_changed_entry_of_the_value_log_is_a_corrupt_value_and_never_a_wrong_o
 				"{what}: {changes:?}"
 			);
 
-			// A file that was cut short: the entries before the cut are read, and the one that is
-			// cut is an error that says so.
-			let work = work_copy(db.dir.path());
-			set_len(&first_file(work.path(), "vlog", "vlog"), (bytes.len() - 20) as u64);
-			let before = DirImage::of(work.path());
-			let outcome =
-				open_and_read(work.path(), WITH_LOG, mode, suite, &Auth::Right, &db.expected).await;
-			let Outcome::Opened(reads) = outcome else {
-				panic!("{what}: the open of a database whose log was cut short was refused");
-			};
-			assert!(reads.wrong.is_empty() && reads.missing.is_empty(), "{what}");
-			assert!(!reads.failures.is_empty(), "{what}: the cut was never noticed");
-			for error in &reads.failures {
+			// A file that was cut short. The commits that were not flushed are in the last segment
+			// of the WAL, and the open holds that segment to the value log: with the
+			// last entry cut, the commit that it belongs to is not replayed, and the
+			// mode that refuses damage refuses it. Every other entry that is cut is an
+			// error that says so, where it is read.
+			for cut in [bytes.len() - 20, 127 + 20] {
+				let what = format!("{what}, the value log cut to {cut} of {} bytes", bytes.len());
+				let work = work_copy(db.dir.path());
+				set_len(&first_file(work.path(), "vlog", "vlog"), cut as u64);
+				let before = DirImage::of(work.path());
+				let outcome =
+					open_and_read(work.path(), WITH_LOG, mode, suite, &Auth::Right, &db.expected)
+						.await;
+				if mode == WalRecoveryMode::AbsoluteConsistency {
+					let Outcome::Refused(error) = outcome else {
+						panic!("{what}: the open of a database whose log was cut short succeeded");
+					};
+					assert!(matches!(error, Error::WalCorruption { .. }), "{what}: {error:?}");
+					DirImage::of(work.path()).assert_unchanged_since(&before, &what);
+					continue;
+				}
+				let Outcome::Opened(reads) = outcome else {
+					panic!("{what}: the open of a database whose log was cut short was refused");
+				};
+				assert!(reads.wrong.is_empty(), "{what}");
+				let unflushed: Vec<Vec<u8>> =
+					db.expected.keys().filter(|key| key.starts_with(b"w-")).cloned().collect();
+				assert_eq!(reads.missing, unflushed, "{what}: the commit whose value is cut");
+				for error in &reads.failures {
+					assert!(
+						matches!(error, Error::Other(message) if message.contains("cut short")),
+						"{what}: {error:?}"
+					);
+				}
+				if cut == 127 + 20 {
+					assert!(!reads.failures.is_empty(), "{what}: the cut was never noticed");
+				}
+				let changes = DirImage::of(work.path()).changes_since(&before);
 				assert!(
-					matches!(error, Error::Other(message) if message.contains("cut short")),
-					"{what}: {error:?}"
+					changes.iter().all(|change| change.starts_with("file added: wal")
+						|| change.starts_with("file changed: wal")),
+					"{what}: {changes:?}"
 				);
 			}
-			let changes = DirImage::of(work.path()).changes_since(&before);
-			assert!(
-				changes.iter().all(|change| change.starts_with("file added: wal")),
-				"{what}: {changes:?}"
-			);
 		}
 	}
 }
@@ -868,6 +908,9 @@ async fn a_changed_entry_of_the_value_log_is_a_corrupt_value_and_never_a_wrong_o
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_damaged_wal_is_never_repaired_unless_it_is_a_tear_in_the_last_segment() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let pristine_dir = wal_db(suite).await;
 		let pristine = Pristine {
@@ -1022,6 +1065,9 @@ async fn rotated_db(suite: CipherSuite) -> Db {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_key_that_rotated_is_needed_until_it_is_retired_and_then_the_database_is_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let db = rotated_db(suite).await;
 		assert_holds_no_key(

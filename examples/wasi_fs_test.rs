@@ -1,3 +1,8 @@
+#![allow(
+	clippy::disallowed_methods,
+	reason = "an example that removes its scratch directory on a disk"
+)]
+
 use surrealkv::TreeBuilder;
 
 #[tokio::main(flavor = "current_thread")]

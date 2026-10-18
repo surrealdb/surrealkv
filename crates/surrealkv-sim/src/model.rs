@@ -71,6 +71,18 @@ impl ModelDb {
 		self.data.range((map_start, map_end)).map(|(k, v)| (k.clone(), v.clone())).collect()
 	}
 
+	/// The committed key-value pairs, in key order: what a recovery is compared with.
+	pub fn state(&self) -> Vec<(Key, Vec<u8>)> {
+		self.data.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+	}
+
+	/// Sets the committed state to `state`, which is what a crash left of it: the commits that were
+	/// lost are gone from the model too, and a transaction that begins now reads this state.
+	pub fn restore(&mut self, state: Vec<(Key, Vec<u8>)>) {
+		self.data = state.into_iter().collect();
+		self.history.insert(self.version, self.data.clone());
+	}
+
 	/// Begins a model transaction at the current version.
 	pub fn begin(&self) -> ModelTxn {
 		ModelTxn {
@@ -217,6 +229,27 @@ mod tests {
 
 		assert_eq!(model.get(b"k1"), None);
 		assert_eq!(model.get(b"k2"), None);
+	}
+
+	#[test]
+	fn test_model_restore_rewinds_the_committed_state() {
+		let mut model = ModelDb::new();
+		let mut tx = model.begin();
+		tx.set(b"k1", b"v1");
+		assert!(model.commit(tx).is_ok());
+		let before = model.state();
+		let mut tx = model.begin();
+		tx.set(b"k2", b"v2");
+		tx.delete(b"k1");
+		assert!(model.commit(tx).is_ok());
+		assert_eq!(model.state(), vec![(b"k2".to_vec(), b"v2".to_vec())]);
+
+		model.restore(before.clone());
+		assert_eq!(model.state(), before);
+		// A transaction that begins after the rewind reads the rewound state.
+		let tx = model.begin();
+		assert_eq!(tx.get(b"k1", &model), Some(b"v1".to_vec()));
+		assert_eq!(tx.get(b"k2", &model), None);
 	}
 
 	#[test]

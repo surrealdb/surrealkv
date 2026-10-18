@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tempdir::TempDir;
 use test_log::test;
 
+use super::tfs;
 use crate::compaction::leveled::Strategy;
 use crate::{Options, Tree, TreeBuilder};
 
@@ -410,11 +411,11 @@ async fn test_oversized_recovery_memtable_does_not_become_active() {
 	// completing, so replay has to reconstruct the data itself via the
 	// oversized-memtable fallback.
 	let wal_dir = opts.wal_dir();
-	std::fs::create_dir_all(&wal_dir).unwrap();
+	super::sfs::create_dir_all(&wal_dir).unwrap();
 	// The engine writes the manifest before it creates any WAL segment, so a crash can
 	// only leave a segment next to an existing manifest. Opening a directory that has
 	// WAL segments but no manifest is refused rather than treated as a new database.
-	std::fs::create_dir_all(opts.manifest_dir()).unwrap();
+	tfs::create_dir_all(&opts, opts.manifest_dir()).unwrap();
 	crate::levels::LevelManifest::new(Arc::new(opts.clone())).unwrap();
 	let big_value = vec![0xEFu8; MAX_MEMTABLE * 2];
 	// Values are stored `ValueLocation`-encoded (even inline ones) by the normal
@@ -422,7 +423,7 @@ async fn test_oversized_recovery_memtable_does_not_become_active() {
 	// encoding here since this test writes directly to the WAL, bypassing that path.
 	let encoded_value = crate::vlog::ValueLocation::with_inline_value(big_value.clone()).encode();
 	{
-		let wal_opts = crate::wal::Options::default();
+		let wal_opts = tfs::wal_options();
 		let mut wal = crate::wal::manager::Wal::open(&wal_dir, wal_opts).unwrap();
 		let mut batch = crate::batch::Batch::new(1);
 		batch.set(b"oversized_key".to_vec(), encoded_value, 0).unwrap();

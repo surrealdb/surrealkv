@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tempdir::TempDir;
 use test_log::test;
 
+use super::{sfs, tfs};
 use crate::batch::Batch;
 use crate::compaction::leveled::Strategy;
 use crate::ring::PipelineHook;
@@ -22,7 +23,7 @@ use crate::{Error, Options, Tree};
 /// Truncates a file to zero bytes, the way a power loss can when the file's
 /// data was never fsynced.
 fn simulate_data_loss(path: &std::path::Path) {
-	std::fs::OpenOptions::new().write(true).open(path).unwrap().set_len(0).unwrap();
+	sfs::OpenOptions::new().write(true).open(path).unwrap().set_len(0).unwrap();
 }
 
 /// Test for https://github.com/surrealdb/surrealdb/issues/7426
@@ -44,6 +45,9 @@ fn simulate_data_loss(path: &std::path::Path) {
 /// best-effort async close spawned by `Drop` is never polled.
 #[test(tokio::test)]
 async fn power_loss_after_compaction_must_not_lose_synced_data() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let temp_dir = TempDir::new("test").unwrap();
 	let path = temp_dir.path().to_path_buf();
 
@@ -92,7 +96,7 @@ async fn power_loss_after_compaction_must_not_lose_synced_data() {
 	// output is lost to a crash the data is unrecoverable.
 	for id in &l0_ids {
 		assert!(
-			!opts.sstable_file_path(*id).exists(),
+			!sfs::exists(opts.sstable_file_path(*id)),
 			"compaction input table {id} should be deleted"
 		);
 	}
@@ -130,7 +134,7 @@ async fn power_loss_after_compaction_must_not_lose_synced_data() {
 	// Simulate power loss: any SST whose data was never fsynced may legally
 	// come back empty; fsynced files survive.
 	let mut truncated = Vec::new();
-	for entry in std::fs::read_dir(opts.sstable_dir()).unwrap() {
+	for entry in sfs::read_dir(opts.sstable_dir()).unwrap() {
 		let sst_path = entry.unwrap().path();
 		if sst_path.extension().is_some_and(|ext| ext == "sst")
 			&& !sync_tracker::was_synced(&sst_path)
@@ -142,7 +146,7 @@ async fn power_loss_after_compaction_must_not_lose_synced_data() {
 
 	// The flush-created sibling must have survived intact (it was fsynced)
 	// — the analogue of the intact 1064-byte table in the issue report.
-	let sibling_size = std::fs::metadata(opts.sstable_file_path(sibling_id)).unwrap().len();
+	let sibling_size = sfs::metadata(opts.sstable_file_path(sibling_id)).unwrap().len();
 	assert!(sibling_size > 0, "fsynced flush table {sibling_id} must survive the crash intact");
 
 	// Reopen: the store must come back with every key intact. Without the

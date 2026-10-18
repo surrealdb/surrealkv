@@ -24,6 +24,7 @@ use super::sstable_encryption_tests::{
 	KEYS,
 	TABLE_ID,
 };
+use super::tfs;
 use crate::error::EncryptionError;
 use crate::inspect::{
 	dump_sst_with_options,
@@ -340,6 +341,9 @@ fn a_table_that_cannot_be_read_is_not_verified_and_is_not_said_to_be_damaged_unl
 
 #[tokio::test]
 async fn a_database_that_was_written_by_a_tree_is_verified_with_its_key_and_not_without_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		create(dir.path(), manager(), suite).await;

@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 
+use super::tfs;
 use crate::error::EncryptionError;
 use crate::levels::{
 	check_manifest_before_open,
@@ -68,7 +69,7 @@ fn options(dir: &Path, ctx: Option<&Arc<EncryptionContext>>) -> Arc<Options> {
 		Some(ctx) => opts.with_encryption_context(Arc::clone(ctx)),
 		None => opts,
 	};
-	fs::create_dir_all(opts.manifest_dir()).unwrap();
+	tfs::create_dir_all(&opts, opts.manifest_dir()).unwrap();
 	Arc::new(opts)
 }
 
@@ -172,6 +173,9 @@ fn as_version_1(plain: &[u8]) -> Vec<u8> {
 
 #[test]
 fn the_manifest_of_an_encrypted_database_is_sealed_and_its_body_is_what_a_plaintext_one_holds() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let ctx = context(suite, ROOT, 0xD1);
@@ -212,6 +216,9 @@ fn the_manifest_of_an_encrypted_database_is_sealed_and_its_body_is_what_a_plaint
 
 #[test]
 fn a_manifest_without_a_context_is_the_bytes_that_a_plaintext_database_always_had() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let opts = options(dir.path(), None);
 	LevelManifest::new(Arc::clone(&opts)).unwrap();
@@ -240,6 +247,9 @@ fn a_manifest_without_a_context_is_the_bytes_that_a_plaintext_database_always_ha
 
 #[test]
 fn every_write_of_the_manifest_is_sealed_under_a_new_salt() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let ctx = context(suite, ROOT, 0xD1);
@@ -268,6 +278,9 @@ fn every_write_of_the_manifest_is_sealed_under_a_new_salt() {
 
 #[test]
 fn a_write_that_is_tried_again_after_a_failure_is_sealed_under_a_new_salt() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let ctx = context(suite, ROOT, 0xD1);
@@ -304,6 +317,9 @@ fn a_write_that_is_tried_again_after_a_failure_is_sealed_under_a_new_salt() {
 
 #[test]
 fn a_manifest_is_not_read_as_the_other_kind_and_nothing_is_changed_by_the_refusal() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let ctx = context(suite, ROOT, 0xD1);
@@ -350,6 +366,9 @@ fn a_manifest_is_not_read_as_the_other_kind_and_nothing_is_changed_by_the_refusa
 
 #[test]
 fn a_loader_that_does_not_know_encryption_fails_at_the_manifest_with_nothing_else_read() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let opts = options(dir.path(), Some(&context(suite, ROOT, 0xD1)));
@@ -377,6 +396,9 @@ fn a_loader_that_does_not_know_encryption_fails_at_the_manifest_with_nothing_els
 
 #[test]
 fn a_changed_manifest_is_the_error_of_the_part_that_changed_and_a_read_changes_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let ctx = context(suite, ROOT, 0xD1);
@@ -449,6 +471,9 @@ fn a_changed_manifest_is_the_error_of_the_part_that_changed_and_a_read_changes_n
 
 #[test]
 fn a_manifest_that_is_cut_short_is_damage_at_every_length_and_never_a_panic() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let opts = options(dir.path(), Some(&context(suite, ROOT, 0xD1)));

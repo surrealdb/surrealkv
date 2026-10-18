@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 
+use super::tfs;
 use crate::compaction::leveled::Strategy;
 use crate::error::{EncryptionError, KeyProviderFailure};
 use crate::sstable::block_io::{BlockKind, TrailerLayout};
@@ -147,6 +148,9 @@ fn open_error(opts: &Arc<Options>) -> Error {
 
 #[tokio::test]
 async fn the_tables_that_a_flush_and_a_compaction_write_are_sealed_and_read_back_after_a_reopen() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let ctx = context(suite);
@@ -202,6 +206,9 @@ async fn the_tables_that_a_flush_and_a_compaction_write_are_sealed_and_read_back
 
 #[tokio::test]
 async fn a_key_that_cannot_be_had_is_the_error_of_the_flush_and_the_flush_can_be_tried_again() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let key_manager = FlakyManager::new();
 	let ctx = Arc::new(EncryptionContext::new(
@@ -251,6 +258,9 @@ async fn a_key_that_cannot_be_had_is_the_error_of_the_flush_and_the_flush_can_be
 
 #[tokio::test]
 async fn a_batch_that_goes_straight_to_level_zero_is_sealed_too() {
+	if tfs::skip_listed() {
+		return;
+	}
 	const COUNT: usize = 250;
 	let direct_value = |i: usize| format!("direct-canary-{i:06}-{}", "y".repeat(380)).into_bytes();
 
@@ -287,6 +297,9 @@ async fn a_batch_that_goes_straight_to_level_zero_is_sealed_too() {
 
 #[tokio::test]
 async fn a_database_is_not_opened_with_a_key_that_is_not_its_own_and_nothing_is_changed() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let ctx = context(CipherSuite::Aes256Gcm);
 	let opts = options(dir.path(), Some(&ctx), DEFAULT_MEMTABLE);
@@ -331,6 +344,9 @@ async fn a_database_is_not_opened_with_a_key_that_is_not_its_own_and_nothing_is_
 
 #[tokio::test]
 async fn a_plain_database_is_not_opened_as_an_encrypted_one_and_nothing_is_changed() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let plain = options(dir.path(), None, DEFAULT_MEMTABLE);
 	let tree = Tree::new(Arc::clone(&plain)).unwrap();
@@ -365,6 +381,9 @@ async fn a_plain_database_is_not_opened_as_an_encrypted_one_and_nothing_is_chang
 
 #[tokio::test]
 async fn a_foreign_database_is_not_migrated_into_an_encrypted_one() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let ctx = context(CipherSuite::Aes256Gcm);
 	let key_manager: Arc<dyn crate::KeyManager> = Arc::new(SoftwareKeyManager::new([0x42; 32]));
 
@@ -423,6 +442,9 @@ fn files_of(dir: &Path) -> BTreeMap<String, Vec<u8>> {
 
 #[tokio::test]
 async fn a_checkpoint_of_an_encrypted_database_holds_its_sealed_tables_and_restores_with_the_key() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let checkpoints = TempDir::new().unwrap();
@@ -463,6 +485,9 @@ async fn a_checkpoint_of_an_encrypted_database_holds_its_sealed_tables_and_resto
 
 #[tokio::test]
 async fn a_plain_checkpoint_is_not_restored_into_an_encrypted_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let plain_dir = TempDir::new().unwrap();
 	let checkpoints = TempDir::new().unwrap();
 	let checkpoint = checkpoints.path().join("checkpoint");
@@ -491,6 +516,9 @@ async fn a_plain_checkpoint_is_not_restored_into_an_encrypted_database() {
 
 #[tokio::test]
 async fn a_table_that_was_changed_on_disk_is_an_error_that_repairs_and_removes_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let ctx = context(CipherSuite::XChaCha20Poly1305);
 	let opts = options(dir.path(), Some(&ctx), DEFAULT_MEMTABLE);

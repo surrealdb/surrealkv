@@ -25,6 +25,7 @@ use super::encryption_open_tests::{
 	KEYS,
 	SUITES,
 };
+use super::tfs;
 use crate::error::EncryptionError;
 use crate::tde::{CipherSuite, KeyManager, SoftwareKeyManager};
 use crate::Tree;
@@ -68,6 +69,9 @@ fn segment_in_the_clear() -> Vec<u8> {
 #[tokio::test]
 async fn a_segment_of_the_wal_of_a_checkpoint_that_is_not_of_this_database_is_refused_before_anything_is_cleared(
 ) {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let checkpoints = TempDir::new().unwrap();
@@ -116,6 +120,9 @@ async fn a_segment_of_the_wal_of_a_checkpoint_that_is_not_of_this_database_is_re
 #[tokio::test]
 async fn a_sealed_segment_in_the_wal_of_a_checkpoint_of_a_database_that_is_not_encrypted_is_refused(
 ) {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let checkpoints = TempDir::new().unwrap();
 	let live_root = dir.path().join("live");
@@ -140,6 +147,9 @@ async fn a_sealed_segment_in_the_wal_of_a_checkpoint_of_a_database_that_is_not_e
 #[tokio::test]
 async fn a_segment_of_the_wal_of_a_checkpoint_that_is_a_link_is_looked_at_as_the_file_it_leads_to()
 {
+	if tfs::skip_listed() {
+		return;
+	}
 	let suite = CipherSuite::XChaCha20Poly1305;
 	let dir = TempDir::new().unwrap();
 	let checkpoints = TempDir::new().unwrap();

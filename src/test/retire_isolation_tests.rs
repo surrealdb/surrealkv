@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use tempdir::TempDir;
 
+use super::tfs;
 use crate::batch::Batch;
 use crate::lsm::Tree;
 use crate::ring::{PipelineHook, ADMISSION_PERMITS, COMMIT_RING_CAPACITY, RETIRE_EVERY_GROUPS};
@@ -1180,6 +1181,9 @@ async fn savepoints_decide_which_locked_reads_conflict_across_laps() {
 /// conflicts across laps are found, disjoint transactions commit, and the retained entries drain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_with_a_transaction_open_leaves_validation_and_retire_working() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (store, _dir) = create_store();
 	let pipeline = &store.core.commit_pipeline;
 	commit_unique(&store, "base", 10).await;

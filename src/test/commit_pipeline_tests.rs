@@ -331,16 +331,16 @@ async fn wal_bytes_of_a_fixed_commit_sequence_do_not_change() {
 	// Opening a tree continues in a fresh segment, which leaves the first one empty, so only
 	// the segments that hold bytes are counted: all of them must be one, the commits did not
 	// rotate the WAL.
-	let mut segments: Vec<(u64, PathBuf)> = std::fs::read_dir(dir.path().join("wal"))
+	let mut segments: Vec<(u64, PathBuf)> = super::sfs::read_dir(dir.path().join("wal"))
 		.unwrap()
 		.map(|entry| entry.unwrap().path())
 		.filter(|path| path.extension().is_some_and(|ext| ext == "wal"))
-		.filter(|path| std::fs::metadata(path).unwrap().len() > 0)
+		.filter(|path| super::sfs::metadata(path).unwrap().len() > 0)
 		.map(|path| (path.file_stem().unwrap().to_str().unwrap().parse().unwrap(), path))
 		.collect();
 	segments.sort();
 	let bytes: Vec<u8> =
-		segments.iter().flat_map(|(_, path)| std::fs::read(path).unwrap()).collect();
+		segments.iter().flat_map(|(_, path)| super::sfs::read(path).unwrap()).collect();
 	assert_eq!(
 		(segments.len(), bytes.len(), xxh3_64(&bytes)),
 		(1, 404_281, 5_576_617_551_117_973_792),

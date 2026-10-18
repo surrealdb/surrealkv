@@ -1,5 +1,10 @@
 //! Diagnostics, inspection, and integrity scrubbing utilities for SurrealKV.
 
+#![allow(
+	clippy::disallowed_methods,
+	reason = "std-path diagnostics for a database directory on a disk, run by a tool that holds no file system handle; none of it is on the path that opens or writes a database"
+)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

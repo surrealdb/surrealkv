@@ -22,6 +22,7 @@ use super::encryption_open_tests::{
 	SUITES,
 };
 use super::sstable_encryption_tests::{many_points, options, write_table};
+use super::tfs;
 use crate::inspect::{encryption_report, EncryptionStatus};
 use crate::tde::{
 	describe_manifest_file,
@@ -78,6 +79,9 @@ fn first_table(root: &Path) -> PathBuf {
 
 #[tokio::test]
 async fn a_tree_says_which_key_covers_which_files() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		create(dir.path(), manager(), suite).await;
@@ -116,6 +120,9 @@ async fn a_tree_says_which_key_covers_which_files() {
 
 #[tokio::test]
 async fn a_key_that_was_replaced_still_covers_what_was_written_under_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let km = Arc::new(SoftwareKeyManager::new(ROOT));
@@ -187,6 +194,9 @@ async fn a_tree_that_is_not_encrypted_has_nothing_to_say_about_keys() {
 
 #[tokio::test]
 async fn a_report_made_from_the_files_alone_says_the_same_without_a_key() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		create(dir.path(), manager(), suite).await;
@@ -227,6 +237,9 @@ fn plain_table(id: u64) -> Vec<u8> {
 
 #[tokio::test]
 async fn a_file_in_the_clear_in_an_encrypted_database_is_reported_and_counted() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (dir, _) = database().await;
 	let before = on_disk(dir.path());
 	fs::write(sstable(dir.path(), 99), plain_table(99)).unwrap();
@@ -245,6 +258,9 @@ async fn a_file_in_the_clear_in_an_encrypted_database_is_reported_and_counted() 
 
 #[tokio::test]
 async fn a_file_of_another_database_and_suite_and_a_renamed_file_are_reported() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (dir, _) = database().await;
 	let before = on_disk(dir.path());
 
@@ -295,6 +311,9 @@ async fn a_file_of_another_database_and_suite_and_a_renamed_file_are_reported() 
 #[cfg(unix)]
 #[tokio::test]
 async fn a_file_that_is_a_link_is_counted_as_the_file_that_it_leads_to() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (dir, _) = database().await;
 	let before = on_disk(dir.path());
 	let table = first_table(dir.path());
@@ -322,6 +341,9 @@ async fn a_file_that_is_a_link_is_counted_as_the_file_that_it_leads_to() {
 
 #[tokio::test]
 async fn a_header_that_cannot_be_read_is_reported_and_belongs_to_no_key() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (dir, _) = database().await;
 	let before = on_disk(dir.path());
 	let mut table = fs::read(first_table(dir.path())).unwrap();
@@ -342,6 +364,9 @@ async fn a_header_that_cannot_be_read_is_reported_and_belongs_to_no_key() {
 
 #[tokio::test]
 async fn what_a_healthy_database_leaves_is_noted_and_does_not_make_it_inconsistent() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (dir, _) = database().await;
 	let opts = opts_of(dir.path());
 	let before = on_disk(dir.path());
@@ -373,6 +398,9 @@ async fn what_a_healthy_database_leaves_is_noted_and_does_not_make_it_inconsiste
 
 #[tokio::test]
 async fn a_sealed_file_in_a_database_that_is_not_encrypted_is_reported() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let tree = Tree::new(plain(dir.path())).unwrap();
 	write(&tree, '1', 0..KEYS).await;

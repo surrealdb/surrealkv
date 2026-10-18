@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 use tempdir::TempDir;
 use test_log::test;
 
-use super::collect_transaction_all;
+use super::{collect_transaction_all, tfs};
 use crate::checkpoint::{CheckpointMetadata, CheckpointStage};
 use crate::compaction::compactor::CompactionStage;
 use crate::compaction::leveled::Strategy;
@@ -912,6 +912,9 @@ async fn point_in_time(shape: Shape, name: &str) {
 /// returned, and exactly the ones numbered up to its sequence number.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 8))]
 async fn checkpoints_under_group_writers_hold_whole_transactions_and_a_prefix_of_each_writer() {
+	if tfs::skip_listed() {
+		return;
+	}
 	point_in_time(
 		Shape {
 			memtable: 16 * 1024,
@@ -933,6 +936,9 @@ async fn checkpoints_under_group_writers_hold_whole_transactions_and_a_prefix_of
 /// transactions, and threads that rotate it by hand on top, with values in the value log.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 8))]
 async fn checkpoints_racing_a_rotation_storm_with_a_value_log_hold_whole_transactions() {
+	if tfs::skip_listed() {
+		return;
+	}
 	point_in_time(
 		Shape {
 			memtable: 4 * 1024,
@@ -955,6 +961,9 @@ async fn checkpoints_racing_a_rotation_storm_with_a_value_log_hold_whole_transac
 /// whole transactions at the sequence number they report.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 8))]
 async fn two_checkpoints_at_once_into_different_directories_both_restore_consistently() {
+	if tfs::skip_listed() {
+		return;
+	}
 	point_in_time(
 		Shape {
 			memtable: 8 * 1024,
@@ -1038,6 +1047,9 @@ async fn two_tables(path: &Path, vlog: bool) -> Merging {
 /// copied, which agree, and restores to exactly the state it had when it began.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_flush_and_a_compaction_wait_for_the_checkpoint_that_holds_the_manifest() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let dir = TempDir::new("ckpt_conc_hold").unwrap();
 		let out = TempDir::new("ckpt_conc_hold_out").unwrap();
@@ -1144,6 +1156,9 @@ async fn a_flush_and_a_compaction_wait_for_the_checkpoint_that_holds_the_manifes
 /// checkpoint is done: the checkpoint's manifest lists tables whose values are all in its copy.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_flush_and_a_compaction_finish_while_a_checkpoint_has_yet_to_copy_the_value_log() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let dir = TempDir::new("ckpt_conc_released").unwrap();
 		let out = TempDir::new("ckpt_conc_released_out").unwrap();
@@ -1240,6 +1255,9 @@ async fn a_flush_and_a_compaction_finish_while_a_checkpoint_has_yet_to_copy_the_
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_holds_the_manifest_while_it_copies_it_and_writes_its_metadata_after_the_value_log(
 ) {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let dir = TempDir::new("ckpt_conc_window").unwrap();
 		let out = TempDir::new("ckpt_conc_window_out").unwrap();
@@ -1394,6 +1412,9 @@ fn churn_val(writer: usize, i: usize, version: usize) -> Vec<u8> {
 /// version it was, or a later one, intact.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 8))]
 async fn checkpoints_during_value_log_churn_and_background_compaction_read_back_every_value() {
+	if tfs::skip_listed() {
+		return;
+	}
 	const WRITERS: usize = 4;
 	const KEYS: usize = 12;
 	const VERSIONS: usize = 60;
@@ -1539,6 +1560,9 @@ async fn checkpoints_during_value_log_churn_and_background_compaction_read_back_
 /// one that ran last. Repeated, with writers running.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 8))]
 async fn two_checkpoints_at_once_into_the_same_directory_leave_one_that_restores_whole() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let shape = Shape {
 		memtable: 8 * 1024,
 		vlog: true,
@@ -1726,6 +1750,9 @@ async fn same_directory_slow_and_fast(
 /// every value readable, nothing of the older state mixed in.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_slow_checkpoint_over_a_faster_one_into_the_same_directory_leaves_a_whole_state() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let (newer, _slow, _fast, out, cp) = same_directory_slow_and_fast(vlog).await;
 		let target = out.path().join("restored");
@@ -1741,6 +1768,9 @@ async fn a_slow_checkpoint_over_a_faster_one_into_the_same_directory_leaves_a_wh
 /// its metadata last, over the files of the newer one.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn the_metadata_a_slow_checkpoint_leaves_in_a_shared_directory_describes_its_files() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (_newer, _slow, fast, out, cp) = same_directory_slow_and_fast(false).await;
 	let target = out.path().join("restored");
 	let (copy, outcome) = restored(&cp, &target, false).await;
@@ -1757,6 +1787,9 @@ async fn the_metadata_a_slow_checkpoint_leaves_in_a_shared_directory_describes_i
 /// a `..` waits for the first just the same, and the files it leaves are its own.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_waits_for_the_one_writing_its_destination_however_the_path_is_spelled() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("ckpt_conc_spelled").unwrap();
 	let out = TempDir::new("ckpt_conc_spelled_out").unwrap();
 	let tree = open(dir.path(), false);
@@ -1792,6 +1825,9 @@ async fn a_checkpoint_waits_for_the_one_writing_its_destination_however_the_path
 /// first is parked inside its own.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_into_another_directory_does_not_wait_for_a_parked_one() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("ckpt_conc_other").unwrap();
 	let out = TempDir::new("ckpt_conc_other_out").unwrap();
 	let tree = open(dir.path(), false);
@@ -1817,6 +1853,9 @@ async fn a_checkpoint_into_another_directory_does_not_wait_for_a_parked_one() {
 /// A checkpoint that fails gives its destination back: the next one into it is not left waiting.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_failed_checkpoint_lets_the_next_one_into_its_destination() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (source, _dir, state) = source_with_data(false).await;
 	let out = TempDir::new("ckpt_conc_failed").unwrap();
 	let cp = out.path().join("cp");
@@ -1839,6 +1878,9 @@ async fn a_failed_checkpoint_lets_the_next_one_into_its_destination() {
 /// waiting.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_that_panics_lets_the_next_one_into_its_destination() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (source, _dir, state) = source_with_data(false).await;
 	let out = TempDir::new("ckpt_conc_panic").unwrap();
 	let cp = out.path().join("cp");
@@ -1973,6 +2015,9 @@ fn image_hook(tree: &Tree, cp: &Path, into: &Path) -> Images {
 /// and a refused restore leaves the target as it was.
 #[test(tokio::test)]
 async fn a_checkpoint_directory_without_its_metadata_is_refused_and_the_target_is_untouched() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let (source, _dir, state) = source_with_data(vlog).await;
 		let out = TempDir::new("ckpt_conc_images").unwrap();
@@ -2024,6 +2069,9 @@ async fn a_checkpoint_directory_without_its_metadata_is_refused_and_the_target_i
 /// the target keeps its data.
 #[test(tokio::test)]
 async fn a_torn_or_unsupported_metadata_file_is_refused_and_the_target_is_untouched() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (source, _dir, state) = source_with_data(false).await;
 	let out = TempDir::new("ckpt_conc_torn").unwrap();
 	let cp = out.path().join("cp");
@@ -2065,6 +2113,9 @@ async fn a_torn_or_unsupported_metadata_file_is_refused_and_the_target_is_untouc
 /// written) describes no checkpoint: restore refuses it, and the target keeps its data.
 #[test(tokio::test)]
 async fn a_zero_filled_metadata_file_is_refused_and_the_target_is_untouched() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (source, _dir, _state) = source_with_data(false).await;
 	let out = TempDir::new("ckpt_conc_zeroed").unwrap();
 	let cp = out.path().join("cp");
@@ -2082,6 +2133,9 @@ async fn a_zero_filled_metadata_file_is_refused_and_the_target_is_untouched() {
 /// target's data: the restore reads everything it needs before it replaces anything.
 #[test(tokio::test)]
 async fn a_checkpoint_with_an_empty_manifest_is_refused_and_the_target_is_untouched() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (source, _dir, _state) = source_with_data(false).await;
 	let out = TempDir::new("ckpt_conc_manifest").unwrap();
 	let cp = out.path().join("cp");
@@ -2105,6 +2159,9 @@ async fn a_checkpoint_with_an_empty_manifest_is_refused_and_the_target_is_untouc
 /// checkpoint nor the newer one: it is refused, or every value is there.
 #[test(tokio::test)]
 async fn an_interrupted_checkpoint_over_an_older_one_is_refused_or_restores_a_whole_state() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("ckpt_conc_reuse_crash").unwrap();
 	let out = TempDir::new("ckpt_conc_reuse_crash_out").unwrap();
 	let tree = open(dir.path(), true);
@@ -2171,6 +2228,9 @@ async fn an_interrupted_checkpoint_over_an_older_one_is_refused_or_restores_a_wh
 /// state it had.
 #[test(tokio::test)]
 async fn a_checkpoint_stays_whole_after_the_live_tree_deletes_the_tables_it_links() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let dir = TempDir::new("ckpt_conc_links").unwrap();
 		let out = TempDir::new("ckpt_conc_links_out").unwrap();
@@ -2243,6 +2303,9 @@ async fn a_checkpoint_stays_whole_after_the_live_tree_deletes_the_tables_it_link
 #[cfg(target_os = "linux")]
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_name_another_checkpoint_linked_meanwhile_is_not_copied_over_the_live_table() {
+	if tfs::skip_listed() {
+		return;
+	}
 	const TABLES: usize = 120;
 	const ROUNDS: usize = 12;
 	let dir = TempDir::new("ckpt_conc_race").unwrap();
@@ -2336,6 +2399,9 @@ async fn a_name_another_checkpoint_linked_meanwhile_is_not_copied_over_the_live_
 /// by a byte.
 #[test(tokio::test)]
 async fn restoring_a_checkpoint_again_after_the_first_target_compacted_yields_the_original() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let out = TempDir::new("ckpt_conc_twice").unwrap();
 		let (source, source_dir, state) = source_with_data(vlog).await;
@@ -2426,6 +2492,9 @@ async fn restoring_a_checkpoint_again_after_the_first_target_compacted_yields_th
 /// tree has since deleted or replaced comes back.
 #[test(tokio::test)]
 async fn a_checkpoint_over_an_older_one_in_the_same_directory_is_exactly_the_newer_state() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let dir = TempDir::new("ckpt_conc_reuse").unwrap();
 		let out = TempDir::new("ckpt_conc_reuse_out").unwrap();
@@ -2488,6 +2557,9 @@ async fn a_checkpoint_over_an_older_one_in_the_same_directory_is_exactly_the_new
 /// own state: the table 2 left by the other history is replaced, not kept.
 #[test(tokio::test)]
 async fn a_checkpoint_into_a_directory_that_holds_another_history_with_the_same_table_ids() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let dir = TempDir::new("ckpt_conc_ids").unwrap();
 		let out = TempDir::new("ckpt_conc_ids_out").unwrap();
@@ -2543,6 +2615,9 @@ async fn a_checkpoint_into_a_directory_that_holds_another_history_with_the_same_
 /// with the metadata file that says they are all there.
 #[test(tokio::test)]
 async fn a_checkpoint_syncs_the_directories_that_hold_its_files() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let (source, _dir, _state) = source_with_data(vlog).await;
 		let out = TempDir::new("ckpt_conc_sync").unwrap();

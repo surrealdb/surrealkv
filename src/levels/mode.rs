@@ -30,8 +30,6 @@
 //! when the manifest is first made, before the log, the value log or any table: no file exists
 //! under an identity until the manifest that carries it is on disk.
 
-use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Once};
 
@@ -48,6 +46,7 @@ use crate::tde::{
 	KeyManager,
 	MANIFEST_PREFIX_LEN,
 };
+use crate::vfs::Fs;
 use crate::Options;
 
 /// Settles, before anything is created or moved, whether the database at `opts.path` is
@@ -61,13 +60,20 @@ use crate::Options;
 ///
 /// Reads only. Every refusal leaves the directory as it was.
 pub(crate) fn resolve_encryption(opts: Arc<Options>) -> Result<Arc<Options>> {
+	let fs = Arc::clone(&opts.fs);
+	resolve_encryption_in(&*fs, opts)
+}
+
+/// [`resolve_encryption`] over `fs`, where the manifest is read from: for every database, since
+/// whether there is a manifest is the first thing it settles.
+pub(crate) fn resolve_encryption_in(fs: &dyn Fs, opts: Arc<Options>) -> Result<Arc<Options>> {
 	let key_manager = opts
 		.encryption_context()
 		.map(|context| Arc::clone(context.key_manager()))
 		.or_else(|| opts.key_manager.clone());
 	let manifest_path = opts.manifest_file_path(0);
 
-	let Some(head) = read_prefix(&manifest_path)? else {
+	let Some(head) = read_prefix(fs, &manifest_path)? else {
 		let Some(key_manager) = key_manager else {
 			return Ok(opts);
 		};
@@ -116,7 +122,7 @@ pub(crate) fn resolve_encryption(opts: Arc<Options>) -> Result<Arc<Options>> {
 	}
 	// The check of the key: the manifest opens, which is the tag of its header and the tag of its
 	// body, or the database is refused and nothing was sealed under the key.
-	open_manifest(&context, &std::fs::read(&manifest_path)?)?;
+	open_manifest(&context, &fs.read(&manifest_path)?)?;
 	warn_if_slow(suite);
 	Ok(with_context(opts, context))
 }
@@ -134,7 +140,16 @@ pub(crate) fn check_manifest_mode(
 	live: Option<&EncryptionContext>,
 	manifest_path: &Path,
 ) -> Result<()> {
-	let head = read_prefix(manifest_path)?.unwrap_or_default();
+	check_manifest_mode_in(&*crate::vfs::default_fs(), live, manifest_path)
+}
+
+/// [`check_manifest_mode`] over `fs`.
+pub(crate) fn check_manifest_mode_in(
+	fs: &dyn Fs,
+	live: Option<&EncryptionContext>,
+	manifest_path: &Path,
+) -> Result<()> {
+	let head = read_prefix(fs, manifest_path)?.unwrap_or_default();
 	check_head_mode(live, &head)
 }
 
@@ -179,15 +194,8 @@ fn with_context(opts: Arc<Options>, context: Arc<EncryptionContext>) -> Arc<Opti
 
 /// The first bytes of the manifest at `path`, as many as describe it without a key, or `None` if
 /// there is no manifest.
-fn read_prefix(path: &Path) -> Result<Option<Vec<u8>>> {
-	let file = match File::open(path) {
-		Ok(file) => file,
-		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-		Err(e) => return Err(e.into()),
-	};
-	let mut head = Vec::with_capacity(MANIFEST_PREFIX_LEN);
-	file.take(MANIFEST_PREFIX_LEN as u64).read_to_end(&mut head)?;
-	Ok(Some(head))
+fn read_prefix(fs: &dyn Fs, path: &Path) -> Result<Option<Vec<u8>>> {
+	Ok(fs.read_prefix(path, MANIFEST_PREFIX_LEN)?)
 }
 
 /// Whether AES-256-GCM is slow and not constant-time on a machine that has no instructions for

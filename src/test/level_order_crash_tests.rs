@@ -69,7 +69,7 @@ use std::time::Duration;
 use tempdir::TempDir;
 use test_log::test;
 
-use super::collect_transaction_all;
+use super::{collect_transaction_all, sfs, tfs};
 use crate::compaction::compactor::{CompactionStage, CompactionStageHook};
 use crate::compaction::leveled::Strategy;
 use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
@@ -156,8 +156,8 @@ fn finish(tree: Tree) {
 }
 
 fn copy_dir(src: &Path, dst: &Path) {
-	std::fs::create_dir_all(dst).unwrap();
-	for entry in std::fs::read_dir(src).unwrap() {
+	sfs::create_dir_all(dst).unwrap();
+	for entry in sfs::read_dir(src).unwrap() {
 		let entry = entry.unwrap();
 		if entry.file_name() == "LOCK" {
 			continue;
@@ -166,7 +166,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 		if entry.file_type().unwrap().is_dir() {
 			copy_dir(&entry.path(), &to);
 		} else {
-			std::fs::copy(entry.path(), &to).unwrap();
+			sfs::copy(entry.path(), &to).unwrap();
 		}
 	}
 }
@@ -207,7 +207,7 @@ fn copy_image(
 ) -> Image {
 	let path = root.join(format!("image{n}"));
 	copy_dir(src, &path);
-	if let Ok(entries) = std::fs::read_dir(src.join("sstables")) {
+	if let Ok(entries) = sfs::read_dir(src.join("sstables")) {
 		for entry in entries {
 			let original = entry.unwrap().path();
 			if original.extension().is_some_and(|e| e == "sst") {
@@ -217,7 +217,7 @@ fn copy_image(
 					// image and copied again must not lose it twice.
 					sync_tracker::record(&copy);
 				} else {
-					std::fs::OpenOptions::new().write(true).open(copy).unwrap().set_len(0).unwrap();
+					sfs::OpenOptions::new().write(true).open(copy).unwrap().set_len(0).unwrap();
 				}
 			}
 		}
@@ -635,7 +635,7 @@ struct DiskManifest {
 }
 
 fn read_manifest(dir: &Path) -> DiskManifest {
-	let data = std::fs::read(dir.join("manifest").join(format!("{:020}.manifest", 0))).unwrap();
+	let data = sfs::read(dir.join("manifest").join(format!("{:020}.manifest", 0))).unwrap();
 	let mut cursor = std::io::Cursor::new(&data[..]);
 	let mut u16_buf = [0u8; 2];
 	let mut u64_buf = [0u8; 8];
@@ -655,7 +655,7 @@ fn read_manifest(dir: &Path) -> DiskManifest {
 
 fn sst_ids_on_disk(dir: &Path) -> BTreeSet<u64> {
 	let mut ids = BTreeSet::new();
-	for entry in std::fs::read_dir(dir.join("sstables")).unwrap() {
+	for entry in sfs::read_dir(dir.join("sstables")).unwrap() {
 		let name = entry.unwrap().file_name().to_string_lossy().to_string();
 		if let Some(stem) = name.strip_suffix(".sst") {
 			ids.insert(stem.parse::<u64>().unwrap_or_else(|_| panic!("odd table file {name}")));
@@ -890,6 +890,9 @@ const K: [&str; 10] = ["k00", "k01", "k02", "k03", "k04", "k05", "k06", "k07", "
 /// compactions, and every stage of an L0 to L1 and of an L1 to L2 compaction is imaged.
 #[test(tokio::test)]
 async fn a_value_rewritten_in_every_layer_reads_back_as_the_newest_by_sequence_at_every_step() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut db = Db::open(Shape::WIDE).await;
 
 	// L2: generation A of every key.
@@ -993,6 +996,9 @@ async fn a_value_rewritten_in_every_layer_reads_back_as_the_newest_by_sequence_a
 #[test(tokio::test)]
 async fn a_tombstone_in_l0_over_a_value_in_l2_survives_an_l0_to_l1_compaction_and_every_crash_image(
 ) {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut db = Db::open(Shape::WIDE).await;
 	db.put_all(&["a", "b", "c", "d"], "old").await;
 	db.flush();
@@ -1056,6 +1062,9 @@ async fn a_tombstone_in_l0_over_a_value_in_l2_survives_an_l0_to_l1_compaction_an
 /// rewrite does not hide the rewrite.
 #[test(tokio::test)]
 async fn range_deletes_spanning_levels_hide_exactly_the_older_versions_in_every_crash_image() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut db = Db::open(Shape::WIDE).await;
 	let keys: Vec<String> = (0..12).map(|i| format!("r{i:02}")).collect();
 	let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
@@ -1121,6 +1130,9 @@ async fn range_deletes_spanning_levels_hide_exactly_the_older_versions_in_every_
 /// image of each of them.
 #[test(tokio::test)]
 async fn a_range_delete_hides_its_start_and_not_its_end_in_whichever_layer_holds_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for place in ["the active memtable", "an immutable memtable", "L0", "L1"] {
 		let mut db = Db::open(Shape::WIDE).await;
 		db.put_all(&["d0", "e0", "f0", "g0", "h0"], "old").await;
@@ -1160,6 +1172,9 @@ async fn a_range_delete_hides_its_start_and_not_its_end_in_whichever_layer_holds
 /// it into L3 may drop it together with the value it hides.
 #[test(tokio::test)]
 async fn a_tombstone_is_kept_above_a_value_in_the_bottom_level_until_it_reaches_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut db = Db::open(Shape::WIDE).await;
 	db.put_all(&["t0", "t1", "t2"], "bottom").await;
 	db.flush();
@@ -1205,6 +1220,9 @@ async fn a_tombstone_is_kept_above_a_value_in_the_bottom_level_until_it_reaches_
 /// the compaction, and the range delete takes effect when its sequence number is published.
 #[test(tokio::test)]
 async fn a_compaction_keeps_the_versions_that_a_range_delete_not_published_yet_covers() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut db = Db::open(Shape::WIDE).await;
 	db.put_all(&["u0", "u1", "u2", "u3"], "old").await;
 	db.flush();
@@ -1247,6 +1265,9 @@ async fn a_compaction_keeps_the_versions_that_a_range_delete_not_published_yet_c
 /// older L0 table, in the live tree and in every image.
 #[test(tokio::test)]
 async fn a_table_flushed_during_a_compaction_has_a_lower_id_than_its_output_and_still_wins() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut db = Db::open(Shape::WIDE).await;
 	let keys = ["m0", "m1", "m2", "m3", "m4", "m5"];
 	db.put_all(&keys, "gen1").await;
@@ -1321,6 +1342,9 @@ async fn a_table_flushed_during_a_compaction_has_a_lower_id_than_its_output_and_
 #[test(tokio::test)]
 async fn in_a_one_level_tree_a_table_flushed_during_an_l0_compaction_stays_in_front_of_its_output()
 {
+	if tfs::skip_listed() {
+		return;
+	}
 	const ONE_LEVEL: Shape = Shape {
 		target_file_size: 64 << 20,
 		level_count: 1,
@@ -1388,6 +1412,9 @@ async fn in_a_one_level_tree_a_table_flushed_during_an_l0_compaction_stays_in_fr
 /// tables in every level and every key reads back.
 #[test(tokio::test)]
 async fn every_compaction_stage_image_of_a_multi_table_workload_keeps_levels_sorted_and_disjoint() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut db = Db::open(Shape::SPLIT).await;
 	let key = |i: usize| format!("w{i:03}");
 	let mut rng = Rng(0x5eed_cafe_f00d_0001);
@@ -1472,6 +1499,9 @@ fn table_bounds(tree: &Tree, level: usize) -> Vec<(String, String)> {
 /// of another one, and every stage of each is imaged.
 #[test(tokio::test)]
 async fn a_compaction_takes_the_next_level_tables_that_share_a_boundary_key_with_its_input() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut db = Db::open(Shape::SPLIT).await;
 	let keys: Vec<String> = (0..12).map(|i| format!("g{i:02}")).collect();
 	for key in &keys {
@@ -1526,6 +1556,9 @@ async fn a_compaction_takes_the_next_level_tables_that_share_a_boundary_key_with
 /// L1 or deeper holds every version of its keys, or the tables of the level overlap.
 #[test(tokio::test)]
 async fn all_the_versions_of_a_key_that_snapshots_retain_stay_in_one_output_table() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut db = Db::open(Shape::SPLIT).await;
 	db.put_padded("v0", "first", 300).await;
 	let mut readers = Vec::new();
@@ -1567,6 +1600,9 @@ async fn all_the_versions_of_a_key_that_snapshots_retain_stay_in_one_output_tabl
 #[test(tokio::test)]
 async fn the_remaining_l0_tables_keep_their_order_after_a_compaction_of_the_oldest_ones_and_a_restart(
 ) {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut db = Db::open(Shape::WIDE).await;
 	let keys = ["p0", "p1", "p2", "p3", "p4"];
 	db.put_all(&keys, "t1").await;
@@ -1634,6 +1670,9 @@ async fn the_remaining_l0_tables_keep_their_order_after_a_compaction_of_the_olde
 /// there, and the keys rewritten in each segment read back as the newest.
 #[test(tokio::test)]
 async fn recovery_flushes_of_several_wal_segments_enter_l0_newest_first() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut db = Db::open(Shape::WIDE).await;
 	db.put_all(&["s0", "s1", "s2", "s3"], "base").await;
 	db.flush();
@@ -1685,6 +1724,9 @@ async fn recovery_flushes_of_several_wal_segments_enter_l0_newest_first() {
 /// it are logged and flushed, and outrank every table of L0 and of L1.
 #[test(tokio::test)]
 async fn a_flush_after_a_reopen_outranks_the_tables_that_were_there() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut db = Db::open(Shape::WIDE).await;
 	for round in 0..4 {
 		db.put_all(&["f0", "f1", "f2"], &format!("r{round}")).await;
@@ -1717,6 +1759,9 @@ async fn a_flush_after_a_reopen_outranks_the_tables_that_were_there() {
 /// compactions, on the disk image and on the reopened tree.
 #[test(tokio::test)]
 async fn the_manifest_on_disk_lists_l0_in_sequence_order_after_every_step_and_a_load_keeps_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut db = Db::open(Shape::SPLIT).await;
 	let check = |db: &Db, step: &str| {
 		db.flush_wal_buffers();
@@ -1788,6 +1833,9 @@ async fn the_manifest_on_disk_lists_l0_in_sequence_order_after_every_step_and_a_
 /// and so that it is flushed to an L0 table at the front.
 #[test(tokio::test)]
 async fn last_sequence_is_restored_so_a_write_after_a_reopen_outranks_every_table() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut db = Db::open(Shape::WIDE).await;
 	for round in 0..3 {
 		db.put_all(&["q0", "q1", "q2"], &format!("r{round}")).await;
@@ -1834,6 +1882,9 @@ async fn last_sequence_is_restored_so_a_write_after_a_reopen_outranks_every_tabl
 /// versions of the keys it covers, in the tables below it and after a crash.
 #[test(tokio::test)]
 async fn a_memtable_holding_only_a_range_delete_flushes_to_an_l0_table_that_hides_older_keys() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut db = Db::open(Shape::WIDE).await;
 	db.put_all(&["a1", "a2", "b1", "b2"], "old").await;
 	db.flush();
@@ -1865,6 +1916,9 @@ async fn a_memtable_holding_only_a_range_delete_flushes_to_an_l0_table_that_hide
 /// behind it would eventually stall).
 #[test(tokio::test)]
 async fn a_memtable_holding_a_range_delete_with_a_one_byte_end_key_flushes() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut db = Db::open(Shape::WIDE).await;
 	db.put_all(&["a1", "a2", "b1", "b2"], "old").await;
 	db.flush();
@@ -1949,6 +2003,9 @@ async fn a_range_delete_with_an_end_key_above_the_vlog_threshold_keeps_its_end_k
 /// reopen. A table with no point at all is the subject of the next test.
 #[test(tokio::test)]
 async fn a_range_delete_flushed_on_its_own_does_not_hide_the_l1_tables_around_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut db = Db::open(Shape::WIDE).await;
 	// L2: the older versions of every key.
 	db.put_all(&["a1", "a2", "m1", "m2", "z1", "z2"], "old").await;
@@ -2023,6 +2080,9 @@ fn tables_without_points(tree: &Tree) -> usize {
 /// below.)
 #[test(tokio::test)]
 async fn a_bottom_level_table_emptied_by_a_range_delete_leaves_the_tables_around_it_readable() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (mut db, keys, bounds) = db_with_a_split_bottom_level().await;
 
 	// A range delete over the keys of the second table of L3, and no others.
@@ -2117,6 +2177,9 @@ async fn a_scan_works_in_a_tree_with_a_bottom_level_table_emptied_by_a_range_del
 /// step, in the live tree and after a reopen.
 #[test(tokio::test)]
 async fn a_compaction_into_a_bottom_level_that_holds_a_table_without_points_merges_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (mut db, _keys, bounds) = db_with_a_split_bottom_level().await;
 	let (first, end) = (bounds[1].0.clone(), bounds[2].0.clone());
 	db.del_range(&first, &end).await;
@@ -2245,6 +2308,9 @@ async fn db_with_a_table_without_points_in_l2() -> Db {
 /// compaction of it into the level below it both have to work.
 #[test(tokio::test)]
 async fn a_table_without_points_above_the_bottom_level_is_read_and_compacted_on() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let db = db_with_a_table_without_points_in_l2().await;
 	check_invariants(&db.tree, "a table without points in L2");
 	db.assert_reads("a table without points in L2").await;
@@ -2289,6 +2355,9 @@ impl CompactionStrategy for SameLevel {
 /// tables, and be merged away by the next compaction.
 #[test(tokio::test)]
 async fn a_table_without_points_in_l0_of_a_one_level_tree_is_read_and_compacted_on() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let shape = Shape {
 		target_file_size: 700,
 		level_count: 1,
@@ -2449,7 +2518,7 @@ async fn check_sweep_image(
 		assert_reads_in(&txn, &image.model, &image.universe, &ctx).await;
 	}
 	finish(tree);
-	let _ = std::fs::remove_dir_all(&image.path);
+	let _ = sfs::remove_dir_all(&image.path);
 }
 
 /// A random workload against a model: puts, overwrites, deletes, range deletes, batches,
@@ -2617,6 +2686,9 @@ macro_rules! sweep_seeds {
 		$(
 			#[test(tokio::test)]
 			async fn $name() {
+				if tfs::skip_listed() {
+					return;
+				}
 				let seed: u64 = $seed;
 				let stats = sweep(seed, $kind).await;
 				eprintln!("seed {seed:#x}: {stats:?}");

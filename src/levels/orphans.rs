@@ -12,12 +12,11 @@
 //! with the error that says what it is, deleting nothing.
 
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::error::{EncryptionError, Error, Result};
 use crate::tde::{CryptoHeader, EncryptionContext, DB_ID_LEN, HEADER_LEN, HEADER_MAGIC};
+use crate::vfs::Fs;
 use crate::Options;
 
 /// The offset of the database id in the encryption header of a file.
@@ -31,14 +30,22 @@ const DB_ID_OFFSET: usize = 16;
 /// file is named for deletion: see `check_unlisted_table`. A database that is not encrypted is
 /// answered by the names alone, as it always was.
 pub(crate) fn plan_cleanup(opts: &Options, live: &HashSet<u64>) -> Result<Vec<(u64, PathBuf)>> {
+	plan_cleanup_in(&*opts.fs, opts, live)
+}
+
+/// [`plan_cleanup`] over `fs`: the directory is listed, and the files are read, there.
+pub(crate) fn plan_cleanup_in(
+	fs: &dyn Fs,
+	opts: &Options,
+	live: &HashSet<u64>,
+) -> Result<Vec<(u64, PathBuf)>> {
 	let dir = opts.sstable_dir();
-	if !dir.exists() {
+	if !fs.exists(&dir) {
 		return Ok(Vec::new());
 	}
 	let mut orphans = Vec::new();
-	for entry in std::fs::read_dir(&dir)? {
-		let entry = entry?;
-		let name = entry.file_name().to_string_lossy().into_owned();
+	for entry in fs.read_dir(&dir)? {
+		let name = entry.name.to_string_lossy().into_owned();
 		// The name of a table file: {id:020}.sst
 		if !(name.ends_with(".sst") && name.len() == 24) {
 			continue;
@@ -49,9 +56,9 @@ pub(crate) fn plan_cleanup(opts: &Options, live: &HashSet<u64>) -> Result<Vec<(u
 		if live.contains(&id) {
 			continue;
 		}
-		let path = entry.path();
+		let path = dir.join(&entry.name);
 		if let Some(context) = opts.encryption_context() {
-			check_unlisted_table(context, &path)?;
+			check_unlisted_table_in(fs, context, &path)?;
 		}
 		orphans.push((id, path));
 	}
@@ -71,16 +78,17 @@ pub(crate) fn plan_cleanup(opts: &Options, live: &HashSet<u64>) -> Result<Vec<(u
 /// cannot be read (`MalformedHeader`, `UnsupportedVersion`, `UnsupportedSuite`), and a file that
 /// does not start as a sealed table at all, which is in the clear in a database that is not
 /// (`PlaintextInEncryptedDb`). The files that are refused are left as they are.
+#[cfg(test)]
 fn check_unlisted_table(context: &EncryptionContext, path: &Path) -> Result<()> {
-	let mut head = Vec::with_capacity(HEADER_LEN);
-	match File::open(path) {
-		Ok(file) => {
-			file.take(HEADER_LEN as u64).read_to_end(&mut head)?;
-		}
-		// Gone since the directory was listed, which is a clean-up that is already done.
-		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-		Err(e) => return Err(e.into()),
-	}
+	check_unlisted_table_in(&*crate::vfs::default_fs(), context, path)
+}
+
+/// [`check_unlisted_table`] over `fs`.
+fn check_unlisted_table_in(fs: &dyn Fs, context: &EncryptionContext, path: &Path) -> Result<()> {
+	// Gone since the directory was listed, which is a clean-up that is already done.
+	let Some(head) = fs.read_prefix(path, HEADER_LEN)? else {
+		return Ok(());
+	};
 
 	if head.iter().all(|&byte| byte == 0) {
 		return Ok(());
@@ -212,6 +220,9 @@ mod tests {
 
 	#[test]
 	fn the_plan_names_what_this_database_left_and_refuses_everything_if_one_file_is_not_its_own() {
+		if crate::test::tfs::skip_listed() {
+			return;
+		}
 		let dir = TempDir::new().unwrap();
 		let opts = Options {
 			path: dir.path().to_path_buf(),

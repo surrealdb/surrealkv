@@ -38,7 +38,7 @@ use tempdir::TempDir;
 use test_log::test;
 
 use super::wal_group_budget_tests::{copy_dir, mark_closed, release_lock};
-use super::{collect_transaction_all, collect_transaction_reverse};
+use super::{collect_transaction_all, collect_transaction_reverse, tfs};
 use crate::checkpoint::{CheckpointMetadata, CheckpointStage};
 use crate::compaction::compactor::CompactionStage;
 use crate::compaction::leveled::Strategy;
@@ -618,11 +618,17 @@ async fn exact(vlog: bool) {
 
 #[test(tokio::test)]
 async fn exact_a_restore_returns_the_checkpoint_content() {
+	if tfs::skip_listed() {
+		return;
+	}
 	exact(false).await;
 }
 
 #[test(tokio::test)]
 async fn exact_a_restore_returns_the_checkpoint_content_with_a_value_log() {
+	if tfs::skip_listed() {
+		return;
+	}
 	exact(true).await;
 }
 
@@ -680,11 +686,17 @@ async fn after_the_restore(vlog: bool) {
 
 #[test(tokio::test)]
 async fn commits_after_a_restore_continue_from_the_restored_sequence_and_the_oracle_is_reset() {
+	if tfs::skip_listed() {
+		return;
+	}
 	after_the_restore(false).await;
 }
 
 #[test(tokio::test)]
 async fn commits_after_a_restore_continue_from_the_restored_sequence_with_a_value_log() {
+	if tfs::skip_listed() {
+		return;
+	}
 	after_the_restore(true).await;
 }
 
@@ -693,6 +705,9 @@ async fn commits_after_a_restore_continue_from_the_restored_sequence_with_a_valu
 /// for the new one.
 #[test(tokio::test)]
 async fn a_table_id_reused_after_a_restore_does_not_serve_the_blocks_cached_for_the_old_table() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut w = build(false).await;
 	// Reads that fill the block cache with the blocks of the tables written after the checkpoint,
 	// whose ids the restore hands out again.
@@ -751,11 +766,17 @@ async fn large_values_after_a_restore(crash: bool) {
 
 #[test(tokio::test)]
 async fn large_values_committed_after_a_restore_are_readable_and_survive_a_reopen() {
+	if tfs::skip_listed() {
+		return;
+	}
 	large_values_after_a_restore(false).await;
 }
 
 #[test(tokio::test)]
 async fn large_values_committed_after_a_restore_survive_a_crash() {
+	if tfs::skip_listed() {
+		return;
+	}
 	large_values_after_a_restore(true).await;
 }
 
@@ -964,17 +985,26 @@ async fn writers_during_a_restore(vlog: bool, failed_may_land: bool) {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn writers_racing_a_restore_leave_the_checkpoint_plus_the_commits_after_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	writers_during_a_restore(false, true).await;
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn writers_racing_a_restore_never_land_a_commit_that_returned_an_error() {
+	if tfs::skip_listed() {
+		return;
+	}
 	writers_during_a_restore(false, false).await;
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn writers_racing_a_restore_leave_the_checkpoint_plus_the_commits_after_it_with_a_value_log()
 {
+	if tfs::skip_listed() {
+		return;
+	}
 	writers_during_a_restore(true, true).await;
 }
 
@@ -982,6 +1012,9 @@ async fn writers_racing_a_restore_leave_the_checkpoint_plus_the_commits_after_it
 /// trace after the restore, at every stage of the restore.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_commit_issued_during_a_restore_fails_cleanly_and_leaves_no_trace() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for stage in RESTORE_STAGES {
 		let mut w = build(false).await;
 		let gate = park_checkpoint_at(&w.tree, stage);
@@ -1134,6 +1167,9 @@ async fn commits_in_the_pipeline_across_a_restore(park: Park, landing: bool) {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn commits_in_the_pipeline_when_a_restore_runs_fail_and_leave_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	commits_in_the_pipeline_across_a_restore(Park::AfterWalSync, true).await;
 }
 
@@ -1143,16 +1179,25 @@ async fn commits_in_the_pipeline_when_a_restore_runs_fail_and_leave_nothing() {
 /// it is refused there, and neither is acknowledged nor replayed when the database is opened.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_commit_that_logs_after_a_restore_replaced_the_wal_is_refused_and_never_replayed() {
+	if tfs::skip_listed() {
+		return;
+	}
 	commits_in_the_pipeline_across_a_restore(Park::AfterWalHeal, true).await;
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_commit_applied_across_a_restore_is_not_acknowledged() {
+	if tfs::skip_listed() {
+		return;
+	}
 	commits_in_the_pipeline_across_a_restore(Park::BeforeApplyRound, false).await;
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_commit_applied_across_a_restore_leaves_nothing_in_the_restored_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	commits_in_the_pipeline_across_a_restore(Park::BeforeApplyRound, true).await;
 }
 
@@ -1162,6 +1207,9 @@ async fn a_commit_applied_across_a_restore_leaves_nothing_in_the_restored_databa
 #[test(tokio::test)]
 async fn a_restore_leaves_nothing_of_the_old_memtable_behind_once_commits_pass_its_sequence_numbers(
 ) {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut w = build(false).await;
 	let ahead = w.tree.core.seq_num() - w.ckpt_seq;
 	assert!(ahead > 20, "setup: the tree is {ahead} sequence numbers ahead of the checkpoint");
@@ -1186,6 +1234,9 @@ async fn a_restore_leaves_nothing_of_the_old_memtable_behind_once_commits_pass_i
 /// that transaction is open.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_restore_drops_the_commit_history_that_an_old_transaction_pinned() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let w = build(false).await;
 	let pipeline = Arc::clone(&w.tree.core.commit_pipeline);
 	let held = w.tree.begin().unwrap();
@@ -1282,11 +1333,17 @@ async fn readers_old_transaction(vlog: bool) {
 
 #[test(tokio::test)]
 async fn readers_begun_before_a_restore_never_see_a_value_of_neither_state() {
+	if tfs::skip_listed() {
+		return;
+	}
 	readers_old_transaction(false).await;
 }
 
 #[test(tokio::test)]
 async fn readers_begun_before_a_restore_never_see_a_value_of_neither_state_with_a_value_log() {
+	if tfs::skip_listed() {
+		return;
+	}
 	readers_old_transaction(true).await;
 }
 
@@ -1296,6 +1353,9 @@ async fn readers_begun_before_a_restore_never_see_a_value_of_neither_state_with_
 /// next to values it does.
 #[test(tokio::test)]
 async fn readers_begun_between_the_manifest_swap_and_the_memtable_swap_see_one_state() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let w = build(false).await;
 	let seen: Arc<Mutex<Option<Result<Model, String>>>> = Arc::new(Mutex::new(None));
 	let tree = Arc::clone(&w.tree);
@@ -1327,6 +1387,9 @@ async fn readers_begun_between_the_manifest_swap_and_the_memtable_swap_see_one_s
 /// never a panic, keys stay strictly increasing, every row is in one of the two states.
 #[test(tokio::test)]
 async fn readers_an_iterator_open_across_a_restore_keeps_ordered_rows_of_the_two_states() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let w = build(false).await;
 	let t = w.tree.begin_with_mode(Mode::ReadOnly).unwrap();
 	let mut it = t.iter().unwrap();
@@ -1427,26 +1490,41 @@ async fn restore_during_a_compaction(stage: CompactionStage, flushes: usize) {
 
 #[test(tokio::test)]
 async fn a_compaction_that_resumes_after_a_restore_from_its_outputs_stage_leaves_the_checkpoint() {
+	if tfs::skip_listed() {
+		return;
+	}
 	restore_during_a_compaction(CompactionStage::OutputsDurable, 0).await;
 }
 
 #[test(tokio::test)]
 async fn a_compaction_whose_output_id_a_flush_reuses_after_a_restore_leaves_the_checkpoint() {
+	if tfs::skip_listed() {
+		return;
+	}
 	restore_during_a_compaction(CompactionStage::OutputsDurable, 2).await;
 }
 
 #[test(tokio::test)]
 async fn a_compaction_that_resumes_after_a_restore_from_its_manifest_stage_leaves_the_checkpoint() {
+	if tfs::skip_listed() {
+		return;
+	}
 	restore_during_a_compaction(CompactionStage::ManifestWritten, 0).await;
 }
 
 #[test(tokio::test)]
 async fn a_compaction_that_resumes_after_a_restore_from_its_inputs_stage_leaves_the_checkpoint() {
+	if tfs::skip_listed() {
+		return;
+	}
 	restore_during_a_compaction(CompactionStage::InputsRemoved, 0).await;
 }
 
 #[test(tokio::test)]
 async fn a_compaction_that_resumes_after_a_restore_from_its_last_stage_leaves_the_checkpoint() {
+	if tfs::skip_listed() {
+		return;
+	}
 	restore_during_a_compaction(CompactionStage::VlogCleaned, 0).await;
 }
 
@@ -1454,6 +1532,9 @@ async fn a_compaction_that_resumes_after_a_restore_from_its_last_stage_leaves_th
 /// restore replaced the files, must not remove a file the restored tables point into.
 #[test(tokio::test)]
 async fn a_compaction_that_resumes_after_a_restore_with_a_value_log_keeps_the_values() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut w = build(true).await;
 	let gate = park_compaction_at(&w.tree, CompactionStage::InputsRemoved);
 	let compaction = compact_call(&w.tree, &w.opts);
@@ -1479,6 +1560,9 @@ async fn a_compaction_that_resumes_after_a_restore_with_a_value_log_keeps_the_va
 /// restore excludes.
 #[test(tokio::test)]
 async fn a_restore_waits_for_a_compaction_that_is_running_at_every_stage() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for stage in [
 		CompactionStage::OutputsDurable,
 		CompactionStage::ManifestWritten,
@@ -1512,6 +1596,9 @@ async fn a_restore_waits_for_a_compaction_that_is_running_at_every_stage() {
 /// and then compacts the restored tables.
 #[test(tokio::test)]
 async fn a_compaction_that_begins_during_a_restore_waits_and_compacts_the_restored_tables() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for stage in [CheckpointStage::RestoreCleared, CheckpointStage::RestoreManifestSwapped] {
 		let mut w = build(false).await;
 		let gate = park_checkpoint_at(&w.tree, stage);
@@ -1548,6 +1635,9 @@ async fn a_compaction_that_begins_during_a_restore_waits_and_compacts_the_restor
 /// flush of the queue that begins after the swap has nothing to flush and returns at once.
 #[test(tokio::test)]
 async fn a_flush_that_starts_during_a_restore_waits_for_it_and_adds_no_table() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for stage in [CheckpointStage::RestoreCleared, CheckpointStage::RestoreManifestSwapped] {
 		let mut w = build(false).await;
 		w.tree.core.inner.rotate_memtable().unwrap();
@@ -1601,6 +1691,9 @@ async fn a_flush_that_starts_during_a_restore_waits_for_it_and_adds_no_table() {
 /// commits work.
 #[test(tokio::test)]
 async fn a_flush_parked_before_it_lists_its_table_does_not_leak_it_into_a_restore() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut w = build(false).await;
 	let (gate, pass) = gate();
 	let hook: FlushHook = Arc::new(move |_table_id| {
@@ -1634,6 +1727,9 @@ async fn a_flush_parked_before_it_lists_its_table_does_not_leak_it_into_a_restor
 /// in it. The rotation then finds the restored tree, and the tree is the checkpoint.
 #[test(tokio::test)]
 async fn a_rotation_that_begins_during_a_restore_waits_for_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for stage in [
 		CheckpointStage::RestoreCleared,
 		CheckpointStage::RestoreFilesCopied,
@@ -1669,6 +1765,9 @@ async fn a_rotation_that_begins_during_a_restore_waits_for_it() {
 /// file in the directory that the restore removes, or in the restored one.
 #[test(tokio::test)]
 async fn a_value_log_append_that_begins_during_a_restore_waits_for_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for stage in [
 		CheckpointStage::RestoreCleared,
 		CheckpointStage::RestoreSstablesCopied,
@@ -1701,6 +1800,9 @@ async fn a_value_log_append_that_begins_during_a_restore_waits_for_it() {
 /// refused meanwhile.
 #[test(tokio::test)]
 async fn a_restore_waits_for_a_checkpoint_that_is_running() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut w = build(false).await;
 	let second = TempDir::new("restore_conc_second").unwrap();
 	let second_dir = second.path().join("ckpt");
@@ -1734,6 +1836,9 @@ async fn a_restore_waits_for_a_checkpoint_that_is_running() {
 /// A checkpoint that begins while a restore runs waits for it, and is the restored state, whole.
 #[test(tokio::test)]
 async fn a_checkpoint_that_begins_during_a_restore_waits_for_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for stage in [CheckpointStage::RestoreCleared, CheckpointStage::RestoreFilesCopied] {
 		let mut w = build(false).await;
 		let second = TempDir::new("restore_conc_second").unwrap();
@@ -1778,6 +1883,9 @@ fn file_names(dir: &Path) -> std::collections::BTreeSet<String> {
 /// affected.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_commit_group_writing_its_values_during_a_restore_waits_and_is_refused_after_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for stage in [CheckpointStage::RestoreCleared, CheckpointStage::RestoreFilesCopied] {
 		let mut w = build(true).await;
 		let restored_files = file_names(&w.ckpt.join("vlog"));
@@ -1864,6 +1972,9 @@ async fn a_commit_group_writing_its_values_during_a_restore_waits_and_is_refused
 /// still replacing the files.
 #[test(tokio::test)]
 async fn a_second_restore_that_overlaps_the_first_runs_with_the_commits_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut w = build(false).await;
 	let (first_gate, pass_first) = gate();
 	let (second_gate, pass_second) = gate();
@@ -1906,6 +2017,9 @@ async fn a_second_restore_that_overlaps_the_first_runs_with_the_commits_refused(
 /// the restore is over, and it fails then, without touching its destination.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_that_waits_for_a_restore_fails_when_close_comes_first() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let w = build(false).await;
 	let second = TempDir::new("restore_conc_second").unwrap();
 	let second_dir = second.path().join("ckpt");
@@ -1939,6 +2053,9 @@ async fn a_checkpoint_that_waits_for_a_restore_fails_when_close_comes_first() {
 /// logged, so it is counted and tolerated, and nothing else is.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn commits_checkpoints_flushes_compactions_and_restores_that_run_together_do_not_deadlock() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut w = build(true).await;
 	let stop = Arc::new(AtomicBool::new(false));
 	let mut committers = Vec::new();
@@ -2056,6 +2173,9 @@ async fn commits_checkpoints_flushes_compactions_and_restores_that_run_together_
 /// checkpoint afterwards.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_close_that_begins_during_a_restore_waits_for_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for stage in [
 		CheckpointStage::RestoreCleared,
 		CheckpointStage::RestoreFilesCopied,
@@ -2094,6 +2214,9 @@ async fn a_close_that_begins_during_a_restore_waits_for_it() {
 /// A restore that begins once `close` has fails, and the database is as it was.
 #[test(tokio::test)]
 async fn a_restore_that_begins_after_close_is_refused_and_changes_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let w = build(false).await;
 	w.tree.close().await.unwrap();
 	let before = fingerprint(&w.path);
@@ -2117,6 +2240,9 @@ fn open_checkpoint_copy(ckpt: &Path, vlog: bool) -> Result<Model, Error> {
 /// never a mix, and it opens.
 #[test(tokio::test)]
 async fn a_checkpoint_parked_before_a_restore_is_the_state_before_it_or_after_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut w = build(false).await;
 	let second = TempDir::new("restore_conc_second").unwrap();
 	let second_dir = second.path().join("ckpt");
@@ -2154,6 +2280,9 @@ async fn a_checkpoint_parked_before_a_restore_is_the_state_before_it_or_after_it
 /// nothing that looks like a checkpoint. The live tree is the checkpoint afterwards.
 #[test(tokio::test)]
 async fn a_checkpoint_begun_during_a_restore_is_never_a_mix_of_the_two_states() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for stage in [CheckpointStage::RestoreCleared, CheckpointStage::RestoreFilesCopied] {
 		let mut w = build(false).await;
 		let second = TempDir::new("restore_conc_second").unwrap();
@@ -2231,6 +2360,9 @@ fn restore_taking_images(
 /// every stage, and after it.
 #[test(tokio::test)]
 async fn the_checkpoint_directory_is_never_modified_by_a_restore() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let w = build(vlog).await;
 		let before = fingerprint(&w.ckpt);
@@ -2250,6 +2382,9 @@ async fn the_checkpoint_directory_is_never_modified_by_a_restore() {
 /// touching the checkpoint, and the checkpoint restores again afterwards.
 #[test(tokio::test)]
 async fn the_checkpoint_is_untouched_by_the_database_that_was_restored_from_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let mut w = build(vlog).await;
 		let before = fingerprint(&w.ckpt);
@@ -2307,16 +2442,25 @@ async fn image_with_every_file_in_place(vlog: bool, stage: CheckpointStage) {
 #[test(tokio::test)]
 async fn a_crash_when_the_files_are_back_but_the_memory_is_not_reloaded_reopens_as_the_checkpoint()
 {
+	if tfs::skip_listed() {
+		return;
+	}
 	image_with_every_file_in_place(false, CheckpointStage::RestoreFilesCopied).await;
 }
 
 #[test(tokio::test)]
 async fn a_crash_after_the_manifest_swap_reopens_as_the_checkpoint() {
+	if tfs::skip_listed() {
+		return;
+	}
 	image_with_every_file_in_place(false, CheckpointStage::RestoreManifestSwapped).await;
 }
 
 #[test(tokio::test)]
 async fn a_crash_when_the_files_are_back_reopens_as_the_checkpoint_with_a_value_log() {
+	if tfs::skip_listed() {
+		return;
+	}
 	image_with_every_file_in_place(true, CheckpointStage::RestoreFilesCopied).await;
 }
 
@@ -2324,6 +2468,9 @@ async fn a_crash_when_the_files_are_back_reopens_as_the_checkpoint_with_a_value_
 /// database, and the tables are still there afterwards.
 #[test(tokio::test)]
 async fn a_crash_with_the_tables_copied_and_no_manifest_is_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (w, _images, taken) = images_of_a_restore(false).await;
 	let image = &taken["RestoreSstablesCopied"];
 	let tables = |files: BTreeMap<String, u64>| -> BTreeMap<String, u64> {
@@ -2365,11 +2512,17 @@ async fn image_never_a_plausible_wrong_database(stage: CheckpointStage) {
 
 #[test(tokio::test)]
 async fn a_crash_after_the_state_is_cleared_must_not_open_as_an_empty_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	image_never_a_plausible_wrong_database(CheckpointStage::RestoreCleared).await;
 }
 
 #[test(tokio::test)]
 async fn a_crash_with_the_tables_copied_never_opens_as_a_wrong_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	image_never_a_plausible_wrong_database(CheckpointStage::RestoreSstablesCopied).await;
 }
 
@@ -2381,6 +2534,9 @@ const MARKER: &str = "RESTORE_IN_PROGRESS";
 /// back, and not before or after.
 #[test(tokio::test)]
 async fn a_restore_marks_the_directory_from_before_it_removes_anything_until_every_file_is_back() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let w = build(vlog).await;
 		assert!(!w.path.join(MARKER).exists(), "vlog {vlog}: a marker before the restore");
@@ -2409,6 +2565,9 @@ async fn a_restore_marks_the_directory_from_before_it_removes_anything_until_eve
 /// again are entries of it, and the removal of the marker must not be on disk without them.
 #[test(tokio::test)]
 async fn a_restore_syncs_the_database_directory_before_it_removes_the_marker() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let w = build(false).await;
 	let root = w.path.canonicalize().unwrap();
 	let at = Arc::new(Mutex::new(BTreeMap::new()));
@@ -2439,6 +2598,9 @@ async fn a_restore_syncs_the_database_directory_before_it_removes_the_marker() {
 /// as they were: nothing is created, moved or deleted.
 #[test(tokio::test)]
 async fn an_interrupted_restore_is_refused_at_open_and_the_directory_is_left_alone() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for stage in [CheckpointStage::RestoreCleared, CheckpointStage::RestoreSstablesCopied] {
 		let (w, _images, taken) = images_of_a_restore(false).await;
 		let image = &taken[&format!("{stage:?}")];
@@ -2468,6 +2630,9 @@ async fn an_interrupted_restore_is_refused_at_open_and_the_directory_is_left_alo
 /// removed the directory opens, and restoring the checkpoint on it gives the checkpoint.
 #[test(tokio::test)]
 async fn an_interrupted_restore_is_repeated_in_an_empty_directory_or_after_the_marker_is_removed() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (w, _images, taken) = images_of_a_restore(false).await;
 
 	// An empty directory
@@ -2508,6 +2673,9 @@ async fn an_interrupted_restore_is_repeated_in_an_empty_directory_or_after_the_m
 /// file.
 #[test(tokio::test)]
 async fn a_restore_that_fails_after_it_removed_the_files_leaves_the_marker() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let w = build(false).await;
 	std::fs::remove_dir_all(w.ckpt.join("wal")).unwrap();
 	std::fs::write(w.ckpt.join("wal"), b"not a directory").unwrap();
@@ -2524,6 +2692,9 @@ async fn a_restore_that_fails_after_it_removed_the_files_leaves_the_marker() {
 /// with the database as it was. A directory is where the marker goes.
 #[test(tokio::test)]
 async fn a_restore_that_cannot_write_its_marker_removes_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let w = build(false).await;
 	std::fs::create_dir(w.path.join(MARKER)).unwrap();
 	let files = fingerprint(&w.path);
@@ -2539,6 +2710,9 @@ async fn a_restore_that_cannot_write_its_marker_removes_nothing() {
 /// checkpoint replaces them one by one between the validation and the copy.
 #[test(tokio::test)]
 async fn a_checkpoint_into_the_directory_a_restore_reads_waits_for_the_restore() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let w = build(false).await;
 	let other_dir = TempDir::new("restore_conc_other").unwrap();
 	let other = open(options(other_dir.path(), false));
@@ -2588,6 +2762,9 @@ async fn a_checkpoint_into_the_directory_a_restore_reads_waits_for_the_restore()
 /// database as it was.
 #[test(tokio::test)]
 async fn a_restore_from_a_directory_a_checkpoint_is_writing_is_refused_and_leaves_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let w = build(false).await;
 	let other_dir = TempDir::new("restore_conc_other").unwrap();
 	let other = open(options(other_dir.path(), false));
@@ -2623,6 +2800,9 @@ async fn a_restore_from_a_directory_a_checkpoint_is_writing_is_refused_and_leave
 /// opens again.
 #[test(tokio::test)]
 async fn the_checkpoint_of_an_empty_database_restores_and_empties_the_target() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let w = build(vlog).await;
 		let empty_dir = TempDir::new("restore_conc_empty").unwrap();
@@ -2659,17 +2839,26 @@ async fn acknowledged_commits_survive_a_crash(vlog: bool) {
 
 #[test(tokio::test)]
 async fn acknowledged_commits_after_a_restore_survive_a_crash() {
+	if tfs::skip_listed() {
+		return;
+	}
 	acknowledged_commits_survive_a_crash(false).await;
 }
 
 #[test(tokio::test)]
 async fn acknowledged_commits_after_a_restore_survive_a_crash_with_a_value_log() {
+	if tfs::skip_listed() {
+		return;
+	}
 	acknowledged_commits_survive_a_crash(true).await;
 }
 
 /// A crash after the restore returned, with nothing committed since: the image is the checkpoint.
 #[test(tokio::test)]
 async fn a_crash_right_after_a_restore_recovers_the_checkpoint() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let w = build(vlog).await;
 		w.tree.restore_from_checkpoint(&w.ckpt).unwrap();
@@ -2764,6 +2953,9 @@ fn checkpoint_tables(ckpt: &Path) -> Vec<PathBuf> {
 
 #[test(tokio::test)]
 async fn a_restore_of_a_checkpoint_without_metadata_fails_and_leaves_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	bad_checkpoint("no metadata", |ckpt| {
 		std::fs::remove_file(ckpt.join("CHECKPOINT_METADATA")).unwrap();
 	})
@@ -2772,6 +2964,9 @@ async fn a_restore_of_a_checkpoint_without_metadata_fails_and_leaves_the_databas
 
 #[test(tokio::test)]
 async fn a_restore_of_a_checkpoint_with_torn_metadata_fails_and_leaves_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	bad_checkpoint("torn metadata", |ckpt| {
 		let bytes = std::fs::read(ckpt.join("CHECKPOINT_METADATA")).unwrap();
 		std::fs::write(ckpt.join("CHECKPOINT_METADATA"), &bytes[..bytes.len() / 2]).unwrap();
@@ -2781,6 +2976,9 @@ async fn a_restore_of_a_checkpoint_with_torn_metadata_fails_and_leaves_the_datab
 
 #[test(tokio::test)]
 async fn a_restore_of_a_checkpoint_with_empty_metadata_fails_and_leaves_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	bad_checkpoint("empty metadata", |ckpt| {
 		std::fs::write(ckpt.join("CHECKPOINT_METADATA"), b"").unwrap();
 	})
@@ -2789,6 +2987,9 @@ async fn a_restore_of_a_checkpoint_with_empty_metadata_fails_and_leaves_the_data
 
 #[test(tokio::test)]
 async fn a_restore_of_a_checkpoint_of_an_unsupported_version_fails_and_leaves_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	bad_checkpoint("unsupported version", |ckpt| {
 		let mut bytes = std::fs::read(ckpt.join("CHECKPOINT_METADATA")).unwrap();
 		bytes[..4].copy_from_slice(&7u32.to_be_bytes());
@@ -2799,6 +3000,9 @@ async fn a_restore_of_a_checkpoint_of_an_unsupported_version_fails_and_leaves_th
 
 #[test(tokio::test)]
 async fn a_restore_of_a_checkpoint_missing_a_listed_table_fails_and_leaves_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	bad_checkpoint("a listed table is missing", |ckpt| {
 		std::fs::remove_file(&checkpoint_tables(ckpt)[0]).unwrap();
 	})
@@ -2807,6 +3011,9 @@ async fn a_restore_of_a_checkpoint_missing_a_listed_table_fails_and_leaves_the_d
 
 #[test(tokio::test)]
 async fn a_restore_of_a_checkpoint_with_a_truncated_table_fails_and_leaves_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	bad_checkpoint("a table is truncated", |ckpt| {
 		let table = checkpoint_tables(ckpt)[0].clone();
 		// A copy, not the link: truncating the file would truncate the live table too.
@@ -2819,6 +3026,9 @@ async fn a_restore_of_a_checkpoint_with_a_truncated_table_fails_and_leaves_the_d
 
 #[test(tokio::test)]
 async fn a_restore_of_a_checkpoint_without_a_tables_directory_fails_and_leaves_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	bad_checkpoint("no sstables directory", |ckpt| {
 		std::fs::remove_dir_all(ckpt.join("sstables")).unwrap();
 	})
@@ -2827,6 +3037,9 @@ async fn a_restore_of_a_checkpoint_without_a_tables_directory_fails_and_leaves_t
 
 #[test(tokio::test)]
 async fn a_restore_of_a_checkpoint_without_a_manifest_fails_and_leaves_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	bad_checkpoint("no manifest directory", |ckpt| {
 		std::fs::remove_dir_all(ckpt.join("manifest")).unwrap();
 	})
@@ -2836,6 +3049,9 @@ async fn a_restore_of_a_checkpoint_without_a_manifest_fails_and_leaves_the_datab
 /// A table that is as long as it was and is not a table: its footer does not decode.
 #[test(tokio::test)]
 async fn a_restore_of_a_checkpoint_with_a_table_of_garbage_fails_and_leaves_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	bad_checkpoint("a table is garbage", |ckpt| {
 		let table = checkpoint_tables(ckpt)[0].clone();
 		let len = std::fs::metadata(&table).unwrap().len() as usize;
@@ -2848,6 +3064,9 @@ async fn a_restore_of_a_checkpoint_with_a_table_of_garbage_fails_and_leaves_the_
 /// A manifest that has its bytes and does not decode.
 #[test(tokio::test)]
 async fn a_restore_of_a_checkpoint_with_a_garbage_manifest_fails_and_leaves_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	bad_checkpoint("the manifest is garbage", |ckpt| {
 		let manifest = ckpt.join("manifest").join(format!("{:020}.manifest", 0));
 		let len = std::fs::metadata(&manifest).unwrap().len() as usize;
@@ -2860,6 +3079,9 @@ async fn a_restore_of_a_checkpoint_with_a_garbage_manifest_fails_and_leaves_the_
 /// would restore into a database whose reads of large values fail.
 #[test(tokio::test)]
 async fn a_restore_of_a_checkpoint_without_its_value_log_fails_and_leaves_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	bad_checkpoint_with(true, "no value log directory", |ckpt| {
 		std::fs::remove_dir_all(ckpt.join("vlog")).unwrap();
 	})
@@ -2868,6 +3090,9 @@ async fn a_restore_of_a_checkpoint_without_its_value_log_fails_and_leaves_the_da
 
 #[test(tokio::test)]
 async fn a_restore_of_a_checkpoint_whose_value_log_files_are_gone_fails_and_leaves_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	bad_checkpoint_with(true, "the value log files are gone", |ckpt| {
 		let mut files: Vec<PathBuf> = std::fs::read_dir(ckpt.join("vlog"))
 			.unwrap()
@@ -2908,11 +3133,17 @@ async fn restoring_twice(vlog: bool) {
 
 #[test(tokio::test)]
 async fn restoring_the_same_checkpoint_twice_gives_the_checkpoint_each_time() {
+	if tfs::skip_listed() {
+		return;
+	}
 	restoring_twice(false).await;
 }
 
 #[test(tokio::test)]
 async fn restoring_the_same_checkpoint_twice_gives_the_checkpoint_each_time_with_a_value_log() {
+	if tfs::skip_listed() {
+		return;
+	}
 	restoring_twice(true).await;
 }
 
@@ -2955,11 +3186,17 @@ async fn restoring_in_every_order(vlog: bool) {
 
 #[test(tokio::test)]
 async fn restoring_an_older_checkpoint_after_a_newer_one_and_back() {
+	if tfs::skip_listed() {
+		return;
+	}
 	restoring_in_every_order(false).await;
 }
 
 #[test(tokio::test)]
 async fn restoring_an_older_checkpoint_after_a_newer_one_and_back_with_a_value_log() {
+	if tfs::skip_listed() {
+		return;
+	}
 	restoring_in_every_order(true).await;
 }
 
@@ -2983,6 +3220,9 @@ async fn source_checkpoint(dir: &Path, roots: &Path, vlog: bool) -> (Model, Path
 /// cache holds anything of it.
 #[test(tokio::test)]
 async fn restoring_a_checkpoint_from_a_tree_with_another_value_log_layout() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let source_dir = TempDir::new("restore_conc_source").unwrap();
 	let roots = TempDir::new("restore_conc_source_ckpt").unwrap();
 	let (source_model, ckpt) = source_checkpoint(source_dir.path(), roots.path(), true).await;
@@ -3020,6 +3260,9 @@ async fn restoring_a_checkpoint_from_a_tree_with_another_value_log_layout() {
 /// into them, and nothing would ever collect them.
 #[test(tokio::test)]
 async fn restoring_a_checkpoint_without_a_value_log_removes_the_value_log_files_of_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let source_dir = TempDir::new("restore_conc_source").unwrap();
 	let roots = TempDir::new("restore_conc_source_ckpt").unwrap();
 	let (source_model, ckpt) = source_checkpoint(source_dir.path(), roots.path(), false).await;
@@ -3054,6 +3297,9 @@ async fn restoring_a_checkpoint_without_a_value_log_removes_the_value_log_files_
 /// never be appended to them.
 #[test(tokio::test)]
 async fn a_restore_replays_the_wal_of_a_checkpoint_and_continues_in_a_segment_of_its_own() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let w = build(false).await;
 	let roots = TempDir::new("restore_conc_carried").unwrap();
 	let carried = roots.path().join("carried");
@@ -3097,6 +3343,9 @@ async fn a_restore_replays_the_wal_of_a_checkpoint_and_continues_in_a_segment_of
 /// the restore must not leave the target reading through the blocks it cached for its own tables.
 #[test(tokio::test)]
 async fn restoring_the_checkpoint_of_another_tree_serves_its_tables_and_not_cached_blocks() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let source_dir = TempDir::new("restore_conc_source").unwrap();
 	let roots = TempDir::new("restore_conc_source_ckpt").unwrap();
 	let (source_model, ckpt) = source_checkpoint(source_dir.path(), roots.path(), false).await;
@@ -3117,6 +3366,9 @@ async fn restoring_the_checkpoint_of_another_tree_serves_its_tables_and_not_cach
 /// checkpoint exactly, and after the work it holds what the work wrote.
 #[test(tokio::test)]
 async fn restoring_between_rounds_of_work_that_collects_the_value_log() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut w = build(true).await;
 	let seed = 0x5EED_0000_0000_1357u64;
 	let mut rng = Rng(seed);
@@ -3159,6 +3411,9 @@ async fn restoring_between_rounds_of_work_that_collects_the_value_log() {
 /// restored database that has the same id, whenever the iterator reads them.
 #[test(tokio::test)]
 async fn an_iterator_that_reads_the_old_tables_after_a_restore_does_not_poison_the_reused_ids() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut w = build(false).await;
 	let old_ids = table_ids(&w.tree);
 	let t = w.tree.begin_with_mode(Mode::ReadOnly).unwrap();
@@ -3204,6 +3459,9 @@ async fn an_iterator_that_reads_the_old_tables_after_a_restore_does_not_poison_t
 /// is ahead of them.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_group_applied_before_a_restore_publishes_nothing_after_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut w = build(false).await;
 	let (gate, pass) = gate();
 	w.tree.core.commit_pipeline.set_publish_hook(Some(pass));
@@ -3245,6 +3503,9 @@ async fn a_group_applied_before_a_restore_publishes_nothing_after_it() {
 /// idle tree.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_writer_stalled_on_level_zero_files_resumes_when_a_restore_removes_them() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("restore_conc_stall").unwrap();
 	let ckpt_root = TempDir::new("restore_conc_stall_ckpt").unwrap();
 	let opts = Arc::new(Options {
@@ -3362,10 +3623,16 @@ async fn readers_and_writers_of_the_tree_state_run_together(serial: bool) {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn iterators_flushes_compactions_and_restores_that_run_together_do_not_deadlock() {
+	if tfs::skip_listed() {
+		return;
+	}
 	readers_and_writers_of_the_tree_state_run_together(true).await;
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_restore_that_runs_while_the_memtable_rotates_does_not_fail_half_way() {
+	if tfs::skip_listed() {
+		return;
+	}
 	readers_and_writers_of_the_tree_state_run_together(false).await;
 }

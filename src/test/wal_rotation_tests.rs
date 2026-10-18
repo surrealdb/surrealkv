@@ -29,15 +29,14 @@ use std::time::{Duration, Instant};
 use tempdir::TempDir;
 use test_log::test;
 
-use super::{collect_transaction_all, collect_transaction_reverse};
+use super::{collect_transaction_all, collect_transaction_reverse, sfs, tfs};
 use crate::batch::Batch;
 use crate::compaction::leveled::Strategy;
 use crate::memtable::{max_entry_bytes, MemTable};
 use crate::ring::PipelineHook;
 use crate::vlog::ValueLocation;
 use crate::wal::manager::Wal;
-use crate::wal::parallel_recovery::decode_segment_batches;
-use crate::wal::{self, segment_name};
+use crate::wal::segment_name;
 use crate::{Durability, Mode, Options, Tree};
 
 const VALUE_LEN: usize = 100;
@@ -118,7 +117,7 @@ fn n_sst(tree: &Tree) -> usize {
 
 fn wal_segments(path: &Path) -> Vec<u64> {
 	let mut ids = Vec::new();
-	if let Ok(rd) = std::fs::read_dir(path.join("wal")) {
+	if let Ok(rd) = sfs::read_dir(path.join("wal")) {
 		for e in rd.flatten() {
 			let name = e.file_name().to_string_lossy().to_string();
 			if let Some(stem) = name.strip_suffix(".wal") {
@@ -139,7 +138,7 @@ fn wal_batches(path: &Path) -> BTreeMap<u64, Vec<Batch>> {
 		.into_iter()
 		.map(|id| {
 			let file = path.join("wal").join(format!("{id:020}.wal"));
-			(id, decode_segment_batches(&file, id).unwrap().1)
+			(id, tfs::decode_segment_batches(&file, id).unwrap().1)
 		})
 		.collect()
 }
@@ -154,8 +153,8 @@ fn wal_keys(path: &Path) -> BTreeMap<u64, HashSet<Vec<u8>>> {
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) {
-	std::fs::create_dir_all(dst).unwrap();
-	for entry in std::fs::read_dir(src).unwrap() {
+	sfs::create_dir_all(dst).unwrap();
+	for entry in sfs::read_dir(src).unwrap() {
 		let entry = entry.unwrap();
 		let name = entry.file_name();
 		if name == "LOCK" {
@@ -165,7 +164,7 @@ fn copy_dir_all(src: &Path, dst: &Path) {
 		if entry.file_type().unwrap().is_dir() {
 			copy_dir_all(&entry.path(), &to);
 		} else {
-			std::fs::copy(entry.path(), &to).unwrap();
+			sfs::copy(entry.path(), &to).unwrap();
 		}
 	}
 }
@@ -1672,6 +1671,9 @@ async fn duplicate_records_from_a_repaired_group_are_harmless() {
 /// is created without a tag has tag 0 and every commit against it would fail.)
 #[test(tokio::test)]
 async fn active_memtable_tag_equals_the_wal_number_after_every_transition() {
+	if tfs::skip_listed() {
+		return;
+	}
 	within(async {
 		let dir = TempDir::new("wal_rotation").unwrap();
 		let path = dir.path().to_path_buf();
@@ -1806,29 +1808,29 @@ async fn commits_after_recovery_are_logged_once_in_the_fresh_segment() {
 #[test]
 fn wal_rotate_failure_leaves_number_and_writer_consistent() {
 	let dir = TempDir::new("wal_rotation").unwrap();
-	let mut wal = Wal::open(dir.path(), wal::Options::default()).unwrap();
+	let mut wal = Wal::open(dir.path(), tfs::wal_options_for(dir.path())).unwrap();
 	wal.append(b"before").unwrap();
 	let n = wal.get_active_log_number();
 
 	// An obstacle where the next segment file has to be created.
 	let next = dir.path().join(segment_name(n + 1, "wal"));
-	std::fs::create_dir(&next).unwrap();
+	sfs::create_dir(&next).unwrap();
 	assert!(wal.rotate().is_err(), "rotation cannot create the next segment");
 	assert_eq!(wal.get_active_log_number(), n, "a failed rotation leaves the number alone");
 
 	// The writer is still on segment n and still works.
 	wal.append(b"after").unwrap();
 	wal.sync().unwrap();
-	let current = std::fs::read(dir.path().join(segment_name(n, "wal"))).unwrap();
+	let current = sfs::read(dir.path().join(segment_name(n, "wal"))).unwrap();
 	assert!(current.windows(5).any(|w| w == b"after"), "the append landed in segment {n}");
 
 	// Once the obstacle is gone the rotation succeeds and moves exactly one on.
-	std::fs::remove_dir(&next).unwrap();
+	sfs::remove_dir(&next).unwrap();
 	assert_eq!(wal.rotate().unwrap(), n + 1);
 	assert_eq!(wal.get_active_log_number(), n + 1);
 	wal.append(b"later").unwrap();
 	wal.sync().unwrap();
-	let rotated = std::fs::read(dir.path().join(segment_name(n + 1, "wal"))).unwrap();
+	let rotated = sfs::read(dir.path().join(segment_name(n + 1, "wal"))).unwrap();
 	assert!(rotated.windows(5).any(|w| w == b"later"));
 	assert!(!rotated.windows(5).any(|w| w == b"after"));
 }
@@ -1852,7 +1854,7 @@ async fn failed_rotation_during_a_commit_fails_cleanly() {
 
 		// Block the next segment, then commit the batch that needs a rotation.
 		let obstacle = path.join("wal").join(segment_name(wal + 1, "wal"));
-		std::fs::create_dir(&obstacle).unwrap();
+		sfs::create_dir(&obstacle).unwrap();
 		let mut txn = tree.begin().unwrap();
 		txn.set_durability(Durability::Immediate);
 		txn.set(key_of(i), val_of(i)).unwrap();
@@ -1864,7 +1866,7 @@ async fn failed_rotation_during_a_commit_fails_cleanly() {
 		);
 
 		// The fault is gone: the next commit works and is durable.
-		std::fs::remove_dir(&obstacle).unwrap();
+		sfs::remove_dir(&obstacle).unwrap();
 		let (a, rotated) = write_keys(&tree, i + 1..i + 2, Durability::Immediate).await;
 		assert!(!rotated.is_empty(), "the next commit rotates once the fault is gone");
 		acked.extend(a);
@@ -1996,6 +1998,9 @@ struct Image {
 /// existing hazard that this test is not about.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn writers_racing_rotations_flushes_and_checkpoints_lose_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	within(async {
 		let dir = TempDir::new("wal_rotation").unwrap();
 		let path = dir.path().to_path_buf();

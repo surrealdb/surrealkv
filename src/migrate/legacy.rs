@@ -46,6 +46,11 @@
 //! collection of it follows the new tables. Delete the directory once the migrated database has
 //! been verified.
 
+#![allow(
+	clippy::disallowed_methods,
+	reason = "the migration of a v0.x database runs only for a native build on std::fs, behind the file system kind check in Tree::new"
+)]
+
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;

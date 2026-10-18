@@ -16,6 +16,7 @@ use tempfile::TempDir;
 use test_log::test;
 
 use super::sstable_encryption_tests::FlakyManager;
+use super::tfs;
 use super::wal_sealed_tests::{
 	context,
 	names,
@@ -519,6 +520,9 @@ fn segment_keys(enc: &Arc<EncryptionContext>, path: &Path, id: u64) -> Vec<Strin
 /// of the group that failed are not readable, and a crash image recovers the rest.
 #[test(tokio::test)]
 async fn a_tree_replaces_a_failed_sealed_segment_with_one_that_has_its_own_salt() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in [CipherSuite::Aes256Gcm, CipherSuite::XChaCha20Poly1305] {
 		for write_fault in [false, true] {
 			let root = TempDir::new().unwrap();
@@ -596,6 +600,9 @@ fn copy_dir(src: &Path, dst: &Path) {
 /// own, and never appends to the one a crash left.
 #[test(tokio::test)]
 async fn a_tree_that_is_opened_again_writes_to_a_new_segment_and_leaves_the_old_one_alone() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in [CipherSuite::Aes256Gcm, CipherSuite::XChaCha20Poly1305] {
 		let root = TempDir::new().unwrap();
 		let live = root.path().join("live");

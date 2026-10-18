@@ -6,7 +6,6 @@
 //! nothing may move them to a table. The two must not meet: the recovery of a flush ends the
 //! error of the flush only, and a stopped database refuses every flush, the retried one included.
 
-use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +22,7 @@ use super::manifest_write_failure_tests::{
 	Healed,
 	GRACE,
 };
+use super::{sfs as fs, tfs};
 use crate::error::BackgroundErrorReason;
 use crate::levels::{fail_replacements, ReplaceFailure};
 use crate::{Durability, Error, Mode, Options, Result, Tree};
@@ -113,6 +113,9 @@ fn assert_stopped(tree: &Tree, what: &str) {
 /// of the group, and the flushes and the checkpoints that come after are refused.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_flush_that_succeeds_after_a_group_stopped_the_database_does_not_end_the_stop() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_stop_in_flight").unwrap();
 	let tree = open(dir.path(), 16 * 1024 * 1024);
 	for result in commit_group(&tree, &base()).await {
@@ -175,6 +178,9 @@ async fn a_flush_that_succeeds_after_a_group_stopped_the_database_does_not_end_t
 /// table is written however the manifest recovers, and a crash image recovers the group whole.
 #[test(tokio::test)]
 async fn a_failed_manifest_write_in_the_flush_before_a_direct_write_stops_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_stop_group").unwrap();
 	let tree = open(dir.path(), SMALL);
 	for result in commit_group(&tree, &base()).await {
