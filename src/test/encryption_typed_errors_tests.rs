@@ -230,6 +230,7 @@ fn replay(
 		"test",
 		mode,
 		ARENA,
+		None,
 		|memtable, _, _| {
 			memtables.push(memtable);
 			Ok(())

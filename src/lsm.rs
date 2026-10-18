@@ -35,6 +35,7 @@ use crate::wal::recovery::{
 	WalDamage,
 	WalRecoveryReport,
 };
+use crate::wal::tail::{self, TailCheck, TailEnd};
 use crate::wal::{self, cleanup_old_segments_for_in, list_segment_ids_in, Wal, WalManager};
 use crate::{
 	rt,
@@ -2128,6 +2129,7 @@ impl Core {
 			context,
 			recovery_mode,
 			arena_size,
+			None,
 			flush_memtable,
 		)
 	}
@@ -2160,6 +2162,7 @@ impl Core {
 		context: &str,
 		recovery_mode: WalRecoveryMode,
 		arena_size: usize,
+		mut tail: Option<&mut TailCheck<'_>>,
 		mut flush_memtable: F,
 	) -> Result<(Option<u64>, Option<Arc<MemTable>>, WalRecoveryReport)>
 	where
@@ -2167,6 +2170,19 @@ impl Core {
 	{
 		let mut report = WalRecoveryReport::default();
 		let mut repair_attempts = 0;
+
+		// Before anything of the log is replayed, so that no memtable is made of a record that the
+		// segment is then cut before. Once: the records that are kept were all looked at.
+		if let Some(tail) = tail.as_deref_mut() {
+			Self::cut_tail_of_log(
+				tail,
+				wal_context,
+				wal_path,
+				min_wal_number,
+				recovery_mode,
+				&mut report,
+			)?;
+		}
 
 		let (wal_seq_num_opt, memtables) = loop {
 			match replay_wal_inner_with(wal_context, wal_path, min_wal_number, arena_size) {
@@ -2333,6 +2349,12 @@ impl Core {
 			}
 		};
 
+		// What the records of the last segment point to is made durable before anything else is
+		// started on top of them: the open starts the next segment once this returns.
+		if let Some(tail) = tail.as_deref() {
+			tail.make_durable(&*wal_context.fs)?;
+		}
+
 		// If no memtables, nothing was recovered
 		if memtables.is_empty() {
 			return Ok((None, None, report));
@@ -2403,6 +2425,54 @@ impl Core {
 		Ok((wal_seq_num_opt, Some(last_memtable), report))
 	}
 
+	/// Holds the records of the last segment of the log to the value log, and cuts the segment
+	/// before the first record whose value is not in it, as `recovery_mode` allows. The segment as
+	/// it was is kept, as for every repair of the log, and the report says what was cut.
+	fn cut_tail_of_log(
+		tail: &mut TailCheck<'_>,
+		wal_context: &wal::WalContext,
+		wal_path: &Path,
+		min_wal_number: u64,
+		recovery_mode: WalRecoveryMode,
+		report: &mut WalRecoveryReport,
+	) -> Result<()> {
+		let fs = &*wal_context.fs;
+		let Some(segment) = tail::last_segment(fs, wal_path, min_wal_number)? else {
+			return Ok(());
+		};
+		let TailEnd::Cut {
+			record,
+			offset,
+			dropped,
+		} = tail.run(wal_context, &segment, recovery_mode)?
+		else {
+			return Ok(());
+		};
+
+		let segment_id = segment.id as usize;
+		let (quarantined, trimmed) = if wal_context.is_sealed() {
+			let before = fs.file_len(&segment.file_path)?;
+			let kept = wal::sealed_recovery::keep_first_batches(
+				wal_context,
+				wal_path,
+				segment_id,
+				record,
+			)?;
+			(kept, before.saturating_sub(fs.file_len(&segment.file_path)?))
+		} else {
+			repair_corrupted_wal_segment_in(fs, wal_path, segment_id, offset)?
+		};
+		tracing::warn!(
+			"WAL segment {segment_id} ends before record {record}, at offset {offset}: the value it \
+			 points to is not in the value log. {dropped} record(s) and {trimmed} byte(s) were left \
+			 out, and the segment as it was is kept as {quarantined:?}."
+		);
+		report.records_dropped += dropped;
+		report.bytes_trimmed += trimmed;
+		report.quarantined_files.push(quarantined);
+		Ok(())
+	}
+
 	/// Creates a new LSM tree with background task management
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
 		tracing::debug!("Initializing LSM tree at {:?}", opts.path);
@@ -2423,6 +2493,7 @@ impl Core {
 		);
 
 		// Replay WAL with configurable recovery mode (returns None if skipped/empty)
+		let mut tail = inner.vlog.as_deref().map(TailCheck::new);
 		let (wal_seq_num_opt, recovered_memtable, startup_report) = Self::replay_wal_in(
 			&wal::WalContext::for_options(&opts)?,
 			&wal_path,
@@ -2430,6 +2501,7 @@ impl Core {
 			"Database startup",
 			opts.wal_recovery_mode,
 			opts.max_memtable_size,
+			tail.as_mut(),
 			|memtable, wal_number, continues| {
 				// Flush intermediate memtable to SST during recovery
 				let table_id = inner.level_manifest.read()?.next_table_id();
@@ -3551,6 +3623,7 @@ impl Tree {
 		}
 
 		// Replay any WAL entries that were restored
+		let mut tail = self.core.inner.vlog.as_deref().map(TailCheck::new);
 		let (wal_seq_num_opt, recovered_memtable, restore_report) = Core::replay_wal_in(
 			&wal::WalContext::for_options(&self.core.inner.opts)?,
 			&wal_path,
@@ -3558,6 +3631,7 @@ impl Tree {
 			"Database restore",
 			self.core.inner.opts.wal_recovery_mode,
 			self.core.inner.opts.max_memtable_size,
+			tail.as_mut(),
 			|memtable, wal_number, continues| {
 				// Flush intermediate memtable to SST during recovery
 				let table_id = self.core.inner.level_manifest.read()?.next_table_id();

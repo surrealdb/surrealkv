@@ -244,7 +244,7 @@ fn quota() -> io::Error {
 
 const MEMTABLE: usize = 64 * 1024;
 
-fn options_for(fs: &FileSystem, vlog: bool) -> Options {
+pub(super) fn options_for(fs: &FileSystem, vlog: bool) -> Options {
 	let mut options = options_in(fs, MEMTABLE);
 	options.enable_vlog = vlog;
 	options.vlog_value_threshold = 128;
@@ -609,7 +609,7 @@ async fn a_v0_database_in_a_pool_is_refused_and_the_directory_of_the_same_path_i
 
 /// A pool over memory that the test keeps a hand on: what a crash would leave of it is read from
 /// the memory, and a database is opened in that.
-fn pool_over(raw: &MemRaw) -> (FileSystem, Arc<PoolFs<MemRaw>>) {
+pub(super) fn pool_over(raw: &MemRaw) -> (FileSystem, Arc<PoolFs<MemRaw>>) {
 	let (pool, _) = PoolFs::<MemRaw>::mount_sync(raw.clone(), PoolConfig::memory())
 		.expect("a pool mounts over memory");
 	(FileSystem(Arc::clone(&pool) as Arc<dyn Fs>), pool)

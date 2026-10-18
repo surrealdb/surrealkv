@@ -9,6 +9,7 @@
 
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::error::Result;
@@ -31,6 +32,9 @@ pub(crate) struct RecordingFs {
 	inner: StdFs,
 	kind: FsKind,
 	log: Mutex<Vec<String>>,
+	/// Whether the reads of the files are written down as well, which they are not unless a test
+	/// asks: the logs of the tests that compare one with the text of another do not hold them.
+	reads: AtomicBool,
 }
 
 impl RecordingFs {
@@ -46,7 +50,13 @@ impl RecordingFs {
 			inner: StdFs,
 			kind,
 			log: Mutex::new(Vec::new()),
+			reads: AtomicBool::new(false),
 		})
+	}
+
+	/// Writes down the reads of the files from now on, as `read_at <name> <offset> <length>`.
+	pub(crate) fn record_reads(&self) {
+		self.reads.store(true, Ordering::SeqCst);
 	}
 
 	fn record(&self, entry: String) {
@@ -89,6 +99,9 @@ struct RecordingFile {
 
 impl crate::vfs::File for RecordingFile {
 	fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+		if self.fs.reads.load(Ordering::SeqCst) {
+			self.fs.record(format!("read_at {} {offset} {}", self.name, buf.len()));
+		}
 		self.inner.read_at(offset, buf)
 	}
 

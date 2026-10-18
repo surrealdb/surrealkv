@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -1563,13 +1563,19 @@ impl VLog {
 	/// `files_map`, and returns the one with the highest id. A directory that does not exist
 	/// holds none.
 	///
-	/// A log may find a crash's leftover as its newest file: a file that the crash cut off
-	/// before its header was complete, and which therefore holds no entry. It is set aside
-	/// under another name, never deleted, and the newest file is reported as one that is never
-	/// appended to and is no longer there, so that its id is not used again. Only the newest
-	/// file can be that, and only a header that is incomplete or damaged and is no longer than a
-	/// header counts: whatever fails to authenticate is an error and leaves every file as it is.
-	/// The file is renamed only after every other file has opened, so a log that fails on a key
+	/// A log may find a crash's leftover in a file whose header did not reach the disk: one that
+	/// the crash cut off before its header was complete, or whose header is all zeros, and which
+	/// therefore holds no entry that is durable. An fsync of a file writes its header with its
+	/// entries, and a file is synced before a table, or a segment of the log that another
+	/// follows, names an entry of it. Such a file is set aside under another name, never
+	/// deleted. If it is the newest file, it is reported as one that is never appended to and is
+	/// no longer there, so that its id is not used again: the id of any other file is below the
+	/// newest, and is not used again either. Only a header that is no longer than a header and is
+	/// incomplete, or that is all zeros, counts: whatever else fails to authenticate is an error
+	/// and leaves every file as it is. The header of a file of an encrypted log is made durable
+	/// when the file is made, so only its newest file can have been cut off in its header, and a
+	/// header of zeros is never taken for a leftover there.
+	/// The files are renamed only after every other file has opened, so a log that fails on a key
 	/// that does not fit changes nothing, whichever order the directory lists the files in.
 	fn load_files(&self) -> Result<Option<Newest>> {
 		// A directory that is not there holds none. Any other failure to list it is a failure to
@@ -1602,18 +1608,21 @@ impl VLog {
 		};
 
 		let mut newest = None;
-		// The newest file, if a crash left it without a complete header. Nothing is renamed until
-		// every other file has opened: the files come in whatever order the directory lists them,
-		// and a log that then fails on a key that does not fit must leave the directory as it was.
-		let mut torn = None;
+		// The files that a crash left without a complete header. Nothing is renamed until every
+		// other file has opened: the files come in whatever order the directory lists them, and a
+		// log that then fails on a key that does not fit must leave the directory as it was.
+		let mut torn: Vec<(u32, PathBuf)> = Vec::new();
 		// The order `cleanup_obsolete_files` takes them in
 		let mut files_map = self.files_map.write();
 		let mut file_handles = self.file_handles.write();
 
 		for (file_id, file_path, file_size) in found {
 			let is_newest = file_id == newest_id;
-			if is_newest && self.is_torn(&file_path, file_id, file_size)? {
-				torn = Some((file_id, file_path));
+			// A file of an encrypted log has its header synced when it is made: only the newest
+			// can be cut off in it.
+			let can_be_torn = is_newest || self.encryption().is_none();
+			if can_be_torn && self.is_torn(&file_path, file_id, file_size)? {
+				torn.push((file_id, file_path));
 				continue;
 			}
 
@@ -1634,6 +1643,15 @@ impl VLog {
 					if file_size > 0 {
 						let mut header_data = vec![0u8; VLogFileHeader::SIZE];
 						vfs::File::read_at(&*file, 0, &mut header_data)?;
+						// A header that is all zeros did not reach the disk, whatever follows
+						// it: the entries after it were never synced either, since an fsync of
+						// the file writes its header with them, and no record that is durable
+						// points to one. The file is not open when it is set aside.
+						if self.encryption().is_none() && header_data.iter().all(|&byte| byte == 0)
+						{
+							torn.push((file_id, file_path));
+							continue;
+						}
 						let header = VLogFileHeader::decode(&header_data)?;
 						cipher = self.open_layout(&*file, &header, file_id, true)?;
 						if cipher.is_none() {
@@ -1671,14 +1689,16 @@ impl VLog {
 			}
 		}
 
-		// Every other file opened, so no key was refused and nothing is in doubt but this file.
-		if let Some((file_id, file_path)) = torn {
-			self.set_aside(file_id, &file_path)?;
-			newest = Some(Newest {
-				id: file_id,
-				sealed: true,
-				file: None,
-			});
+		// Every other file opened, so no key was refused and nothing is in doubt but these files.
+		for (file_id, file_path) in &torn {
+			self.set_aside(*file_id, file_path)?;
+			if *file_id == newest_id {
+				newest = Some(Newest {
+					id: newest_id,
+					sealed: true,
+					file: None,
+				});
+			}
 		}
 
 		Ok(newest)
@@ -1725,8 +1745,9 @@ impl VLog {
 		sealed::open_header(context, file_id, &head, prepare).map(Some)
 	}
 
-	/// Whether `path`, the newest file of the log, is what a crash during its creation leaves,
-	/// see [`sealed::is_torn`] and [`VLogFileHeader::is_torn`].
+	/// Whether `path` is what a crash leaves of a file whose header was not written back, see
+	/// [`sealed::is_torn`] and [`VLogFileHeader::is_torn`]. Only the newest file of an encrypted
+	/// log is asked.
 	fn is_torn(&self, path: &Path, file_id: u32, file_size: u64) -> Result<bool> {
 		if self.encryption().is_some() {
 			if file_size > sealed::SEALED_HEADER_LEN as u64 {
@@ -1740,13 +1761,13 @@ impl VLog {
 		Ok(VLogFileHeader::is_torn(&self.fs.read(path)?, file_id))
 	}
 
-	/// Renames a file that a crash left without a complete header, which holds no entry, to a
-	/// name that the log does not read.
+	/// Renames a file that a crash left without a complete header, none of whose entries is
+	/// durable, to a name that the log does not read.
 	fn set_aside(&self, file_id: u32, path: &Path) -> Result<()> {
 		let to = sealed::set_aside_in(&*self.fs, path)?;
 		tracing::warn!(
-			"VLog file {file_id} was cut off before its header was complete and holds no entry: \
-			 it was set aside as {to:?}"
+			"VLog file {file_id} was left by a crash without a complete header and holds no entry \
+			 that is durable: it was set aside as {to:?}"
 		);
 		if let Err(e) = self.fs.sync_dir(&self.path) {
 			tracing::warn!("Failed to sync the VLog directory after setting a file aside: {e}");
@@ -2153,6 +2174,119 @@ impl VLog {
 		let value = sealed::open_entry(cipher, pointer, stored)?;
 		self.opts.block_cache.insert_vlog(cache_id, pointer.offset, value.clone());
 		Ok(value)
+	}
+
+	/// The handle of file `file_id`, or `None` if the log has no such file. A file that was
+	/// listed when the log was opened has a handle; any other is looked for in the file system.
+	fn handle_if_present(&self, file_id: u32) -> Result<Option<Arc<OpenFile>>> {
+		if let Some(handle) = self.file_handles.read().get(&file_id) {
+			return Ok(Some(Arc::clone(handle)));
+		}
+		if !self.fs.try_exists(&self.vlog_file_path(file_id))? {
+			return Ok(None);
+		}
+		self.get_file_handle(file_id).map(Some)
+	}
+
+	/// Whether the entry that `pointer` names is in the log, and whole: its file is there, the
+	/// entry lies inside the file, and what is stored is what the pointer says. `Ok(false)` is
+	/// any of those that does not hold, and says nothing of why. An error is a read that failed,
+	/// or a pointer and a file that disagree about whether entries are sealed.
+	///
+	/// A plaintext entry is held to the lengths in its header, to the checksum stored with it,
+	/// and to the checksum of its key and value, which is calculated whatever
+	/// [`VLogChecksumLevel`] the log reads with: it is the only test of a page that is missing in
+	/// the middle of a value. A sealed entry is held to its length and to the checksum of what is
+	/// stored, which is the one thing that can be checked without the key.
+	///
+	/// The entry is read into `buf`, once, and `buf` is kept for the next one. Nothing is put in
+	/// the block cache, and nothing is allocated for the entry if `buf` has room for it.
+	pub(crate) fn check_entry(&self, pointer: &ValuePointer, buf: &mut Vec<u8>) -> Result<bool> {
+		let Some(handle) = self.handle_if_present(pointer.file_id)? else {
+			return Ok(false);
+		};
+		let sealed = match (&handle.cipher, pointer.is_sealed()) {
+			(Some(_), true) => true,
+			(None, false) => false,
+			(Some(_), false) | (None, true) => {
+				return Err(Error::Corruption(format!(
+					"The pointer and the file disagree about whether the entry is sealed \
+					 (file_id={}, offset={})",
+					pointer.file_id, pointer.offset
+				)));
+			}
+		};
+		let file = &*handle.file;
+
+		// What a pointer says is not trusted to size an allocation: an entry that does not fit in
+		// memory, or that ends past its file, is not in the log. The length of the file is asked
+		// for an entry of 16 MiB or more only, on every target, so that no pointer can ask for
+		// more than that of memory that the file does not have.
+		let total = pointer.total_entry_size();
+		if pointer.offset.checked_add(total).is_none() {
+			return Ok(false);
+		}
+		let Ok(size) = usize::try_from(total) else {
+			return Ok(false);
+		};
+		if entry_bound(total, pointer.offset, true, || vfs::File::size(file))?.is_some() {
+			return Ok(false);
+		}
+		if buf.len() < size {
+			buf.try_reserve(size - buf.len())
+				.map_err(|e| Error::Io(Arc::new(io::Error::from(e))))?;
+			buf.resize(size, 0);
+		}
+
+		// `read_at` may return fewer bytes than asked for, and none at the end of the file.
+		let entry = &mut buf[..size];
+		let mut filled = 0;
+		while filled < size {
+			let read =
+				vfs::File::read_at(file, pointer.offset + filled as u64, &mut entry[filled..])?;
+			if read == 0 {
+				return Ok(false);
+			}
+			filled += read;
+		}
+
+		if sealed {
+			return Ok(crc32fast::hash(entry) == pointer.checksum);
+		}
+		let lens = |at: usize| {
+			u32::from_be_bytes([entry[at], entry[at + 1], entry[at + 2], entry[at + 3]])
+		};
+		if lens(0) != pointer.key_size || lens(4) != pointer.value_size {
+			return Ok(false);
+		}
+		let crc_start = size - 4;
+		if lens(crc_start) != pointer.checksum {
+			return Ok(false);
+		}
+		Ok(crc32fast::hash(&entry[8..crc_start]) == pointer.checksum)
+	}
+
+	/// Makes the files `file_ids` durable, and then the directory they are in: what the open does
+	/// for the files that the records it keeps point into, before it starts another segment of
+	/// the log, so that a record of an older segment never names a value that a crash can take.
+	/// A file that is not there is an error.
+	///
+	/// The file that is appended to and the files that were rolled over from are synced as every
+	/// sync does it ([`sync`](Self::sync)), which keeps the count of what an fsync covers: the
+	/// fsync that the open makes next, through [`sync_dirty`](Self::sync_dirty), finds nothing
+	/// left to do.
+	pub(crate) fn sync_files(&self, file_ids: &BTreeSet<u32>) -> Result<()> {
+		if file_ids.is_empty() {
+			return Ok(());
+		}
+		let active = self.active_writer_id.load(Ordering::SeqCst);
+		for &file_id in file_ids.iter().filter(|&&file_id| file_id != active) {
+			let handle = self.get_file_handle(file_id)?;
+			self.fsync(file_id, &*handle.file)?;
+		}
+		self.sync()?;
+		self.fs.sync_dir(&self.path)?;
+		Ok(())
 	}
 
 	/// Keeps every file in place until the pin is dropped. A checkpoint takes one while it holds

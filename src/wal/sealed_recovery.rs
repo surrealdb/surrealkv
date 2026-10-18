@@ -238,6 +238,29 @@ pub(crate) fn replay(
 /// of the segments without a gap. Nothing is deleted, and nothing is touched if anything fails
 /// before the replacement: a failure that is not a tear is the error of the call, whatever it is.
 pub(crate) fn repair(context: &WalContext, wal_dir: &Path, segment_id: usize) -> Result<()> {
+	repair_keeping(context, wal_dir, segment_id, None).map(|_| ())
+}
+
+/// Ends the sealed segment `segment_id` after its first `batches` batches, as [`repair`] does at a
+/// tear, for a segment that has no tear: the batches after them authenticate, and are left out.
+/// Gives the name that the segment as it was is kept under.
+pub(crate) fn keep_first_batches(
+	context: &WalContext,
+	wal_dir: &Path,
+	segment_id: usize,
+	batches: usize,
+) -> Result<PathBuf> {
+	repair_keeping(context, wal_dir, segment_id, Some(batches))
+}
+
+/// [`repair`], keeping at most `limit` batches if there is a limit. Gives the name that the old
+/// segment is kept under.
+fn repair_keeping(
+	context: &WalContext,
+	wal_dir: &Path,
+	segment_id: usize,
+	limit: Option<usize>,
+) -> Result<PathBuf> {
 	require_std(context)?;
 	let id = segment_id as u64;
 	let segment_path = wal_dir.join(segment_name(id, "wal"));
@@ -252,22 +275,23 @@ pub(crate) fn repair(context: &WalContext, wal_dir: &Path, segment_id: usize) ->
 	}
 	fs::create_dir_all(&repair_dir)?;
 
-	let result = write_repaired(context, &segment_path, &repair_dir, id)
+	let result = write_repaired(context, &segment_path, &repair_dir, id, limit)
 		.and_then(|()| replace(wal_dir, &segment_path, &repair_dir.join(segment_name(id, "wal"))));
 	fs::remove_dir_all(&repair_dir).ok();
-	result?;
+	let kept = result?;
 
 	tracing::info!("Repaired the sealed WAL segment {id:020} to the batches before its damage");
-	Ok(())
+	Ok(kept)
 }
 
-/// Writes the batches of `segment_path` that authenticate, up to the first tear, to a new segment
-/// of the same number in `repair_dir`, and makes it durable.
+/// Writes the batches of `segment_path` that authenticate, up to the first tear or the first
+/// `limit` of them, to a new segment of the same number in `repair_dir`, and makes it durable.
 fn write_repaired(
 	context: &WalContext,
 	segment_path: &Path,
 	repair_dir: &Path,
 	id: u64,
+	limit: Option<usize>,
 ) -> Result<()> {
 	let mut reader = Reader::with_context(context.fs.open_read(segment_path)?, None, id, context);
 	let new_options = |compression: CompressionType| Options {
@@ -277,11 +301,16 @@ fn write_repaired(
 	};
 
 	let mut repaired: Option<Wal> = None;
+	let mut written = 0usize;
 	loop {
+		if limit == Some(written) {
+			break;
+		}
 		match reader.read() {
 			Ok((record, _)) => match repaired.as_mut() {
 				Some(wal) => {
 					wal.append(record)?;
+					written += 1;
 				}
 				None => {
 					// The new segment is compressed as this one is, which the reader knows once it
@@ -293,6 +322,7 @@ fn write_repaired(
 						new_options(reader.get_compression_type()),
 					)?;
 					repaired.insert(wal).append(&first)?;
+					written += 1;
 				}
 			},
 			// The tear: what comes before it is kept.
@@ -320,30 +350,49 @@ fn write_repaired(
 	Ok(())
 }
 
-/// Puts `repaired` in the place of `segment_path`, which is kept under another name.
-fn replace(wal_dir: &Path, segment_path: &Path, repaired: &Path) -> Result<()> {
+/// Puts `repaired` in the place of `segment_path`, which is kept under another name, and gives it.
+fn replace(wal_dir: &Path, segment_path: &Path, repaired: &Path) -> Result<PathBuf> {
 	let kept = unused_name(segment_path)?;
 	fs::hard_link(segment_path, &kept)?;
 	fs::rename(repaired, segment_path)?;
 	fsync_directory(wal_dir)?;
 	tracing::info!("The damaged segment is kept as {kept:?}");
-	Ok(())
+	// The newest few copies of all segments stay, as for a log that is not sealed: here the copy
+	// with the highest number is the newest of a segment.
+	crate::wal::recovery::prune_quarantine_in(
+		&*crate::vfs::default_fs(),
+		wal_dir,
+		crate::wal::recovery::QUARANTINE_COPIES_KEPT,
+		&kept,
+		true,
+	);
+	Ok(kept)
 }
 
-/// A name for the damaged copy of a segment: the name of the segment and `.corrupt`, and a number
-/// after it if an earlier repair left one of those.
+/// A name for the damaged copy of a segment: the name of the segment and `.corrupt`, and after it
+/// the number that follows the highest of the copies that earlier repairs left (`.corrupt` is 0),
+/// so that the number of a copy says how new it is, also when older ones were removed.
 fn unused_name(segment_path: &Path) -> Result<PathBuf> {
 	let base = segment_path.as_os_str().to_owned();
-	for attempt in 0..1000u32 {
+	let named = |number: u32| {
 		let mut name = base.clone();
 		name.push(".corrupt");
-		if attempt > 0 {
-			name.push(format!(".{attempt}"));
+		if number > 0 {
+			name.push(format!(".{number}"));
 		}
-		let candidate = PathBuf::from(name);
-		if !candidate.try_exists()? {
-			return Ok(candidate);
+		PathBuf::from(name)
+	};
+	let mut highest = None;
+	for number in 0..1000u32 {
+		if named(number).try_exists()? {
+			highest = Some(number);
 		}
 	}
-	Err(Error::Other("too many damaged copies of a WAL segment are kept".to_string()))
+	match highest {
+		None => Ok(named(0)),
+		Some(number) if number + 1 < 1000 => Ok(named(number + 1)),
+		Some(_) => {
+			Err(Error::Other("too many damaged copies of a WAL segment are kept".to_string()))
+		}
+	}
 }

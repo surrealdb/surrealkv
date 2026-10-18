@@ -854,29 +854,50 @@ async fn a_changed_entry_of_the_value_log_is_a_corrupt_value_and_never_a_wrong_o
 				"{what}: {changes:?}"
 			);
 
-			// A file that was cut short: the entries before the cut are read, and the one that is
-			// cut is an error that says so.
-			let work = work_copy(db.dir.path());
-			set_len(&first_file(work.path(), "vlog", "vlog"), (bytes.len() - 20) as u64);
-			let before = DirImage::of(work.path());
-			let outcome =
-				open_and_read(work.path(), WITH_LOG, mode, suite, &Auth::Right, &db.expected).await;
-			let Outcome::Opened(reads) = outcome else {
-				panic!("{what}: the open of a database whose log was cut short was refused");
-			};
-			assert!(reads.wrong.is_empty() && reads.missing.is_empty(), "{what}");
-			assert!(!reads.failures.is_empty(), "{what}: the cut was never noticed");
-			for error in &reads.failures {
+			// A file that was cut short. The commits that were not flushed are in the last segment
+			// of the WAL, and the open holds that segment to the value log: with the
+			// last entry cut, the commit that it belongs to is not replayed, and the
+			// mode that refuses damage refuses it. Every other entry that is cut is an
+			// error that says so, where it is read.
+			for cut in [bytes.len() - 20, 127 + 20] {
+				let what = format!("{what}, the value log cut to {cut} of {} bytes", bytes.len());
+				let work = work_copy(db.dir.path());
+				set_len(&first_file(work.path(), "vlog", "vlog"), cut as u64);
+				let before = DirImage::of(work.path());
+				let outcome =
+					open_and_read(work.path(), WITH_LOG, mode, suite, &Auth::Right, &db.expected)
+						.await;
+				if mode == WalRecoveryMode::AbsoluteConsistency {
+					let Outcome::Refused(error) = outcome else {
+						panic!("{what}: the open of a database whose log was cut short succeeded");
+					};
+					assert!(matches!(error, Error::WalCorruption { .. }), "{what}: {error:?}");
+					DirImage::of(work.path()).assert_unchanged_since(&before, &what);
+					continue;
+				}
+				let Outcome::Opened(reads) = outcome else {
+					panic!("{what}: the open of a database whose log was cut short was refused");
+				};
+				assert!(reads.wrong.is_empty(), "{what}");
+				let unflushed: Vec<Vec<u8>> =
+					db.expected.keys().filter(|key| key.starts_with(b"w-")).cloned().collect();
+				assert_eq!(reads.missing, unflushed, "{what}: the commit whose value is cut");
+				for error in &reads.failures {
+					assert!(
+						matches!(error, Error::Other(message) if message.contains("cut short")),
+						"{what}: {error:?}"
+					);
+				}
+				if cut == 127 + 20 {
+					assert!(!reads.failures.is_empty(), "{what}: the cut was never noticed");
+				}
+				let changes = DirImage::of(work.path()).changes_since(&before);
 				assert!(
-					matches!(error, Error::Other(message) if message.contains("cut short")),
-					"{what}: {error:?}"
+					changes.iter().all(|change| change.starts_with("file added: wal")
+						|| change.starts_with("file changed: wal")),
+					"{what}: {changes:?}"
 				);
 			}
-			let changes = DirImage::of(work.path()).changes_since(&before);
-			assert!(
-				changes.iter().all(|change| change.starts_with("file added: wal")),
-				"{what}: {changes:?}"
-			);
 		}
 	}
 }

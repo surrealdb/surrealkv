@@ -904,7 +904,7 @@ fn a_scan_finds_the_same_records_through_short_reads() {
 }
 
 #[test]
-fn the_copies_of_repairs_are_reclaimed_on_a_pool_and_kept_on_std() {
+fn the_copies_of_repairs_are_reclaimed_on_a_pool_and_the_newest_three_are_kept_on_std() {
 	for (kind, kept) in [(FsKind::Pool, false), (FsKind::Std, true)] {
 		let dir = TempDir::new().unwrap();
 		let (fs, _) = RecordingFs::recording(kind);
@@ -915,14 +915,15 @@ fn the_copies_of_repairs_are_reclaimed_on_a_pool_and_kept_on_std() {
 			let good = torn_segment(dir.path(), id, 30);
 			repair_corrupted_wal_segment_in(&*fs, dir.path(), id as usize, good as usize).unwrap();
 			cleanup_old_segments_for_in(None, &*fs, dir.path(), id + 1).unwrap();
-			let copies = fs::read_dir(dir.path())
-				.unwrap()
-				.filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".corrupt"))
-				.count();
+			let copies = copy_names(dir.path()).len();
 			high_water = high_water.max(copies);
 		}
 		if kept {
-			assert_eq!(high_water, 20, "std keeps every copy, as it always did");
+			assert_eq!(high_water, 3, "std keeps the newest three copies, and no more");
+			let left = copy_names(dir.path());
+			let newest: Vec<String> =
+				[18u64, 19, 20].iter().map(|id| format!("{id:020}.wal.corrupt")).collect();
+			assert_eq!(left, newest, "the copies of the newest segments are the ones that stay");
 		} else {
 			assert!(
 				high_water <= 1,
@@ -932,6 +933,41 @@ fn the_copies_of_repairs_are_reclaimed_on_a_pool_and_kept_on_std() {
 		// The segments below the log number went in both.
 		assert!(!dir.path().join(format!("{:020}.wal", 5)).exists());
 	}
+}
+
+fn copy_names(dir: &Path) -> Vec<String> {
+	let mut names: Vec<String> = fs::read_dir(dir)
+		.unwrap()
+		.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+		.filter(|name| name.contains(".corrupt"))
+		.collect();
+	names.sort();
+	names
+}
+
+#[test]
+fn the_copy_that_a_repair_has_just_made_is_kept_whatever_the_number_of_its_segment() {
+	// Three copies of newer segments are there, and an older segment is repaired: its copy is the
+	// one that the repair reports, and it is not removed with the others that are past three.
+	let dir = TempDir::new().unwrap();
+	let fs = StdFs;
+	let old = torn_segment(dir.path(), 2, 30);
+	for id in [7u64, 8, 9] {
+		let good = torn_segment(dir.path(), id, 30);
+		repair_corrupted_wal_segment_in(&fs, dir.path(), id as usize, good as usize).unwrap();
+	}
+	let (copy, _) = repair_corrupted_wal_segment_in(&fs, dir.path(), 2, old as usize).unwrap();
+	assert!(copy.exists(), "the copy that the repair reports is there: {copy:?}");
+	let left = copy_names(dir.path());
+	assert_eq!(
+		left,
+		vec![
+			format!("{:020}.wal.corrupt", 2),
+			format!("{:020}.wal.corrupt", 8),
+			format!("{:020}.wal.corrupt", 9),
+		],
+		"the new copy and the two newest of the others"
+	);
 }
 
 #[test]

@@ -72,7 +72,7 @@ impl Recovered {
 fn recover(context: &WalContext, dir: &Path, mode: WalRecoveryMode) -> crate::Result<Recovered> {
 	let mut memtables = Vec::new();
 	let (max_seq, active, _) =
-		Core::replay_wal_in(context, dir, 0, "test", mode, ARENA, |memtable, _, _| {
+		Core::replay_wal_in(context, dir, 0, "test", mode, ARENA, None, |memtable, _, _| {
 			memtables.push(memtable);
 			Ok(())
 		})?;
@@ -1126,6 +1126,45 @@ fn a_second_repair_of_a_segment_keeps_both_damaged_copies() {
 	let second_copy = dir.path().join(format!("{}.corrupt.1", segment_name(2, "wal")));
 	assert_eq!(fs::read(first_copy).unwrap(), first_cut);
 	assert_eq!(fs::read(second_copy).unwrap(), second_cut);
+}
+
+#[test]
+fn the_newest_three_damaged_copies_of_a_sealed_log_are_kept_and_numbered_by_age() {
+	let suite = CipherSuite::Aes256Gcm;
+	let template = TempDir::new().unwrap();
+	let enc = context(suite);
+	// A second segment of eight records, so that five repairs each have a last record to cut.
+	let plan: Plan = vec![
+		vec![encoded_batch(10, "p0", 1, 30)],
+		(0..8u64).map(|i| encoded_batch(20 + i, &format!("s{i}"), 1, 30)).collect(),
+	];
+	build(template.path(), &enc, CompressionType::None, &plan);
+	let context = sealed_context(&enc);
+
+	let dir = work_copy(template.path());
+	let name =
+		|suffix: &str| dir.path().join(format!("{}.corrupt{suffix}", segment_name(1, "wal")));
+	// Five repairs of the same segment, each cutting the record that the last one left last: the
+	// copy that each makes is the segment as it was before that repair.
+	let mut before = Vec::new();
+	for _ in 0..5 {
+		let bytes = read(dir.path(), 1);
+		before.push(bytes.clone());
+		let (at, length) = *batch_records(&bytes).last().unwrap();
+		write(dir.path(), 1, &bytes[..at + HEADER_SIZE + length / 2]);
+		recover(&context, dir.path(), WalRecoveryMode::TolerateCorruptedWithRepair).unwrap();
+	}
+	// Numbers say how new a copy is, also once the oldest were removed: the first two repairs'
+	// copies (`.corrupt` and `.corrupt.1`) are gone, and the next three were not named again.
+	assert!(!name("").exists() && !name(".1").exists());
+	for (suffix, repair) in [(".2", 2), (".3", 3), (".4", 4)] {
+		let copy = fs::read(name(suffix)).unwrap();
+		let cut = {
+			let (at, length) = *batch_records(&before[repair]).last().unwrap();
+			before[repair][..at + HEADER_SIZE + length / 2].to_vec()
+		};
+		assert_eq!(copy, cut, "the copy {suffix} is the segment that the repair {repair} cut");
+	}
 }
 
 #[test]

@@ -243,6 +243,160 @@ fn a_newest_file_with_a_partial_header_is_set_aside_and_the_log_opens() {
 	assert_eq!(more.file_id, 3, "the id of the file that was set aside is not used again");
 }
 
+/// A newest file whose header is zeros and that holds entries after it is what a crash leaves when
+/// the first page of a file was not written back and a later one was. None of its entries was
+/// synced, since an fsync of the file writes its header with them: it is set aside, its id is not
+/// used again, and the log opens.
+#[test]
+fn a_newest_file_whose_header_is_zeros_is_set_aside_and_the_log_opens() {
+	let dir = TempDir::new().unwrap();
+	let opts = options(dir.path());
+	let first = {
+		let vlog = std_open(Arc::clone(&opts));
+		let first: Vec<_> = (0..3).map(|i| vlog.append(&key(i), &value(i)).unwrap()).collect();
+		// The next append rolls over to file 2.
+		vlog.append(&key(3), &value(3)).unwrap();
+		vlog.append(&key(4), &value(4)).unwrap();
+		vlog.sync().unwrap();
+		first
+	};
+	let second = opts.vlog_file_path(2);
+	let mut bytes = std::fs::read(&second).unwrap();
+	assert!(bytes.len() > 31 + 56, "the file holds entries");
+	bytes[..31].fill(0);
+	std::fs::write(&second, &bytes).unwrap();
+
+	let vlog = std_open(Arc::clone(&opts));
+	assert!(!second.exists(), "the file is gone from its name");
+	let mut aside = second.as_os_str().to_owned();
+	aside.push(".torn");
+	assert_eq!(std::fs::read(&aside).unwrap(), bytes, "and kept under another, as it was");
+	assert_eq!(vlog.next_file_id.load(std::sync::atomic::Ordering::SeqCst), 3);
+	assert!(vlog.writer.read().is_none(), "nothing is appended to it");
+	for (i, pointer) in first.iter().enumerate() {
+		assert_eq!(vlog.get(pointer).unwrap(), value(i), "the file before it is read as it was");
+	}
+	let more = vlog.append(&key(9), &value(9)).unwrap();
+	assert_eq!(more.file_id, 3, "the id of the file that was set aside is not used again");
+}
+
+/// Eight entries over three files of three, three and two entries, which are synced.
+fn three_files(opts: &Arc<Options>) -> Vec<ValuePointer> {
+	let vlog = std_open(Arc::clone(opts));
+	let pointers: Vec<_> = (0..8).map(|i| vlog.append(&key(i), &value(i)).unwrap()).collect();
+	vlog.sync().unwrap();
+	assert_eq!(pointers.iter().map(|pointer| pointer.file_id).max(), Some(3));
+	pointers
+}
+
+fn aside(path: &Path) -> PathBuf {
+	let mut name = path.as_os_str().to_owned();
+	name.push(".torn");
+	PathBuf::from(name)
+}
+
+/// A file that is followed by another and whose header is zeros is what a crash leaves too, when
+/// the first page of a file that was rolled over from was not written back: no record that is
+/// durable names an entry of it, since every file that is named was synced, header and all. It is
+/// set aside, with its bytes, the files around it are read as they were, the entries that it held
+/// are not in the log, and no id is used again.
+#[test]
+fn a_file_that_is_not_the_newest_and_whose_header_is_zeros_is_set_aside_and_the_log_opens() {
+	for zeroed in [vec![1u64], vec![2], vec![1, 2]] {
+		let dir = TempDir::new().unwrap();
+		let opts = options(dir.path());
+		let pointers = three_files(&opts);
+		let mut kept = Vec::new();
+		for &id in &zeroed {
+			let path = opts.vlog_file_path(id);
+			let mut bytes = std::fs::read(&path).unwrap();
+			assert!(bytes.len() > 31 + 56, "the file holds entries");
+			bytes[..31].fill(0);
+			std::fs::write(&path, &bytes).unwrap();
+			kept.push((id, bytes));
+		}
+
+		let vlog = std_open(Arc::clone(&opts));
+		for (id, bytes) in &kept {
+			let path = opts.vlog_file_path(*id);
+			assert!(!path.exists(), "{zeroed:?}: file {id} is gone from its name");
+			assert_eq!(&std::fs::read(aside(&path)).unwrap(), bytes, "{zeroed:?}: kept as it was");
+		}
+		let mut buf = Vec::new();
+		for (i, pointer) in pointers.iter().enumerate() {
+			if zeroed.contains(&u64::from(pointer.file_id)) {
+				assert!(!vlog.check_entry(pointer, &mut buf).unwrap(), "{zeroed:?}: entry {i}");
+				assert!(vlog.get(pointer).is_err(), "{zeroed:?}: entry {i}");
+			} else {
+				assert!(vlog.check_entry(pointer, &mut buf).unwrap(), "{zeroed:?}: entry {i}");
+				assert_eq!(vlog.get(pointer).unwrap(), value(i), "{zeroed:?}: entry {i}");
+			}
+		}
+		let open: Vec<u32> = (1..=3).filter(|id| !zeroed.contains(&u64::from(*id))).collect();
+		assert_eq!(handles(&vlog), open, "{zeroed:?}: the files that are left are open");
+		assert_eq!(vlog.next_file_id.load(Ordering::SeqCst), 4, "{zeroed:?}");
+		let more = vlog.append(&key(9), &value(9)).unwrap();
+		assert_eq!(more.file_id, 3, "{zeroed:?}: the newest file is appended to as it was");
+		vlog.flush().unwrap();
+		assert_eq!(vlog.get(&more).unwrap(), value(9));
+	}
+}
+
+/// The same for a file that is followed by another and was cut off inside its header.
+#[test]
+fn a_file_that_is_not_the_newest_and_was_cut_off_inside_its_header_is_set_aside() {
+	let dir = TempDir::new().unwrap();
+	let opts = options(dir.path());
+	let pointers = three_files(&opts);
+	let first = opts.vlog_file_path(1);
+	let header = std::fs::read(&first).unwrap()[..12].to_vec();
+	std::fs::write(&first, &header).unwrap();
+
+	let vlog = std_open(Arc::clone(&opts));
+	assert!(!first.exists());
+	assert_eq!(std::fs::read(aside(&first)).unwrap(), header, "kept as it was");
+	assert!(vlog.get(&pointers[0]).is_err());
+	assert_eq!(vlog.get(&pointers[3]).unwrap(), value(3));
+	assert_eq!(vlog.next_file_id.load(Ordering::SeqCst), 4);
+}
+
+/// What is refused stays refused: a file that is followed by another and whose header is damaged
+/// without being zeros, or that is short and is not the start of a header, is not what a crash
+/// leaves of a file that was never synced. The log does not open, and nothing is changed.
+#[test]
+fn a_file_that_is_not_the_newest_and_whose_header_is_damaged_is_refused() {
+	type Damage = fn(&mut Vec<u8>);
+	let damage: [(&str, Damage); 4] = [
+		("the magic is another", |bytes| bytes[0] ^= 0x01),
+		("the id of the file is another", |bytes| bytes[9] ^= 0x01),
+		("the file is short and is not the start of a header", |bytes| {
+			bytes.truncate(12);
+			bytes[1] ^= 0x40;
+		}),
+		("the header is zeros but for one byte", |bytes| {
+			bytes[..31].fill(0);
+			bytes[20] = 1;
+		}),
+	];
+	for (what, damage) in damage {
+		let dir = TempDir::new().unwrap();
+		let opts = options(dir.path());
+		three_files(&opts);
+		let first = opts.vlog_file_path(1);
+		let mut bytes = std::fs::read(&first).unwrap();
+		damage(&mut bytes);
+		std::fs::write(&first, &bytes).unwrap();
+		let before = listing(&opts);
+
+		let result = VLog::new(Arc::clone(&opts));
+		assert!(
+			matches!(result, Err(Error::Corruption(_)) | Err(Error::Other(_))),
+			"{what}: the log opened or failed in another way"
+		);
+		assert_eq!(listing(&opts), before, "{what}: nothing was changed");
+	}
+}
+
 // ---------------------------------------------------------------------------------------------
 // The calls the log makes of the file system seam
 // ---------------------------------------------------------------------------------------------
