@@ -350,6 +350,8 @@ jobs:
               # Starts several workers that run the engine and ends them at many moments. A worker
               # that is ended in the middle of a task is stopped by the browser about two seconds
               # later, and the next one waits for that, which is most of the time of the target.
+              # The target keeps a budget of its own, 480 seconds, below this limit: a slow runner
+              # fails a test with a message, where the runner would end the binary without one.
               opfs_two_workers_test) limit=600 ;;
               *) limit=120 ;;
             esac

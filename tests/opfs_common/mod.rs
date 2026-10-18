@@ -79,24 +79,29 @@ pub fn expect_err<T: Debug, E: Debug>(r: Result<T, E>, what: &str) -> String {
 	}
 }
 
+/// The directory `name` of the origin private file system, or `None` if there is no such
+/// directory. It does not make the directory.
+pub async fn directory(name: &str) -> Option<FileSystemDirectoryHandle> {
+	let root = root().await;
+	let options = web_sys::FileSystemGetDirectoryOptions::new();
+	options.set_create(false);
+	match JsFuture::from(root.get_directory_handle_with_options(name, &options)).await {
+		Ok(dir) => Some(dir.unchecked_into()),
+		Err(e) => {
+			let not_found = e
+				.dyn_ref::<web_sys::DomException>()
+				.is_some_and(|exception| exception.name() == "NotFoundError");
+			assert!(not_found, "getDirectoryHandle({name:?}) failed: {e:?}");
+			None
+		}
+	}
+}
+
 /// The names in the directory `name` of the origin private file system, sorted, or `None` if there
 /// is no such directory. It does not make the directory and does not open any file in it, so it
 /// can look at a database that a worker has mounted.
 pub async fn list_directory(name: &str) -> Option<Vec<String>> {
-	let root = root().await;
-	let options = web_sys::FileSystemGetDirectoryOptions::new();
-	options.set_create(false);
-	let dir: FileSystemDirectoryHandle =
-		match JsFuture::from(root.get_directory_handle_with_options(name, &options)).await {
-			Ok(dir) => dir.unchecked_into(),
-			Err(e) => {
-				let not_found = e
-					.dyn_ref::<web_sys::DomException>()
-					.is_some_and(|exception| exception.name() == "NotFoundError");
-				assert!(not_found, "getDirectoryHandle({name:?}) failed: {e:?}");
-				return None;
-			}
-		};
+	let dir = directory(name).await?;
 	let iterator = dir.keys();
 	let mut names = Vec::new();
 	loop {

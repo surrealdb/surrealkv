@@ -390,8 +390,7 @@ async fn the_engine_runs_over_the_origin_private_file_system_with_the_value_log(
 fn value_log_file(fs: &FileSystem) -> String {
 	names(fs, "db/vlog")
 		.into_iter()
-		.filter(|name| name.ends_with(".vlog"))
-		.last()
+		.rfind(|name| name.ends_with(".vlog"))
 		.map(|name| format!("db/vlog/{name}"))
 		.expect("a file of the value log")
 }

@@ -41,6 +41,25 @@
 //! entered in a registry, [`begin_test`] ends the ones that an earlier failed test left, and
 //! [`end_test`] fails the test that leaves one running.
 //!
+//! # The budget of the target
+//!
+//! CI gives the whole target a limit, and the runner ends a binary that is still running at it
+//! without saying which test was running or what it waited for. So the target has a budget of its
+//! own, [`BUDGET_MS`], below that limit, which starts with the first test. Every wait that this
+//! file makes is cut to what is left of it, and a wait that ran into it fails the test with the
+//! message of that wait and the progress that the worker had made, as a wait that reaches its own
+//! limit does. A slow machine then makes a test fail with a message and does not make the whole
+//! binary disappear.
+//!
+//! # What a worker counts for the tests
+//!
+//! Every worker wraps `FileSystemSyncAccessHandle.prototype.flush` before it starts the engine, so
+//! it can say how many times the engine asked the browser to flush a file (`flushes` in the replies
+//! of `commit`). The engine calls the method of the handle, which the wrapper sees.
+//! What an end of a worker (`terminate()`) leaves does not depend on whether the engine flushed,
+//! since the browser keeps what a worker wrote to a handle whether or not it was flushed, so the
+//! count is how a test sees whether the engine flushed when a commit said it would.
+//!
 //! # What the worker keeps in a database
 //!
 //! Index `i` is two keys, `<tag>-k-<i>` and `<tag>-a-<i>`, with values that follow from the seed of
@@ -88,9 +107,43 @@ const SPAWN_LIMIT_MS: f64 = 60_000.0;
 /// How long any one command may take unless a test says otherwise.
 pub const CALL_LIMIT_MS: f64 = 120_000.0;
 
+/// How much longer than its wait a mount may take to answer: the time to open the files of a pool
+/// and to settle them.
+const MOUNT_SLACK_MS: f64 = 60_000.0;
+
 /// The name of the file that a copy from IndexedDB keeps at the root of the pool while it runs.
 /// (`IMPORTING_FROM_INDEXEDDB` in the engine, which keeps the constant to itself.)
 pub const MIGRATION_MARKER: &str = "IMPORTING_FROM_INDEXEDDB";
+
+/// The name of the file that holds the lock of a database, in the directory of the database.
+/// (`LOCK_NAME` in the pool, which keeps the constant to itself.)
+pub const LOCK_FILE: &str = "LOCK";
+
+/// The unsigned number in `text`, a variable of the environment of the build that `option_env!`
+/// reads, or `default` if there is none. A `const fn`, so that the tests can use it for constants.
+pub const fn number(text: Option<&str>, default: usize) -> usize {
+	let Some(text) = text else {
+		return default;
+	};
+	let bytes = text.as_bytes();
+	assert!(!bytes.is_empty(), "an empty number in the environment of the build");
+	let (mut n, mut i) = (0usize, 0usize);
+	while i < bytes.len() {
+		assert!(
+			bytes[i].is_ascii_digit(),
+			"the number in the environment of the build is not decimal"
+		);
+		n = n * 10 + (bytes[i] - b'0') as usize;
+		i += 1;
+	}
+	n
+}
+
+/// How long the whole target may run, from its first test, before a test fails with a message of
+/// its own: 480 s, which leaves the runner's limit of 600 s (see `ci.yml`) 120 s for the start of
+/// the browser and for the test that ran into the budget to say what it waited for.
+/// `SKV_TWO_WORKER_BUDGET_MS` at compile time changes it.
+pub const BUDGET_MS: f64 = number(option_env!("SKV_TWO_WORKER_BUDGET_MS"), 480_000) as f64;
 
 fn now() -> f64 {
 	js_sys::Date::now()
@@ -407,6 +460,46 @@ struct Shared {
 thread_local! {
 	static REGISTRY: RefCell<Vec<Rc<Shared>>> = const { RefCell::new(Vec::new()) };
 	static SCRIPT: RefCell<Option<String>> = const { RefCell::new(None) };
+	static TARGET_STARTED: Cell<Option<f64>> = const { Cell::new(None) };
+}
+
+/// What is left of the budget of the target, in ms. The first call starts the clock.
+pub fn budget_left_ms() -> f64 {
+	let started = TARGET_STARTED.with(|started| match started.get() {
+		Some(at) => at,
+		None => {
+			let at = now();
+			started.set(Some(at));
+			at
+		}
+	});
+	BUDGET_MS - (now() - started)
+}
+
+fn budget_message(what: &str) -> String {
+	format!(
+		"the time budget of the target ({:.0} s, which is below the limit that CI gives it) ran out \
+		 while waiting for {what}",
+		BUDGET_MS / 1000.0
+	)
+}
+
+/// `limit_ms`, or what is left of the budget of the target if that is less, and whether it is the
+/// budget that cut it. Fails the test at once if nothing is left.
+fn cap_to_budget(limit_ms: f64, what: &str) -> (f64, bool) {
+	let left = budget_left_ms();
+	assert!(left > 0.0, "{}", budget_message(what));
+	if left < limit_ms {
+		(left, true)
+	} else {
+		(limit_ms, false)
+	}
+}
+
+/// `limit_ms` cut to what is left of the budget of the target (see [`BUDGET_MS`]), for a wait that
+/// a test makes with a limit of its own.
+pub fn capped_ms(limit_ms: u64, what: &str) -> u64 {
+	cap_to_budget(limit_ms as f64, what).0 as u64
 }
 
 impl Shared {
@@ -444,6 +537,17 @@ fn glue_url() -> String {
 		.href()
 }
 
+/// The part of the script of a worker that counts the flushes of its synchronous access handles:
+/// the method of the prototype is wrapped, and [`flushes`] reads the count.
+const FLUSH_COUNTER: &str = "if (self.FileSystemSyncAccessHandle) {\n\
+	\tconst flush = self.FileSystemSyncAccessHandle.prototype.flush;\n\
+	\tself.skvFlushes = 0;\n\
+	\tself.FileSystemSyncAccessHandle.prototype.flush = function () {\n\
+	\t\tself.skvFlushes += 1;\n\
+	\t\treturn flush.apply(this, arguments);\n\
+	\t};\n\
+	}\n";
+
 /// The Blob URL of the script of a worker, made once. The script is the same for every worker.
 fn script_url() -> String {
 	SCRIPT.with(|slot| {
@@ -451,7 +555,8 @@ fn script_url() -> String {
 			return url.clone();
 		}
 		let script = format!(
-			"self.addEventListener('message', async (e) => {{\n\
+			"{FLUSH_COUNTER}\
+			 self.addEventListener('message', async (e) => {{\n\
 			 \ttry {{\n\
 			 \t\tconst glue = await import({glue:?});\n\
 			 \t\tawait glue.default({{ module_or_path: e.data }});\n\
@@ -482,9 +587,12 @@ fn parse_fields(text: &str) -> Vec<(String, String)> {
 }
 
 /// Ends every worker that an earlier test left running (a test that failed does not get to end its
-/// own: the panic does not unwind), and says so. Call it first in every test.
+/// own: the panic does not unwind), and says so, and starts the clock of the budget of the target
+/// if it has not started. A test that begins after the budget was used up fails at once. Call it
+/// first in every test.
 pub fn begin_test(name: &str) {
 	let left: Vec<Rc<Shared>> = REGISTRY.with(|registry| registry.borrow().clone());
+	cap_to_budget(0.0, &format!("the start of the test {name}"));
 	for worker in left {
 		console_log!(
 			"{name}: ending the worker {} that an earlier test left running",
@@ -583,18 +691,104 @@ impl Child {
 		&self.shared.label
 	}
 
-	/// The next message, or a failure of the test if none comes within `limit_ms`.
+	/// The next message, or a failure of the test if none comes within `limit_ms` or the budget of
+	/// the target.
 	async fn next_message(&self, limit_ms: f64, what: &str) -> Msg {
+		let (limit, capped) = cap_to_budget(limit_ms, what);
 		let mut rx = self.rx.lock().await;
 		tokio::select! {
 			biased;
 			msg = rx.recv() => msg.unwrap_or_else(|| {
 				panic!("the channel of the worker {} closed while waiting for {what}", self.shared.label)
 			}),
-			_ = sleep_ms(limit_ms) => panic!(
-				"the worker {} did not answer within {limit_ms} ms while waiting for {what}",
-				self.shared.label
-			),
+			_ = sleep_ms(limit) => {
+				let why = if capped {
+					budget_message(what)
+				} else {
+					format!("it did not answer within {limit_ms} ms while waiting for {what}")
+				};
+				panic!("the worker {}: {why} ({})", self.shared.label, self.progress())
+			}
+		}
+	}
+
+	/// What the worker has done so far, for the message of a wait that failed: the indices it has
+	/// acknowledged, the events that it sent and the numbers of tables that it reported last.
+	pub fn progress(&self) -> String {
+		let events = self.shared.events.borrow();
+		let mut counts: Vec<(&str, usize)> = Vec::new();
+		for event in events.iter() {
+			match counts.iter_mut().find(|(name, _)| *name == event.name) {
+				Some((_, count)) => *count += 1,
+				None => counts.push((event.name.as_str(), 1)),
+			}
+		}
+		let counts: Vec<String> = counts.iter().map(|(name, n)| format!("{name} x{n}")).collect();
+		let mut tables: Vec<&str> = events
+			.iter()
+			.rev()
+			.filter(|e| e.name == "sst")
+			.map(|e| e.arg.as_str())
+			.take(6)
+			.collect();
+		tables.reverse();
+		format!(
+			"{} indices acknowledged; events [{}]; the last numbers of tables {tables:?}",
+			self.shared.acked.get(),
+			counts.join(", ")
+		)
+	}
+
+	/// What changes while the worker works: the acknowledgements and the events.
+	fn activity(&self) -> (u64, usize) {
+		(self.shared.acked.get(), self.shared.events.borrow().len())
+	}
+
+	/// The answer to the command `id` if it has arrived, and what the worker said of itself since
+	/// the last look: a panic or a failure ends the test. It does not wait, and the answer is taken
+	/// out of the channel. What an ended worker sent after the request is dropped by the browser,
+	/// so an answer found before the request means that the command was over before it.
+	pub fn poll_reply(&self, id: u64, what: &str) -> Option<Reply> {
+		let mut rx = self.rx.try_lock().unwrap_or_else(|_| {
+			panic!("{}: the channel is in use while looking for the answer to {what}", self.label())
+		});
+		let mut found = None;
+		while let Ok(msg) = rx.try_recv() {
+			match msg {
+				Msg::Ready => {}
+				Msg::Reply(got, reply) if got == id => found = Some(reply),
+				Msg::Reply(got, _) => panic!(
+					"{}: the answer to command {got} came while looking for {id} ({what})",
+					self.label()
+				),
+				Msg::Panic(text) => {
+					panic!("the engine panicked in the worker {} ({what}): {text}", self.label())
+				}
+				Msg::Fatal(text) => {
+					panic!("the worker {} failed ({what}): {text}", self.label())
+				}
+			}
+		}
+		found
+	}
+
+	/// Fails the test if the command `id` has already answered: a commit loop that was to be ended
+	/// in the middle of its work, and that failed or finished on its own instead, was not ended in
+	/// the middle of anything.
+	pub fn assert_running(&self, id: u64, what: &str) {
+		if let Some(reply) = self.poll_reply(id, what) {
+			panic!(
+				"{}: {what} was over before the worker was asked to end ({} {}): {} ({})",
+				self.label(),
+				if reply.ok {
+					"it returned"
+				} else {
+					"it failed with"
+				},
+				reply.kind,
+				reply.message,
+				self.progress()
+			);
 		}
 	}
 
@@ -652,9 +846,11 @@ impl Child {
 
 	pub async fn mount(&self, db: &Db, wait: Wait) -> Reply {
 		let id = self.send_mount(db, wait);
+		// The worker gives up by itself when its wait is over: the coordinator allows it a little
+		// more than that to answer.
 		let limit = match wait {
 			Wait::Default => CALL_LIMIT_MS,
-			Wait::Ms(ms) => ms as f64 + CALL_LIMIT_MS,
+			Wait::Ms(ms) => ms as f64 + MOUNT_SLACK_MS,
 		};
 		self.wait(id, limit, "a mount").await
 	}
@@ -757,20 +953,51 @@ impl Child {
 		self.shared.events.borrow().iter().filter(|e| e.name == name).cloned().collect()
 	}
 
-	/// Waits until `condition` holds, polling the state that the handlers keep.
+	/// Waits until `condition` holds, polling the state that the handlers keep. Fails the test,
+	/// with the progress of the worker, if it does not hold within `limit_ms` or the budget of
+	/// the target.
 	pub async fn wait_until(
 		&self,
 		what: &str,
 		limit_ms: f64,
+		condition: impl FnMut(&Self) -> bool,
+	) {
+		self.wait_until_or_stalled(what, limit_ms, None, condition).await;
+	}
+
+	/// [`Child::wait_until`] that also fails if neither an acknowledgement nor an event of the
+	/// worker has come for `stall_ms`: a worker that stands still is not going to get there.
+	pub async fn wait_until_or_stalled(
+		&self,
+		what: &str,
+		limit_ms: f64,
+		stall_ms: Option<f64>,
 		mut condition: impl FnMut(&Self) -> bool,
 	) {
+		let (limit, capped) = cap_to_budget(limit_ms, what);
 		let started = now();
+		let (mut seen, mut moved_at) = (self.activity(), started);
 		while !condition(self) {
-			assert!(
-				now() - started < limit_ms,
-				"worker {}: {what} did not happen within {limit_ms} ms",
-				self.shared.label
-			);
+			let at = now();
+			if at - started >= limit {
+				let why = if capped {
+					budget_message(what)
+				} else {
+					format!("{what} did not happen within {limit_ms} ms")
+				};
+				panic!("worker {}: {why} ({})", self.shared.label, self.progress());
+			}
+			let activity = self.activity();
+			if activity != seen {
+				(seen, moved_at) = (activity, at);
+			} else if stall_ms.is_some_and(|stall| at - moved_at >= stall) {
+				panic!(
+					"worker {}: {what} did not happen, and the worker made no progress for {} ms ({})",
+					self.shared.label,
+					at - moved_at,
+					self.progress()
+				);
+			}
 			sleep_ms(1.0).await;
 		}
 	}
@@ -882,6 +1109,15 @@ fn post(line: &str) {
 	let _ = scope.post_message(&JsValue::from_str(line));
 }
 
+/// How many times the engine in this worker asked the browser to flush a file (see
+/// [`FLUSH_COUNTER`]).
+fn flushes() -> u64 {
+	js_sys::Reflect::get(&js_sys::global(), &"skvFlushes".into())
+		.ok()
+		.and_then(|count| count.as_f64())
+		.unwrap_or(0.0) as u64
+}
+
 fn event(name: &str, arg: &str) {
 	post(&format!("ev\t{name}\t{}\t{arg}", now()));
 }
@@ -951,6 +1187,11 @@ struct Session {
 	db: Option<Db>,
 	fs: Option<FileSystem>,
 	tree: Option<Tree>,
+	/// The file systems that were closed, kept until the worker ends. The last reference to a file
+	/// system that was not closed releases its handles and its lock when it is dropped, which is
+	/// what `close` does too: a closed file system that is dropped at once would show only that
+	/// the drop does it. Kept, it shows that `close` releases them.
+	closed: Vec<FileSystem>,
 }
 
 impl Session {
@@ -1130,6 +1371,7 @@ async fn cmd_commit(s: &Session, a: &Args) -> Result<Fields, Failure> {
 	};
 	let end = from + count;
 	let (mut next, mut commits) = (from, 0u64);
+	let flushes_at_start = flushes();
 	while next < end {
 		let group_end = (next + per).min(end);
 		let mut txn = tree.begin().map_err(|e| engine("begin", e))?;
@@ -1160,7 +1402,11 @@ async fn cmd_commit(s: &Session, a: &Args) -> Result<Fields, Failure> {
 			}
 		}
 	}
-	Ok(vec![("end", next.to_string()), ("commits", commits.to_string())])
+	Ok(vec![
+		("end", next.to_string()),
+		("commits", commits.to_string()),
+		("flushes", (flushes() - flushes_at_start).to_string()),
+	])
 }
 
 async fn cmd_verify(s: &Session, a: &Args) -> Result<Fields, Failure> {
@@ -1315,7 +1561,9 @@ async fn cmd_close(s: &mut Session) -> Result<Fields, Failure> {
 		cmd_close_tree(s, &Args(Vec::new())).await?;
 	}
 	if let Some(fs) = s.fs.take() {
-		fs.close().await.map_err(|e| engine("close the file system", e))?;
+		let closed = fs.close().await;
+		s.closed.push(fs);
+		closed.map_err(|e| engine("close the file system", e))?;
 	}
 	Ok(vec![("ms", format!("{:.0}", now() - started))])
 }

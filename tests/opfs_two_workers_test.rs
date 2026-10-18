@@ -19,23 +19,29 @@
 //!
 //! 1. Exclusivity. A second worker cannot mount a database that a first one holds: it fails with
 //!    the typed lock error, after the wait that it was given and not much later, it leaves no file
-//!    behind and cannot remove the database either, and the first worker goes on, unharmed.
-//! 2. A hand-over after a clean close. The next worker mounts at once and finds every key, six
-//!    times in a row, with and without the value log.
+//!    behind and cannot remove the database either, and the first worker goes on, unharmed. The
+//!    first worker holds the `LOCK` file until it closes. A lock that another page holds alone,
+//!    with every slot free, keeps a mount out for as long as it is held, and a mount that waits for
+//!    it gets it when it is let go. Two workers that mount a new database at the same moment are
+//!    not both given it.
+//! 2. A hand-over after a clean close. The next worker mounts at once, while the worker that closed
+//!    is still running, and finds every key, six times in a row, with and without the value log.
 //! 3. A hand-over to a worker that was already waiting for the database: it mounts after the first
 //!    worker closed and not before, and before its deadline.
 //! 4. A kill. A worker commits in a loop, and the coordinator asks the browser to end it at a point
 //!    that it chooses (after a number of commits, at a pseudo-random moment, among flushes and
 //!    compactions, in the middle of `Tree::close`); the next worker mounts, waiting as long as the
 //!    browser needs to release the files, and finds a database that holds the commits of the first
-//!    worker in their order and none after a gap, each commit whole, and, if they were
-//!    `Durability::Immediate`, every one that the worker had acknowledged, which the worker wrote
-//!    to a file of its own as it went, since the browser drops the messages of an ended worker. The
-//!    next worker commits and closes, and a third one reads everything.
+//!    worker in their order and none after a gap, each commit whole, and every one that had
+//!    returned, `Durability::Immediate` or `Durability::Eventual`. Which they were is known from a
+//!    file that the worker wrote as it went, since the browser drops the messages of an ended
+//!    worker. The next worker commits and closes, and a third one reads everything.
 //! 5. Two databases at once, one in each of two workers, worked on at the same time: neither sees a
 //!    key of the other.
 //! 6. The move out of IndexedDB, killed at several moments, then called again by another worker:
 //!    the database equals the source, the source is as it was and the marker is gone.
+//! 7. What the engine asks of the browser. A commit with `Durability::Immediate` asks it to flush a
+//!    file before it returns, and one with `Durability::Eventual` does not.
 //!
 //! # How a worker ends, and what that does not show
 //!
@@ -50,16 +56,34 @@
 //! browser then closes the handles of the worker, when it gets to it: the next worker mounts with a
 //! wait of [`RELEASE_WAIT_MS`], every wait is printed, and the test fails only if that one passes.
 //!
-//! What is not covered: a crash of the browser or of its renderer process, the loss of the
-//! machine's power, and what the operating system keeps of a write that it has not flushed (see the
-//! section on durability in the README). `terminate()` leaves everything that the worker had
-//! written in the file system of the browser.
+//! What is not covered, and what covers it instead:
+//!
+//! * A crash of the browser or of its renderer process, the loss of the machine's power, and what
+//!   the operating system keeps of a write that it has not flushed (see the section on durability
+//!   in the README). The end of a worker is none of these: the browser keeps everything that the
+//!   worker wrote to a handle, whether or not the worker flushed it, so a commit that returned is
+//!   there afterwards with either durability, and these tests assert that for both. They cannot
+//!   show that a commit that asked for a flush got it first. Section 7 counts the calls of the
+//!   engine to the browser, and the order of the flushes and what each crash would lose are tested
+//!   over the memory file system (`src/test/wal_group_crash_tests.rs` for a commit,
+//!   `src/test/indexeddb_migration_tests.rs` for the marker of the move). The flush of the header
+//!   of a file that was never synced, which `FileSystem::close` makes, is not reached here either:
+//!   the tree has synced every file that it wrote by the time it is closed.
+//! * A torn tail of the log, and a log whose value log is shorter than it. A worker that is ended
+//!   is ended between two calls, so the log is whole: `trimmed` and `dropped` are `0` in every
+//!   round. `tests/opfs_engine_test.rs` repairs a torn tail and ends the log at a missing value on
+//!   the real file system.
+//! * The check of the copy from IndexedDB against its source before the marker is removed: a second
+//!   worker cannot change the files between the copy and its check, so the check never fails here.
+//!   `src/test/indexeddb_migration_tests.rs` makes it fail.
 //!
 //! The kill tests run [`ROUNDS`] rounds each, so that the target stays within a few minutes: a
 //! round that ends a worker in the middle of a task takes two seconds longer than the others.
 //! `SKV_TWO_WORKER_ROUNDS=20` at compile time (it is read with `option_env!`) makes a soak run, and
 //! `SKV_TWO_WORKER_SEED` changes the seed that the moments of the kills come from; both are
-//! printed.
+//! printed. The target keeps a time budget of its own, which stays below the limit that CI gives
+//! it, so that a slow machine fails a test with a message of its own instead of ending the whole
+//! binary in silence (see [`workers::BUDGET_MS`]).
 
 #![cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 
@@ -69,9 +93,29 @@ mod opfs_common;
 #[path = "opfs_common/workers.rs"]
 mod workers;
 
-use opfs_common::{destroy_when_released, list_directory, sleep_ms, unique_name, watchdog, Rng};
+use opfs_common::{
+	destroy_when_released,
+	directory,
+	list_directory,
+	sleep_ms,
+	unique_name,
+	watchdog,
+	Rng,
+};
+use surrealkv::storage::opfs::{open_opfs_sync_file, OpfsSyncFile};
 use wasm_bindgen_test::*;
-use workers::{begin_test, end_test, Child, CommitSpec, Db, Wait, Yielding};
+use workers::{
+	begin_test,
+	capped_ms,
+	end_test,
+	number,
+	Child,
+	CommitSpec,
+	Db,
+	Wait,
+	Yielding,
+	LOCK_FILE,
+};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
@@ -81,7 +125,16 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 const RELEASE_WAIT_MS: u64 = 120_000;
 
 /// How long the removal of a database that no worker has mounted may wait for the browser.
-const REMOVE_WAIT_MS: f64 = 120_000.0;
+const REMOVE_WAIT_MS: u64 = 120_000;
+
+/// How long the worker of a kill test may take to flush a memtable to a table and to remove tables
+/// by a compaction while its commit loop runs. A commit with `Durability::Immediate` waits for the
+/// disk, so a machine whose disk is busy needs more time: the wait fails, with the progress that
+/// the worker made, when the limit is over.
+const COMPACTION_LIMIT_MS: f64 = 90_000.0;
+
+/// How long a commit loop may go without an acknowledgement or an event before a wait for it fails.
+const STALL_LIMIT_MS: f64 = 30_000.0;
 
 /// Kill rounds of each of the kill tests.
 const ROUNDS: usize = number(option_env!("SKV_TWO_WORKER_ROUNDS"), 4);
@@ -89,37 +142,64 @@ const ROUNDS: usize = number(option_env!("SKV_TWO_WORKER_ROUNDS"), 4);
 /// Where the moments of the kills come from.
 const SEED: u64 = number(option_env!("SKV_TWO_WORKER_SEED"), 0x5EED_0F7B) as u64;
 
-const fn number(text: Option<&str>, default: usize) -> usize {
-	let Some(text) = text else {
-		return default;
-	};
-	let bytes = text.as_bytes();
-	assert!(!bytes.is_empty(), "an empty number in the environment of the build");
-	let (mut n, mut i) = (0usize, 0usize);
-	while i < bytes.len() {
-		assert!(
-			bytes[i].is_ascii_digit(),
-			"the number in the environment of the build is not decimal"
-		);
-		n = n * 10 + (bytes[i] - b'0') as usize;
-		i += 1;
-	}
-	n
-}
-
 fn now() -> f64 {
 	js_sys::Date::now()
 }
 
+/// Removes the database once no worker holds it. The wait is cut to the budget of the target.
+async fn remove(name: &str) {
+	let limit = capped_ms(REMOVE_WAIT_MS, &format!("the removal of the database {name}"));
+	destroy_when_released(name, limit as f64).await;
+}
+
+/// The wait of a mount that follows a worker that was ended: what the browser may need to release
+/// its files, cut to the budget of the target.
+fn release_wait(what: &str) -> Wait {
+	Wait::Ms(capped_ms(RELEASE_WAIT_MS, what))
+}
+
 /// Removes the database and checks that no worker is left.
 async fn finish(test: &str, db: &Db) {
-	destroy_when_released(&db.name, REMOVE_WAIT_MS).await;
+	remove(&db.name).await;
 	end_test(test);
 }
 
 // ---------------------------------------------------------------------------------------------
 // 1. Exclusivity
 // ---------------------------------------------------------------------------------------------
+
+/// Asks for the lock file of the database `name` as another page would, with a synchronous access
+/// handle on it: the handle, or the text of the error of the browser.
+async fn take_lock_file(name: &str, create: bool) -> Result<OpfsSyncFile, String> {
+	let dir =
+		directory(name).await.ok_or_else(|| format!("the database {name} has no directory"))?;
+	open_opfs_sync_file(&dir, LOCK_FILE, create).await.map_err(|e| format!("{e:?}"))
+}
+
+/// Whether the error of `take_lock_file` is the one of a file that another handle holds.
+fn is_held(error: &str) -> bool {
+	error.contains("NoModificationAllowedError")
+}
+
+/// Takes the lock file of a database whose worker was ended, which the browser frees in its own
+/// time, and keeps it: the coordinator is the page that holds the lock, and no slot is held.
+async fn take_lock_file_when_released(name: &str) -> OpfsSyncFile {
+	let limit = capped_ms(RELEASE_WAIT_MS, "the lock file of the worker that was ended") as f64;
+	let started = now();
+	loop {
+		match take_lock_file(name, true).await {
+			Ok(lock) => return lock,
+			Err(e) => {
+				assert!(
+					is_held(&e) && now() - started < limit,
+					"the lock file of {name} was not released {:.0} ms after the worker was ended: {e}",
+					now() - started
+				);
+				sleep_ms(20.0).await;
+			}
+		}
+	}
+}
 
 async fn exclusivity(test: &str, vlog: bool) {
 	begin_test(test);
@@ -128,9 +208,17 @@ async fn exclusivity(test: &str, vlog: bool) {
 	a.mount_and_open(&db).await;
 	a.commit(&CommitSpec::new(0, 200, true)).await.unwrap("A commits 200 keys");
 
+	// A holds the lock file for as long as it has the database: the browser refuses another handle
+	// on it. That is what keeps a second page out of a pool that has no slot yet.
+	let refused = take_lock_file(&db.name, false).await;
+	match &refused {
+		Err(e) if is_held(e) => {}
+		other => {
+			panic!("the coordinator could take the lock file of a database that A holds: {other:?}")
+		}
+	}
 	let before =
 		list_directory(&db.name).await.expect("the directory of the database that A holds");
-	assert!(before.iter().any(|name| name == "LOCK"), "no lock file in {before:?}");
 
 	let b = Child::spawn("B").await;
 	for wait in [0u64, 400, 1_500] {
@@ -160,7 +248,14 @@ async fn exclusivity(test: &str, vlog: bool) {
 	let probe = a.probe().await;
 	assert!(probe.is_a_prefix() && probe.prefix == 300, "{probe:?}");
 
+	// A lets go of the database but is still running, with its closed file system in hand, so that
+	// it is the close that frees the lock file: no drop of the file system and no end of the
+	// worker.
 	a.close().await.unwrap("A closes");
+	let lock = take_lock_file(&db.name, false)
+		.await
+		.unwrap_or_else(|e| panic!("A closed, and the lock file is still held: {e}"));
+	lock.close();
 	// And once A has closed, B gets it.
 	b.mount(&db, Wait::Ms(0)).await.unwrap("B mounts after A closed");
 	b.open().await.unwrap("B opens");
@@ -180,6 +275,107 @@ async fn a_second_worker_cannot_mount_a_database_that_a_first_holds_without_the_
 	exclusivity("exclusivity_without_the_value_log", false).await;
 }
 
+/// The lock file is what keeps a mount out. Here no slot is held by anybody, the coordinator holds
+/// the lock file alone, as another page would: a mount must fail with the typed lock error for as
+/// long as it is held, and a mount that waits must get the database when it is let go.
+#[wasm_bindgen_test]
+async fn a_lock_file_that_a_page_holds_alone_keeps_a_mount_out_until_it_is_let_go() {
+	const HOLD_MS: f64 = 1_500.0;
+	const DEADLINE_MS: u64 = 30_000;
+	let test = "lock_held_alone";
+	begin_test(test);
+	let db = Db::new("two-lock", true);
+	// A makes the pool, fills it and goes, so that no slot is held.
+	let a = Child::spawn("A").await;
+	a.mount_and_open(&db).await;
+	a.commit(&CommitSpec::new(0, 100, true).per(10)).await.unwrap("A commits");
+	a.close().await.unwrap("A closes");
+	a.exit().await.unwrap("A exits");
+	let lock = take_lock_file_when_released(&db.name).await;
+	let before = list_directory(&db.name).await.expect("the directory of the database");
+
+	let b = Child::spawn("B").await;
+	for wait in [0u64, 300] {
+		let attempt = b.mount(&db, Wait::Ms(wait)).await;
+		assert!(
+			attempt.is_locked(),
+			"B mounted while the lock file was held by another page, or failed otherwise: {attempt:?}"
+		);
+		let waited = attempt.number("ms");
+		assert!(waited >= wait as i64 - 2, "B gave up after {waited} ms of a wait of {wait} ms");
+		assert!(waited <= wait as i64 + 2_000, "B waited {waited} ms for a wait of {wait} ms");
+	}
+	let after = list_directory(&db.name).await.expect("the directory after B's attempts");
+	assert_eq!(before, after, "B's attempts changed the files of the pool");
+
+	// A mount that waits gets the database when the lock file is let go, and not before.
+	let mount = b.send_mount(&db, Wait::Ms(DEADLINE_MS));
+	b.wait_until("B to begin its mount", 30_000.0, |b| b.events("mounting").len() >= 3).await;
+	sleep_ms(HOLD_MS).await;
+	assert!(b.events("mounted").is_empty(), "B mounted while the coordinator held the lock file");
+	let let_go = now();
+	lock.close();
+	let mounted =
+		b.wait(mount, DEADLINE_MS as f64, "B's mount after the lock file was let go").await;
+	let mounted = mounted.unwrap("B mounts");
+	assert!(mounted.seen_at >= let_go, "B's mount was answered before the lock file was let go");
+	assert!(
+		mounted.number("ms") as f64 >= HOLD_MS - 500.0,
+		"B mounted after {} ms",
+		mounted.number("ms")
+	);
+	b.open().await.unwrap("B opens");
+	b.verify(0, 100).await.unwrap("B reads what A wrote");
+	b.close().await.unwrap("B closes");
+	b.exit().await.unwrap("B exits");
+	finish(test, &db).await;
+}
+
+/// Two workers mount a database that is not there at the same moment: one is given it, and the
+/// other fails with the typed lock error. The lock file is what decides, since there is no slot yet
+/// for either of them to find held.
+#[wasm_bindgen_test]
+async fn two_workers_that_mount_a_new_database_at_the_same_moment_are_not_both_given_it() {
+	const RACES: usize = 6;
+	let test = "fresh_race";
+	begin_test(test);
+	for round in 0..RACES {
+		let db = Db::new("two-race", true);
+		let a = Child::spawn("A").await;
+		let b = Child::spawn("B").await;
+		// Both commands are sent before either answer is waited for.
+		let for_a = a.send_mount(&db, Wait::Ms(0));
+		let for_b = b.send_mount(&db, Wait::Ms(0));
+		let from_a = a.wait(for_a, 120_000.0, "A's mount of the new database").await;
+		let from_b = b.wait(for_b, 120_000.0, "B's mount of the new database").await;
+		let (winner, loser, lost) = match (from_a.ok, from_b.ok) {
+			(true, false) => (&a, &b, from_b),
+			(false, true) => (&b, &a, from_a),
+			(true, true) => panic!("round {round}: both workers were given the new database"),
+			(false, false) => {
+				panic!("round {round}: neither worker was given it: {from_a:?} and {from_b:?}")
+			}
+		};
+		assert!(
+			lost.is_locked(),
+			"round {round}: the worker that was not given the database failed otherwise: {lost:?}"
+		);
+		// The worker that has it works with it, and the other's try left nothing in the way.
+		winner.open().await.unwrap("the winner opens");
+		winner.commit(&CommitSpec::new(0, 20, true).per(5)).await.unwrap("the winner commits");
+		winner.verify(0, 20).await.unwrap("the winner reads");
+		winner.close().await.unwrap("the winner closes");
+		loser.mount(&db, Wait::Ms(0)).await.unwrap("the other mounts once it is free");
+		loser.open().await.unwrap("the other opens");
+		loser.verify(0, 20).await.unwrap("the other reads what the winner wrote");
+		loser.close().await.unwrap("the other closes");
+		a.exit().await.unwrap("A exits");
+		b.exit().await.unwrap("B exits");
+		remove(&db.name).await;
+	}
+	end_test(test);
+}
+
 // ---------------------------------------------------------------------------------------------
 // 2. Hand-over after a clean close
 // ---------------------------------------------------------------------------------------------
@@ -190,10 +386,17 @@ async fn hand_overs(test: &str, vlog: bool) {
 	begin_test(test);
 	let db = Db::new("two-chain", vlog);
 	let mut total = 0u64;
+	// The worker that closed, which is not ended until the next one has the database: it is the
+	// close, and not the end of the worker, that has to hand the database over.
+	let mut closed: Option<Child> = None;
 	for round in 0..HAND_OVERS {
 		let worker = Child::spawn(&format!("W{round}")).await;
 		let mounted = worker.mount(&db, Wait::Default).await.unwrap("mount after a clean close");
-		// At once: the lock was released by the close, and nothing waits for the browser.
+		if let Some(earlier) = closed.take() {
+			earlier.exit().await.unwrap("exit");
+		}
+		// At once: the lock was released by the close, and nothing waits for the browser (the
+		// default wait is five seconds, which a lock that was not released would use up).
 		assert!(
 			mounted.number("ms") < 4_000,
 			"the mount after a clean close took {:?} ms",
@@ -221,10 +424,14 @@ async fn hand_overs(test: &str, vlog: bool) {
 		worker.commit(&spec).await.unwrap("commit");
 		total += PER_WORKER;
 		worker.close().await.unwrap("close");
-		worker.exit().await.unwrap("exit");
+		closed = Some(worker);
 	}
 	let last = Child::spawn("A2").await;
-	last.mount_and_open(&db).await;
+	last.mount(&db, Wait::Default).await.unwrap("the last worker mounts");
+	if let Some(earlier) = closed.take() {
+		earlier.exit().await.unwrap("exit");
+	}
+	last.open().await.unwrap("the last worker opens");
 	last.verify(0, total).await.unwrap("the last worker reads everything");
 	let probe = last.probe().await;
 	assert!(probe.is_a_prefix() && probe.prefix == total, "{probe:?}, expected {total}");
@@ -328,7 +535,8 @@ const AFTER_KILL: u64 = 40;
 
 /// What a round of a kill test saw.
 struct Seen {
-	/// Indices the first worker had acknowledged when it was gone, from the file it wrote them to.
+	/// Indices the first worker had committed, that is, whose commit had returned, when it was
+	/// gone, from the file it wrote them to.
 	acked: u64,
 	/// The length of the prefix that the next worker found.
 	present: u64,
@@ -359,12 +567,12 @@ async fn forced_after_ms() -> f64 {
 	a.terminate();
 	let ended = a.terminated_at().expect("the worker was asked to end");
 	let b = Child::spawn("B").await;
-	let mounted = b.mount(&db, Wait::Ms(RELEASE_WAIT_MS)).await;
+	let mounted = b.mount(&db, release_wait("the files of a worker in a long task")).await;
 	let waited = now() - ended;
 	assert!(mounted.ok, "the files of a worker in a long task were not released in {waited:.0} ms");
 	b.close().await.unwrap("close");
 	b.exit().await;
-	destroy_when_released(&db.name, REMOVE_WAIT_MS).await;
+	remove(&db.name).await;
 	console_log!("FORCED_END after_ms={waited:.0}");
 	FORCED_AFTER_MS.with(|known| known.set(Some(waited)));
 	waited
@@ -430,9 +638,11 @@ fn table_history(worker: &Child) -> (u64, bool) {
 	(most, fell)
 }
 
-/// One round: the first worker commits one index (or `per`) at a time and is asked to end, in one
-/// task if `busy` (so that the browser stops it in the middle of it) and between tasks if not; the
-/// second finds the database and has to make sense of it; the third reads what is there at the end.
+/// One round: the first worker commits one index (or `per`) at a time, with `Immediate` durability
+/// if `durable` and with `Eventual` if not, and is asked to end, in one task if `busy` (so that the
+/// browser stops it in the middle of it) and between tasks if not; the second finds the database
+/// and has to make sense of it; the third reads what is there at the end. The second has to find
+/// every commit that returned, whichever durability it had.
 async fn kill_round(
 	label: &str,
 	round: usize,
@@ -460,28 +670,57 @@ async fn kill_round(
 		} else {
 			0
 		});
-	// Never waited for: the worker is ended in the middle of it.
-	a.send_commit(&spec);
+	// Its answer is not waited for: the worker is ended in the middle of the loop. It is looked for
+	// before the request, since a loop that failed or ended on its own is not one that was ended in
+	// the middle of its work.
+	let commits = a.send_commit(&spec);
+	let running = "the commit loop";
 	match kill {
 		Kill::Acks(n) => {
 			a.terminate_at_ack(n);
-			a.wait_until("the acknowledgements to reach the kill point", 120_000.0, |a| {
-				a.is_terminated()
-			})
+			a.wait_until_or_stalled(
+				"the acknowledgements to reach the kill point",
+				120_000.0,
+				Some(STALL_LIMIT_MS),
+				|a| {
+					a.assert_running(commits, running);
+					a.is_terminated()
+				},
+			)
 			.await;
 		}
 		Kill::Delay(ms) => {
 			a.wait_until("the first acknowledgement", 120_000.0, |a| a.acked() >= 1).await;
+			// It goes on committing: the moment of the request is one in the loop and not after it.
+			let first = a.acked();
+			a.wait_until_or_stalled(
+				"another acknowledgement",
+				120_000.0,
+				Some(STALL_LIMIT_MS),
+				|a| {
+					a.assert_running(commits, running);
+					a.acked() > first
+				},
+			)
+			.await;
 			sleep_ms(ms as f64).await;
+			a.assert_running(commits, running);
 			a.terminate();
 		}
 		Kill::Compaction(ms) => {
-			a.wait_until("a flush and a compaction", 300_000.0, |a| {
-				let (most, fell) = table_history(a);
-				most >= 1 && fell
-			})
+			a.wait_until_or_stalled(
+				"a flush and a compaction",
+				COMPACTION_LIMIT_MS,
+				Some(STALL_LIMIT_MS),
+				|a| {
+					a.assert_running(commits, running);
+					let (most, fell) = table_history(a);
+					most >= 1 && fell
+				},
+			)
 			.await;
 			sleep_ms(ms as f64).await;
+			a.assert_running(commits, running);
 			a.terminate();
 		}
 	}
@@ -491,7 +730,7 @@ async fn kill_round(
 
 	// The next worker waits as long as the browser needs to release the files.
 	let b = Child::spawn("B").await;
-	let mounted = b.mount(&db, Wait::Ms(RELEASE_WAIT_MS)).await;
+	let mounted = b.mount(&db, release_wait("the files of the worker that was ended")).await;
 	let waited_ms = now() - asked;
 	assert!(
 		mounted.ok,
@@ -518,13 +757,20 @@ async fn kill_round(
 		0,
 		"{label} round {round}: a commit of {per} indices is torn: {probe:?}"
 	);
-	if durable {
-		assert!(
-			probe.prefix >= acked,
-			"{label} round {round} ({kill:?}): A was told {acked} indices were durable and B found {}",
-			probe.prefix
-		);
-	}
+	// Every commit that returned is there, `Durability::Immediate` or `Durability::Eventual`: the
+	// worker that was ended is not a machine that lost its power, and the engine had handed the
+	// commit to the file before it returned. (That an Immediate commit was flushed is not what this
+	// shows: see section 7.)
+	assert!(
+		probe.prefix >= acked,
+		"{label} round {round} ({kill:?}): A had {acked} indices committed ({}) and B found {}",
+		if durable {
+			"Immediate"
+		} else {
+			"Eventual"
+		},
+		probe.prefix
+	);
 	if probe.prefix > 0 {
 		b.verify(0, probe.prefix).await.unwrap("B reads what it found with get");
 	}
@@ -595,7 +841,7 @@ async fn kill_test(test: &str, vlog: bool, durable: bool) {
 			(Kill::Delay(moment(test, round, 700)), round % 3 == 1)
 		};
 		seen.push(kill_round(test, round, db.clone(), durable, 1, kill, busy).await);
-		destroy_when_released(&db.name, REMOVE_WAIT_MS).await;
+		remove(&db.name).await;
 	}
 	summarise(test, &seen);
 	end_test(test);
@@ -612,22 +858,22 @@ fn summarise(test: &str, seen: &[Seen]) {
 }
 
 #[wasm_bindgen_test]
-async fn a_killed_worker_leaves_every_durable_commit_with_the_value_log() {
+async fn a_killed_worker_loses_no_immediate_commit_with_the_value_log() {
 	kill_test("kill_durable_with_the_value_log", true, true).await;
 }
 
 #[wasm_bindgen_test]
-async fn a_killed_worker_leaves_every_durable_commit_without_the_value_log() {
+async fn a_killed_worker_loses_no_immediate_commit_without_the_value_log() {
 	kill_test("kill_durable_without_the_value_log", false, true).await;
 }
 
 #[wasm_bindgen_test]
-async fn a_killed_worker_that_commits_eventually_leaves_a_prefix_with_the_value_log() {
+async fn a_killed_worker_loses_no_eventual_commit_with_the_value_log() {
 	kill_test("kill_eventual_with_the_value_log", true, false).await;
 }
 
 #[wasm_bindgen_test]
-async fn a_killed_worker_that_commits_eventually_leaves_a_prefix_without_the_value_log() {
+async fn a_killed_worker_loses_no_eventual_commit_without_the_value_log() {
 	kill_test("kill_eventual_without_the_value_log", false, false).await;
 }
 
@@ -635,7 +881,7 @@ async fn a_killed_worker_that_commits_eventually_leaves_a_prefix_without_the_val
 /// and the log segments change all the time, and the commits go four indices at a time to fill it
 /// faster. Every other round ends the worker in the middle of its task.
 #[wasm_bindgen_test]
-async fn a_worker_killed_among_flushes_and_compactions_leaves_every_durable_commit() {
+async fn a_worker_killed_among_flushes_and_compactions_loses_no_immediate_commit() {
 	let test = "kill_among_flushes_and_compactions";
 	begin_test(test);
 	console_log!("{test}: {ROUNDS} rounds, seed {SEED:#x}");
@@ -645,7 +891,7 @@ async fn a_worker_killed_among_flushes_and_compactions_leaves_every_durable_comm
 		let db = Db::new("two-flush", round % 2 == 0).with_mem(128 * 1024);
 		let kill = Kill::Compaction(moment(test, round, 300));
 		seen.push(kill_round(test, round, db.clone(), true, 4, kill, round % 2 == 1).await);
-		destroy_when_released(&db.name, REMOVE_WAIT_MS).await;
+		remove(&db.name).await;
 	}
 	summarise(test, &seen);
 	end_test(test);
@@ -714,7 +960,7 @@ async fn kill_in_close(test: &str, vlog: bool) {
 		};
 		let b = Child::spawn("B").await;
 		let started = asked.unwrap_or_else(now);
-		let mounted = b.mount(&db, Wait::Ms(RELEASE_WAIT_MS)).await;
+		let mounted = b.mount(&db, release_wait("the files of the worker that was ended")).await;
 		let waited = now() - started;
 		assert!(
 			mounted.ok,
@@ -772,7 +1018,7 @@ async fn kill_in_close(test: &str, vlog: bool) {
 		c.verify(0, INDICES + AFTER_KILL).await.unwrap("C reads everything");
 		c.close().await.unwrap("C closes");
 		c.exit().await.unwrap("C exits");
-		destroy_when_released(&db.name, REMOVE_WAIT_MS).await;
+		remove(&db.name).await;
 	}
 	let count = |wanted| states.iter().filter(|s| **s == wanted).count();
 	let inside = count(CloseState::Inside);
@@ -788,13 +1034,12 @@ async fn kill_in_close(test: &str, vlog: bool) {
 }
 
 #[wasm_bindgen_test]
-async fn a_worker_killed_in_the_middle_of_close_leaves_every_durable_commit_with_the_value_log() {
+async fn a_worker_killed_in_the_middle_of_close_loses_no_immediate_commit_with_the_value_log() {
 	kill_in_close("kill_in_close_with_the_value_log", true).await;
 }
 
 #[wasm_bindgen_test]
-async fn a_worker_killed_in_the_middle_of_close_leaves_every_durable_commit_without_the_value_log()
-{
+async fn a_worker_killed_in_the_middle_of_close_loses_no_immediate_commit_without_the_value_log() {
 	kill_in_close("kill_in_close_without_the_value_log", false).await;
 }
 
@@ -866,8 +1111,68 @@ async fn two_workers_work_on_two_databases_at_once_and_do_not_disturb_each_other
 		reader.close().await.unwrap("close");
 		reader.exit().await.unwrap("exit");
 	}
-	destroy_when_released(&x.name, REMOVE_WAIT_MS).await;
+	remove(&x.name).await;
 	finish(test, &y).await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 7. What the engine asks of the browser
+// ---------------------------------------------------------------------------------------------
+
+/// A commit with `Durability::Immediate` asks the browser to flush a file before it returns, and
+/// one with `Durability::Eventual` does not. The end of a worker cannot show that (see the header),
+/// so the worker counts the calls of the engine to `flush` on the handles of its files. Every
+/// commit of the first run makes one for the log, and, if the value log is on and the commit has a
+/// value that goes to it, one for the value log too, since the values are on disk before the
+/// record that points to them. The commits of the second run make none.
+async fn flush_calls(test: &str, vlog: bool) {
+	const COMMITS: u64 = 20;
+	begin_test(test);
+	let db = Db::new("two-flush-calls", vlog);
+	let a = Child::spawn("A").await;
+	a.mount_and_open(&db).await;
+	// One index in each commit, one after the other: no two commits share a flush.
+	let immediate = a.commit(&CommitSpec::new(0, COMMITS, true)).await.unwrap("Immediate commits");
+	let eventual =
+		a.commit(&CommitSpec::new(COMMITS, COMMITS, false)).await.unwrap("Eventual commits");
+	console_log!(
+		"FLUSHES test={test} immediate_commits={} eventual_commits={}",
+		immediate.number("flushes"),
+		eventual.number("flushes")
+	);
+	// The log, and the value log as well if it is on: the values of this test are above its
+	// threshold.
+	let per_commit = if vlog {
+		2
+	} else {
+		1
+	};
+	assert!(
+		immediate.number("flushes") >= (COMMITS * per_commit) as i64,
+		"{COMMITS} commits with Immediate durability asked the browser for {} flushes, and each of \
+		 them has to ask for {per_commit}: {immediate:?}",
+		immediate.number("flushes")
+	);
+	assert_eq!(
+		eventual.number("flushes"),
+		0,
+		"{COMMITS} commits with Eventual durability asked the browser to flush: {eventual:?}"
+	);
+	a.close().await.unwrap("A closes");
+	a.exit().await.unwrap("A exits");
+	finish(test, &db).await;
+}
+
+#[wasm_bindgen_test]
+async fn an_immediate_commit_asks_the_browser_to_flush_and_an_eventual_one_does_not_with_the_value_log(
+) {
+	flush_calls("flush_calls_with_the_value_log", true).await;
+}
+
+#[wasm_bindgen_test]
+async fn an_immediate_commit_asks_the_browser_to_flush_and_an_eventual_one_does_not_without_the_value_log(
+) {
+	flush_calls("flush_calls_without_the_value_log", false).await;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -913,7 +1218,7 @@ async fn a_move_out_of_indexeddb_that_a_kill_cut_short_is_made_again_by_the_next
 	let calibration = target("two-moved-calibration");
 	let k = Child::spawn("K").await;
 	let id = migrate(&k, &calibration, true);
-	let done = k.wait(id, 300_000.0, "the whole copy").await.unwrap("the whole copy");
+	let done = k.wait(id, 120_000.0, "the whole copy").await.unwrap("the whole copy");
 	assert_eq!(done.text("result"), "imported");
 	assert_eq!(done.number("entries"), rows.len() as i64);
 	assert_eq!(done.number("bytes") as u64, total_bytes);
@@ -921,7 +1226,7 @@ async fn a_move_out_of_indexeddb_that_a_kill_cut_short_is_made_again_by_the_next
 	k.exit().await;
 	check_database(&calibration, rows.len(), &wanted_digest, "the calibration copy").await;
 	assert_eq!(idb::fingerprint(&idb_name).await, before, "the copy changed the source");
-	destroy_when_released(&calibration.name, REMOVE_WAIT_MS).await;
+	remove(&calibration.name).await;
 	console_log!("KILL test={test} a whole copy takes {copy_ms} ms");
 
 	let (mut imported, mut existing, mut finished_before_kill) = (0, 0, 0);
@@ -931,7 +1236,7 @@ async fn a_move_out_of_indexeddb_that_a_kill_cut_short_is_made_again_by_the_next
 		let tenths = MIGRATION_TENTHS[round % MIGRATION_TENTHS.len()];
 		let db = target("two-moved");
 		let a = Child::spawn("A").await;
-		migrate(&a, &db, true);
+		let moving = migrate(&a, &db, true);
 		let delay = copy_ms * tenths / 10
 			+ if tenths == 0 {
 				0
@@ -939,10 +1244,16 @@ async fn a_move_out_of_indexeddb_that_a_kill_cut_short_is_made_again_by_the_next
 				moment(test, round, copy_ms / 20 + 1)
 			};
 		sleep_ms(delay as f64).await;
+		// A's answer, if it came before the request: a move that failed on its own is not one that
+		// was cut short by the kill, and a move that finished is not cut short at all.
+		let answered = a.poll_reply(moving, "A's move");
+		if let Some(reply) = &answered {
+			assert!(reply.ok, "round {round}: A's move failed on its own: {reply:?}");
+		}
 		a.terminate();
-		// Whether A had finished is what its last events say: one that was still in the air when it
-		// was ended is lost.
-		let a_finished = !a.events("migrated").is_empty();
+		// Whether A had finished is what its answer and its last events say: one that was still in
+		// the air when it was ended is lost.
+		let a_finished = answered.is_some() || !a.events("migrated").is_empty();
 		let ended = a.terminated_at().expect("A was ended");
 		if a_finished {
 			finished_before_kill += 1;
@@ -953,7 +1264,8 @@ async fn a_move_out_of_indexeddb_that_a_kill_cut_short_is_made_again_by_the_next
 		let mut marker_left = None;
 		if list_directory(&db.name).await.is_some() {
 			let inspector = Child::spawn("I").await;
-			let mounted = inspector.mount(&db, Wait::Ms(RELEASE_WAIT_MS)).await;
+			let mounted =
+				inspector.mount(&db, release_wait("the files of the worker that was ended")).await;
 			let waited = now() - ended;
 			assert!(
 				mounted.ok,
@@ -1016,7 +1328,7 @@ async fn a_move_out_of_indexeddb_that_a_kill_cut_short_is_made_again_by_the_next
 		// Either way: the database is the source, no marker is left and the source is as it was.
 		check_database(&db, rows.len(), &wanted_digest, &format!("round {round}")).await;
 		assert_eq!(idb::fingerprint(&idb_name).await, before, "round {round}: the source changed");
-		destroy_when_released(&db.name, REMOVE_WAIT_MS).await;
+		remove(&db.name).await;
 	}
 	console_log!(
 		"SUMMARY test={test} copy_ms={copy_ms} waits_ms=[{}] imported_by_b={imported} existing={existing} \
