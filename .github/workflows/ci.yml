@@ -347,6 +347,10 @@ jobs:
               opfs_engine_test) limit=600 ;;
               # Copies a legacy database in many ways, and drops the call at every moment of one.
               opfs_migrate_test) limit=300 ;;
+              # Starts several workers that run the engine and ends them at many moments. A worker
+              # that is ended in the middle of a task is stopped by the browser about two seconds
+              # later, and the next one waits for that, which is most of the time of the target.
+              opfs_two_workers_test) limit=600 ;;
               *) limit=120 ;;
             esac
             run_chrome "$name" "$limit" --test "$name"

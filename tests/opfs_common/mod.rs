@@ -79,6 +79,64 @@ pub fn expect_err<T: Debug, E: Debug>(r: Result<T, E>, what: &str) -> String {
 	}
 }
 
+/// The names in the directory `name` of the origin private file system, sorted, or `None` if there
+/// is no such directory. It does not make the directory and does not open any file in it, so it
+/// can look at a database that a worker has mounted.
+pub async fn list_directory(name: &str) -> Option<Vec<String>> {
+	let root = root().await;
+	let options = web_sys::FileSystemGetDirectoryOptions::new();
+	options.set_create(false);
+	let dir: FileSystemDirectoryHandle =
+		match JsFuture::from(root.get_directory_handle_with_options(name, &options)).await {
+			Ok(dir) => dir.unchecked_into(),
+			Err(e) => {
+				let not_found = e
+					.dyn_ref::<web_sys::DomException>()
+					.is_some_and(|exception| exception.name() == "NotFoundError");
+				assert!(not_found, "getDirectoryHandle({name:?}) failed: {e:?}");
+				return None;
+			}
+		};
+	let iterator = dir.keys();
+	let mut names = Vec::new();
+	loop {
+		let next = iterator.next().unwrap_or_else(|e| panic!("listing {name:?} failed: {e:?}"));
+		let step: js_sys::IteratorNext = JsFuture::from(next)
+			.await
+			.unwrap_or_else(|e| panic!("listing {name:?} failed: {e:?}"))
+			.unchecked_into();
+		if step.done() {
+			break;
+		}
+		names.push(step.value().as_string().expect("the browser lists names as strings"));
+	}
+	names.sort();
+	Some(names)
+}
+
+/// Removes the database `name` of the origin private file system once no worker holds it, trying
+/// again while the removal fails with the lock error (the browser releases the files of a worker
+/// that was terminated in its own time), and checks that the directory is gone. Fails the test if
+/// the files are still held after `limit_ms`.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub async fn destroy_when_released(name: &str, limit_ms: f64) {
+	let started = js_sys::Date::now();
+	loop {
+		match surrealkv::FileSystem::destroy_opfs(name).await {
+			Ok(()) => break,
+			Err(e) if e.is_database_locked() => {
+				assert!(
+					js_sys::Date::now() - started < limit_ms,
+					"{name} was still held {limit_ms} ms after the workers were ended: {e}"
+				);
+				sleep_ms(250.0).await;
+			}
+			Err(e) => panic!("removing {name} failed: {e}"),
+		}
+	}
+	assert!(list_directory(name).await.is_none(), "{name} is still there after its removal");
+}
+
 /// Reads the whole file by reading until a read returns nothing, so the length it finds is the
 /// real length of the file and does not come from `size()`. A read that never stops returning
 /// data (an ignored offset, for example) fails the test instead of looping forever.
