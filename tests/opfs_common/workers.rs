@@ -1617,12 +1617,15 @@ async fn cmd_migrate(a: &Args) -> Result<Fields, Failure> {
 		Ok(IndexedDbMigration::Imported {
 			entries,
 			bytes,
+			skipped,
+			..
 		}) => {
 			event("migrated", "");
 			Ok(vec![
 				("result", "imported".to_string()),
 				("entries", entries.to_string()),
 				("bytes", bytes.to_string()),
+				("skipped", skipped.to_string()),
 				("ms", ms),
 			])
 		}

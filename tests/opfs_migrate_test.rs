@@ -15,7 +15,8 @@
 //! with the API of the browser, which must be as it was (its version, its object stores and every
 //! row of them). The logic of the move, and what a crash does to it, is tested over memory in
 //! `src/test/indexeddb_migration_tests.rs`; what is shown here is that the real source and the real
-//! files do what the stand-ins do.
+//! files do what the stand-ins do. The global `indexedDB` of the worker is hidden for the tests of
+//! a context that has none, and put back after each of them.
 
 #![cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 
@@ -23,17 +24,21 @@ mod opfs_common;
 
 use opfs_common::{unique_name, watchdog};
 use surrealkv::{
+	delete_indexeddb,
 	migrate_from_indexeddb,
 	migrate_from_indexeddb_with_tuning,
 	Error,
 	FileSystem,
 	ImportTuning,
+	IndexedDbDeletion,
+	IndexedDbError,
 	IndexedDbMigration,
 	LSMIterator,
 	Mode,
 	Options,
 	TreeBuilder,
 };
+use surrealkv_compat_indxdb::wasm::{read_all_from_browser, IdbSource};
 use surrealkv_compat_indxdb::ChunkLimits;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -61,7 +66,7 @@ fn options() -> Options {
 // ---------------------------------------------------------------------------------------------
 
 /// The code of the README. `tests/` is what compiles it, since a native build cannot and the
-/// example of the README is not built by the doctests, and a test of the library checks that the
+/// examples of the README are not built by the doctests, and a test of the library checks that the
 /// README holds these lines.
 #[allow(dead_code, reason = "compiled for the browser, and never called")]
 mod the_example_of_the_readme {
@@ -77,15 +82,19 @@ mod the_example_of_the_readme {
 			IndexedDbMigration::Imported {
 				entries,
 				bytes,
+				skipped,
+				..
 			} => {
-				// The rows of the IndexedDB database are in the database now.
-				let _ = (entries, bytes);
+				// The rows of the IndexedDB database are in the database now, but for the `skipped`
+				// rows that the engine refuses (an empty key), which are still in IndexedDB.
+				let _ = (entries, bytes, skipped);
 			}
 			IndexedDbMigration::Existing => {
 				// The database was there already, and was left as it is.
 			}
 			IndexedDbMigration::NoSource => {
-				// There was nothing to move: this is a new installation.
+				// There was nothing to move: a new installation, or no IndexedDB in this context
+				// (see below), which this result does not tell apart.
 			}
 			_ => {}
 		}
@@ -97,6 +106,32 @@ mod the_example_of_the_readme {
 		// ...
 		tree.close().await?;
 		fs.close().await?;
+		Ok(())
+	}
+}
+
+/// The example of the README that removes the legacy database, built the same way.
+#[allow(dead_code, reason = "compiled for the browser, and never called")]
+mod the_removal_example_of_the_readme {
+	use std::time::Duration;
+
+	use surrealkv::{delete_indexeddb, IndexedDbDeletion};
+
+	async fn remove_the_legacy_database() -> Result<(), Box<dyn std::error::Error>> {
+		// The most that the call waits for the browser to say that the database is deleted.
+		match delete_indexeddb("my-indexeddb-name", Duration::from_secs(5)).await? {
+			IndexedDbDeletion::Deleted => {
+				// The database is gone.
+			}
+			IndexedDbDeletion::NotFound => {
+				// There was no such database, and none was made.
+			}
+			IndexedDbDeletion::Blocked => {
+				// A connection to it is still open. The browser has not cancelled the deletion,
+				// and carries it out when the last connection is closed.
+			}
+			_ => {}
+		}
 		Ok(())
 	}
 }
@@ -187,10 +222,21 @@ fn weight(rows: &Rows) -> u64 {
 	rows.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum()
 }
 
-fn imported(rows: &Rows) -> IndexedDbMigration {
-	IndexedDbMigration::Imported {
-		entries: rows.len() as u64,
-		bytes: weight(rows),
+/// The result of a move that copied `rows` and skipped `skipped` more. It is checked by its numbers
+/// and not built, since `Imported` can grow fields.
+fn assert_imported(result: Result<IndexedDbMigration, Error>, rows: &Rows, skipped: u64) {
+	match result {
+		Ok(IndexedDbMigration::Imported {
+			entries,
+			bytes,
+			skipped: skipped_rows,
+			..
+		}) => assert_eq!(
+			(entries, bytes, skipped_rows),
+			(rows.len() as u64, weight(rows), skipped),
+			"the entries, the bytes and the skipped rows of the move"
+		),
+		other => panic!("the move did not copy: {other:?}"),
 	}
 }
 
@@ -384,7 +430,7 @@ async fn a_legacy_store_is_imported_with_equal_contents_and_is_not_changed() {
 	let wanted = expected(&rows);
 
 	let result = watchdog("the move", migrate_from_indexeddb(&legacy, &opfs, options())).await;
-	assert_eq!(result.unwrap(), imported(&wanted));
+	assert_imported(result, &wanted, 0);
 	assert_rows(&database(&opfs).await, &wanted, "the database");
 
 	// The legacy database is what it was: its version, its stores, and every row.
@@ -441,13 +487,7 @@ async fn a_store_with_no_row_is_an_empty_database() {
 	let before = snapshot(&legacy).await;
 
 	let result = migrate_from_indexeddb(&legacy, &opfs, options()).await;
-	assert_eq!(
-		result.unwrap(),
-		IndexedDbMigration::Imported {
-			entries: 0,
-			bytes: 0
-		}
-	);
+	assert_imported(result, &Rows::new(), 0);
 	assert!(database(&opfs).await.is_empty());
 	assert_eq!(snapshot(&legacy).await, before);
 	let again = migrate_from_indexeddb(&legacy, &opfs, options()).await;
@@ -473,7 +513,7 @@ async fn a_large_store_is_read_in_bounded_chunks_and_every_row_is_there() {
 	};
 	let (result, report) =
 		migrate_from_indexeddb_with_tuning(&legacy, &opfs, options(), tuning).await;
-	assert_eq!(result.unwrap(), imported(&wanted));
+	assert_imported(result, &wanted, 0);
 	// Fifty thousand rows at most four thousand to a chunk.
 	assert!(report.chunks >= 13, "{report:?}");
 	assert!(report.transactions >= report.chunks, "{report:?}");
@@ -511,7 +551,7 @@ async fn a_copy_that_is_abandoned_half_way_is_made_again_and_completes() {
 
 	let result =
 		watchdog("the second call", migrate_from_indexeddb(&legacy, &opfs, options())).await;
-	assert_eq!(result.unwrap(), imported(&wanted));
+	assert_imported(result, &wanted, 0);
 	assert_rows(&database(&opfs).await, &wanted, "the second call");
 	let again = migrate_from_indexeddb(&legacy, &opfs, options()).await;
 	assert_eq!(again.unwrap(), IndexedDbMigration::Existing);
@@ -538,7 +578,7 @@ async fn a_second_mount_while_the_files_are_open_fails_with_the_typed_lock_error
 	// Once it lets go, the copy is made.
 	holder.close().await.unwrap();
 	let result = migrate_from_indexeddb(&legacy, &opfs, options()).await;
-	assert_eq!(result.unwrap(), imported(&wanted));
+	assert_imported(result, &wanted, 0);
 	assert_rows(&database(&opfs).await, &wanted, "after the lock was let go");
 	clean_up(&opfs, &legacy).await;
 }
@@ -621,9 +661,430 @@ async fn a_key_that_is_not_bytes_fails_the_copy_and_the_next_call_starts_again()
 	create_legacy(&legacy, 1, &["kv"], &again).await;
 	let wanted = expected(&again);
 	let result = migrate_from_indexeddb(&legacy, &opfs, options()).await;
-	assert_eq!(result.unwrap(), imported(&wanted));
+	assert_imported(result, &wanted, 0);
 	assert_rows(&database(&opfs).await, &wanted, "after the source was mended");
 	clean_up(&opfs, &legacy).await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rows that the engine refuses
+// ---------------------------------------------------------------------------------------------
+
+#[wasm_bindgen_test]
+async fn rows_with_an_empty_key_are_skipped_and_counted_and_the_source_is_not_changed() {
+	// IndexedDB has two keys of no bytes: the empty string and an empty binary key. They are the
+	// first two rows of the store, in that order.
+	let rows = || {
+		let mut rows = legacy_rows(60);
+		rows.push(Legacy::bytes(b"", b"the value of the key of no bytes"));
+		rows.push(Legacy::text_key("", b"the value of the key that is an empty string"));
+		rows
+	};
+	let legacy = unique_name("empty-keys", "idb");
+	create_legacy(&legacy, 2, &["kv"], &rows()).await;
+	let before = snapshot(&legacy).await;
+	assert_eq!(before.rows[0].1.len(), rows().len());
+	let wanted = expected(&legacy_rows(60));
+
+	// The default pieces, and chunks of two rows, the first of which holds the two rows that the
+	// engine refuses and nothing else.
+	for (what, read) in [
+		("the default chunks", ChunkLimits::default()),
+		("chunks of two rows", ChunkLimits::new(usize::MAX, 2)),
+	] {
+		let opfs = unique_name("target", "db");
+		let tuning = ImportTuning {
+			read,
+			..ImportTuning::default()
+		};
+		let (result, _) =
+			migrate_from_indexeddb_with_tuning(&legacy, &opfs, options(), tuning).await;
+		assert_imported(result, &wanted, 2);
+		assert_rows(&database(&opfs).await, &wanted, what);
+		// The rows that were skipped are still where they were, and so is the rest.
+		assert_eq!(snapshot(&legacy).await, before, "{what}");
+		let again = migrate_from_indexeddb(&legacy, &opfs, options()).await;
+		assert_eq!(again.unwrap(), IndexedDbMigration::Existing, "{what}");
+		FileSystem::destroy_opfs(&opfs).await.expect("remove the database");
+	}
+	delete_legacy(&legacy).await;
+}
+
+#[wasm_bindgen_test]
+async fn a_source_of_rows_with_an_empty_key_only_is_an_empty_database() {
+	let legacy = unique_name("only-empty-keys", "idb");
+	let opfs = unique_name("target", "db");
+	let rows = vec![Legacy::bytes(b"", b"a"), Legacy::text_key("", b"b")];
+	create_legacy(&legacy, 1, &["kv"], &rows).await;
+	let before = snapshot(&legacy).await;
+
+	let result = migrate_from_indexeddb(&legacy, &opfs, options()).await;
+	assert_imported(result, &Rows::new(), 2);
+	assert!(database(&opfs).await.is_empty());
+	assert_eq!(snapshot(&legacy).await, before);
+	clean_up(&opfs, &legacy).await;
+}
+
+#[wasm_bindgen_test]
+async fn two_keys_that_are_the_same_bytes_fail_the_copy_and_the_source_is_not_changed() {
+	let legacy = unique_name("same-bytes", "idb");
+	let opfs = unique_name("target", "db");
+	let mut rows = legacy_rows(20);
+	// A string key and a binary key that are the same bytes: two rows of IndexedDB, one row of the
+	// database. The copy fails and does not drop one of them.
+	rows.push(Legacy::text_key("same bytes", b"from the string key"));
+	rows.push(Legacy::bytes(b"same bytes", b"from the binary key"));
+	create_legacy(&legacy, 1, &["kv"], &rows).await;
+	let before = snapshot(&legacy).await;
+
+	let result = migrate_from_indexeddb(&legacy, &opfs, options()).await;
+	let Err(Error::MigrationFailed(message)) = result else {
+		panic!("two rows of one key must fail the copy: {result:?}");
+	};
+	assert!(message.contains("rows were written") && message.contains("same key"), "{message}");
+	assert_eq!(snapshot(&legacy).await, before);
+	{
+		// What is left is the marker and no file of a database.
+		let fs = FileSystem::opfs(&opfs).await.expect("the lock was released");
+		let names = fs.list_for_test("");
+		assert!(names.iter().any(|n| n.starts_with("IMPORTING")), "{names:?}");
+		assert!(fs.list_for_test("db").is_empty(), "files of the failed copy are left");
+		fs.close().await.unwrap();
+	}
+	clean_up(&opfs, &legacy).await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// A store that the legacy backend did not make
+// ---------------------------------------------------------------------------------------------
+
+/// Creates the database `name` with an object store `kv` that the legacy backend did not make:
+/// `parameters` is what the browser is given to make it with (a key path, or automatic keys).
+async fn create_odd_store(name: &str, parameters: &[(&str, JsValue)]) {
+	let open: IdbOpenDbRequest = factory().open_with_u32(name, 1).unwrap();
+	let options = js_sys::Object::new();
+	for (key, value) in parameters {
+		js_sys::Reflect::set(&options, &(*key).into(), value).unwrap();
+	}
+	let upgrade = Closure::once_into_js(move |event: web_sys::Event| {
+		let req: IdbRequest = event.target().unwrap().unchecked_into();
+		let db: IdbDatabase = req.result().unwrap().unchecked_into();
+		let create: js_sys::Function =
+			js_sys::Reflect::get(&db, &"createObjectStore".into()).unwrap().unchecked_into();
+		create.call2(&db, &"kv".into(), &options).unwrap();
+	});
+	open.set_onupgradeneeded(Some(upgrade.unchecked_ref()));
+	wait_for(open.as_ref(), "success").await;
+	let db: IdbDatabase = open.result().unwrap().unchecked_into();
+	db.close();
+}
+
+#[wasm_bindgen_test]
+async fn a_store_that_the_legacy_backend_did_not_make_fails_the_call_and_is_not_no_indexeddb() {
+	// The README refuses a store `kv` with a key path or with automatic keys. That is an error of
+	// reading a database that is there, and not "there is no IndexedDB here": taken for that, the
+	// call would be `NoSource`, the application would start with a new database, and the next start
+	// would find it and never move the data.
+	for (what, parameters, named) in [
+		("a key path", vec![("keyPath", JsValue::from_str("id"))], "key path"),
+		("automatic keys", vec![("autoIncrement", JsValue::TRUE)], "autoIncrement"),
+	] {
+		let legacy = unique_name("odd-store", "idb");
+		let opfs = unique_name("target", "db");
+		create_odd_store(&legacy, &parameters).await;
+		let before = snapshot(&legacy).await;
+
+		// Every call, not the first only: nothing was made that the next call could take for a
+		// database.
+		for call in ["first", "second"] {
+			let result = migrate_from_indexeddb(&legacy, &opfs, options()).await;
+			let Err(Error::MigrationFailed(message)) = result else {
+				panic!("{what}, the {call} call: a store that is not the legacy one must fail: {result:?}");
+			};
+			assert!(message.contains(named), "{what}, the {call} call: {message}");
+			assert!(!opfs_has(&opfs).await, "{what}, the {call} call: the call made the database");
+			assert_eq!(snapshot(&legacy).await, before, "{what}, the {call} call");
+		}
+		delete_legacy(&legacy).await;
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// A context that has no IndexedDB
+// ---------------------------------------------------------------------------------------------
+
+/// What `indexedDB` of the global scope of the worker is made to be for as long as this is held:
+/// the scope is put back as it was when this is dropped, as it is when a test fails, so that one
+/// test cannot hide IndexedDB from the next. The property is looked at as a script looks at it, so
+/// that what a test sees through this is what the code under test sees.
+struct HiddenIndexedDb {
+	/// The own property that the scope had before, `undefined` if it had none (it is then
+	/// inherited, and the property that was made is removed to bring that back).
+	own: JsValue,
+}
+
+impl HiddenIndexedDb {
+	/// Reading `indexedDB` gives `undefined`.
+	fn as_undefined() -> Self {
+		let descriptor = js_sys::Object::new();
+		js_sys::Reflect::set(&descriptor, &"value".into(), &JsValue::UNDEFINED).unwrap();
+		let hidden = Self::put(&descriptor);
+		let read = js_sys::Reflect::get(&js_sys::global(), &"indexedDB".into());
+		assert!(read.is_ok_and(|value| value.is_undefined()), "indexedDB is still there");
+		hidden
+	}
+
+	/// Reading `indexedDB` throws a `SecurityError`, as it does where the browser blocks storage.
+	fn as_throwing() -> Self {
+		let descriptor = js_sys::Object::new();
+		let getter = js_sys::Function::new_no_args(
+			"throw new DOMException('The operation is insecure.', 'SecurityError');",
+		);
+		js_sys::Reflect::set(&descriptor, &"get".into(), &getter).unwrap();
+		let hidden = Self::put(&descriptor);
+		let read = js_sys::Reflect::get(&js_sys::global(), &"indexedDB".into());
+		assert!(read.is_err(), "reading indexedDB does not throw");
+		hidden
+	}
+
+	fn put(descriptor: &js_sys::Object) -> Self {
+		let (global, key) = (js_sys::global(), JsValue::from_str("indexedDB"));
+		let own = js_sys::Object::get_own_property_descriptor(&global, &key);
+		js_sys::Reflect::set(descriptor, &"configurable".into(), &JsValue::TRUE).unwrap();
+		let defined = js_sys::Reflect::define_property(&global, &key, descriptor)
+			.expect("the scope lets indexedDB be defined again");
+		assert!(defined, "the scope does not let indexedDB be defined again");
+		Self {
+			own,
+		}
+	}
+}
+
+impl Drop for HiddenIndexedDb {
+	fn drop(&mut self) {
+		let (global, key) = (js_sys::global(), JsValue::from_str("indexedDB"));
+		if self.own.is_undefined() {
+			let _ = js_sys::Reflect::delete_property(&global, &key);
+		} else {
+			let _ = js_sys::Reflect::define_property(&global, &key, self.own.unchecked_ref());
+		}
+	}
+}
+
+/// A way of hiding `indexedDB`.
+type Hide = fn() -> HiddenIndexedDb;
+
+/// How `indexedDB` is hidden, for the tests below, and what it is called in their messages.
+fn hidings() -> [(&'static str, Hide); 2] {
+	[
+		("indexedDB is undefined", HiddenIndexedDb::as_undefined),
+		("reading indexedDB throws", HiddenIndexedDb::as_throwing),
+	]
+}
+
+#[wasm_bindgen_test]
+async fn a_worker_without_indexeddb_starts_with_a_new_database_and_makes_nothing() {
+	let legacy = unique_name("legacy", "idb");
+	let opfs = unique_name("target", "db");
+	// A legacy database that is there, so that "no source" is not the answer for a name that is
+	// not: it cannot be read in a worker that has no IndexedDB, and it must be read when it can.
+	let rows = legacy_rows(40);
+	create_legacy(&legacy, 2, &["kv"], &rows).await;
+	let before = snapshot(&legacy).await;
+	let wanted = expected(&rows);
+
+	for (what, hide) in hidings() {
+		// IndexedDB is back before anything is checked, whatever the checks find.
+		let (first, second) = {
+			let _hidden = hide();
+			let first =
+				watchdog("the call", migrate_from_indexeddb(&legacy, &opfs, options())).await;
+			let second = migrate_from_indexeddb(&legacy, &opfs, options()).await;
+			(first, second)
+		};
+		assert_eq!(first.unwrap(), IndexedDbMigration::NoSource, "{what}");
+		assert_eq!(second.unwrap(), IndexedDbMigration::NoSource, "{what}: the call after");
+		assert!(!opfs_has(&opfs).await, "{what}: the call made the database");
+		assert_eq!(snapshot(&legacy).await, before, "{what}: the legacy database was changed");
+	}
+
+	// The browser lets the worker read it, and nothing was skipped for good: the next call moves
+	// it.
+	let result = migrate_from_indexeddb(&legacy, &opfs, options()).await;
+	assert_imported(result, &wanted, 0);
+	assert_rows(&database(&opfs).await, &wanted, "after IndexedDB was back");
+	clean_up(&opfs, &legacy).await;
+}
+
+#[wasm_bindgen_test]
+async fn a_database_that_exists_is_found_by_a_worker_without_indexeddb() {
+	let legacy = unique_name("legacy", "idb");
+	let opfs = unique_name("target", "db");
+	let rows = legacy_rows(25);
+	create_legacy(&legacy, 1, &["kv"], &rows).await;
+	let wanted = expected(&rows);
+	let result = migrate_from_indexeddb(&legacy, &opfs, options()).await;
+	assert_imported(result, &wanted, 0);
+
+	for (what, hide) in hidings() {
+		let result = {
+			let _hidden = hide();
+			migrate_from_indexeddb(&legacy, &opfs, options()).await
+		};
+		assert_eq!(result.unwrap(), IndexedDbMigration::Existing, "{what}");
+	}
+	assert_rows(&database(&opfs).await, &wanted, "the database after the calls");
+	clean_up(&opfs, &legacy).await;
+}
+
+#[wasm_bindgen_test]
+async fn an_unfinished_copy_in_a_worker_without_indexeddb_fails_and_makes_no_database() {
+	let legacy = unique_name("legacy", "idb");
+	let opfs = unique_name("target", "db");
+	let rows = legacy_rows(2_000);
+	create_legacy(&legacy, 1, &["kv"], &rows).await;
+	let wanted = expected(&rows);
+
+	// A worker that dies after two chunks leaves the marker and part of a database.
+	let tuning = ImportTuning {
+		read: ChunkLimits::new(256 * 1024, 300),
+		abandon_after_chunks: Some(2),
+		..ImportTuning::default()
+	};
+	let (result, _) = migrate_from_indexeddb_with_tuning(&legacy, &opfs, options(), tuning).await;
+	assert!(matches!(result, Err(Error::MigrationFailed(_))), "{result:?}");
+
+	for (what, hide) in hidings() {
+		let result = {
+			let _hidden = hide();
+			migrate_from_indexeddb(&legacy, &opfs, options()).await
+		};
+		let Err(Error::MigrationFailed(message)) = result else {
+			panic!("{what}: a copy that cannot be made again must fail: {result:?}");
+		};
+		assert!(
+			message.contains("cannot be made again") && message.contains("not available"),
+			"{what}: {message}"
+		);
+		// The partial files are removed, the marker stays, and what is there is not a database.
+		let fs = FileSystem::opfs(&opfs).await.expect("the lock was released");
+		let names = fs.list_for_test("");
+		assert!(names.iter().any(|n| n.starts_with("IMPORTING")), "{what}: {names:?}");
+		assert!(fs.list_for_test("db").is_empty(), "{what}: files of the copy are left");
+		let refused =
+			TreeBuilder::with_options(options().with_file_system(fs.clone())).build_async().await;
+		assert!(matches!(refused, Err(Error::MigrationFailed(_))), "{what}: the engine opened it");
+		fs.close().await.unwrap();
+	}
+
+	// IndexedDB is back, and the copy is made.
+	let result = migrate_from_indexeddb(&legacy, &opfs, options()).await;
+	assert_imported(result, &wanted, 0);
+	assert_rows(&database(&opfs).await, &wanted, "after IndexedDB was back");
+	clean_up(&opfs, &legacy).await;
+}
+
+#[wasm_bindgen_test]
+async fn the_readers_and_the_deletion_say_unavailable_where_there_is_no_indexeddb() {
+	let name = unique_name("nothing", "idb");
+	for (what, hide) in hidings() {
+		let _hidden = hide();
+		let source = IdbSource::new(&name);
+		assert!(!surrealkv_compat_indxdb::wasm::is_indexeddb_available(), "{what}");
+		assert!(matches!(source.exists().await, Err(IndexedDbError::Unavailable(_))), "{what}");
+		assert!(
+			matches!(
+				source.read_chunk(None, &ChunkLimits::default()).await,
+				Err(IndexedDbError::Unavailable(_))
+			),
+			"{what}"
+		);
+		assert!(
+			matches!(read_all_from_browser(&name).await, Err(IndexedDbError::Unavailable(_))),
+			"{what}"
+		);
+		let deletion = delete_indexeddb(&name, std::time::Duration::from_millis(100)).await;
+		assert!(matches!(deletion, Err(IndexedDbError::Unavailable(_))), "{what}: {deletion:?}");
+	}
+	// With IndexedDB there, a name that is not there is a name that is not there.
+	assert!(surrealkv_compat_indxdb::wasm::is_indexeddb_available());
+	assert!(!IdbSource::new(&name).exists().await.unwrap());
+	assert_eq!(listed_version(&name).await, None);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The IndexedDB database after the move
+// ---------------------------------------------------------------------------------------------
+
+#[wasm_bindgen_test]
+async fn the_move_leaves_the_source_and_the_helper_removes_it_when_the_application_asks() {
+	let legacy = unique_name("legacy", "idb");
+	let opfs = unique_name("target", "db");
+	let rows = legacy_rows(30);
+	create_legacy(&legacy, 6, &["kv", "other"], &rows).await;
+	let before = snapshot(&legacy).await;
+	let wanted = expected(&rows);
+
+	// The move, and the calls after it, never delete the source.
+	let result = migrate_from_indexeddb(&legacy, &opfs, options()).await;
+	assert_imported(result, &wanted, 0);
+	assert_eq!(listed_version(&legacy).await, Some(6.0), "the move deleted the source");
+	assert_eq!(snapshot(&legacy).await, before);
+	let again = migrate_from_indexeddb(&legacy, &opfs, options()).await;
+	assert_eq!(again.unwrap(), IndexedDbMigration::Existing);
+	assert_eq!(
+		snapshot(&legacy).await,
+		before,
+		"a call that found the database changed the source"
+	);
+
+	// The application has checked its data, and deletes the source.
+	assert_rows(&database(&opfs).await, &wanted, "the database that the application checked");
+	let wait = std::time::Duration::from_secs(10);
+	let deleted = watchdog("the deletion", delete_indexeddb(&legacy, wait)).await;
+	assert_eq!(deleted.unwrap(), IndexedDbDeletion::Deleted);
+	assert_eq!(listed_version(&legacy).await, None, "the database is still listed");
+
+	// The database in the OPFS does not need it: the next call does not look for it.
+	let after = migrate_from_indexeddb(&legacy, &opfs, options()).await;
+	assert_eq!(after.unwrap(), IndexedDbMigration::Existing);
+	assert_rows(&database(&opfs).await, &wanted, "the database after the source was deleted");
+	assert_eq!(listed_version(&legacy).await, None, "a call made the legacy database");
+
+	// A name that is not there is not there, and is not made by asking.
+	let missing = delete_indexeddb(&legacy, wait).await;
+	assert_eq!(missing.unwrap(), IndexedDbDeletion::NotFound);
+	assert_eq!(listed_version(&legacy).await, None, "the deletion made the legacy database");
+	FileSystem::destroy_opfs(&opfs).await.expect("remove the database");
+}
+
+#[wasm_bindgen_test]
+async fn a_deletion_that_a_connection_holds_up_is_blocked_and_completes_when_it_closes() {
+	let legacy = unique_name("legacy", "idb");
+	create_legacy(&legacy, 3, &["kv"], &legacy_rows(5)).await;
+
+	// A client of the legacy store that is open and does not close when it is asked to.
+	let open = factory().open(&legacy).unwrap();
+	wait_for(open.as_ref(), "success").await;
+	let holder: IdbDatabase = open.result().unwrap().unchecked_into();
+
+	let started = js_sys::Date::now();
+	let outcome = delete_indexeddb(&legacy, std::time::Duration::from_millis(300)).await;
+	assert_eq!(outcome.unwrap(), IndexedDbDeletion::Blocked);
+	assert!(js_sys::Date::now() - started >= 250.0, "it did not wait for the time it was given");
+	assert_eq!(listed_version(&legacy).await, Some(3.0), "the database is gone while it is held");
+
+	// The request was not cancelled: the browser deletes the database when the connection is
+	// closed.
+	holder.close();
+	let started = js_sys::Date::now();
+	while listed_version(&legacy).await.is_some() {
+		assert!(
+			js_sys::Date::now() - started < 10_000.0,
+			"the deletion did not complete after the connection was closed"
+		);
+		opfs_common::sleep_ms(25.0).await;
+	}
 }
 
 // ---------------------------------------------------------------------------------------------

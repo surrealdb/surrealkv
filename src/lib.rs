@@ -70,6 +70,15 @@ pub use compaction::leveled::CompactionPriority;
 pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator};
 use sstable::bloom::LevelDBBloomFilter;
 pub use sstable::ribbon::RibbonFilter;
+// What an application calls to remove a legacy IndexedDB database once it has moved it. The
+// move never calls it. It is the helper of the crate that reads the legacy database, under
+// names that say what they are here, with the error that it fails with.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub use surrealkv_compat_indxdb::{
+	delete_database as delete_indexeddb,
+	DeleteOutcome as IndexedDbDeletion,
+	Error as IndexedDbError,
+};
 
 use crate::clock::{DefaultLogicalClock, LogicalClock};
 // The types of `Tree::encryption_status`, hidden with the types they are made of until their

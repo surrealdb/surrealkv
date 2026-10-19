@@ -3,6 +3,17 @@
 //! In a browser, `wasm::IdbSource` reads the object store `kv` of a legacy database in chunks,
 //! and never creates, changes or deletes it. `surrealkv` moves what it reads into a database in the
 //! origin private file system. Outside a browser, [`read_dump`] reads an exported dump.
+//!
+//! A context that has no IndexedDB is reported with [`Error::Unavailable`], and with no other
+//! error: the readers and `delete_database` fail with it where the global scope has no
+//! `indexedDB` or reading it throws, so that a caller can tell "there is no IndexedDB here" from a
+//! failure to read a database that is there.
+//!
+//! Nothing here deletes a database but `delete_database` (WebAssembly only), which an
+//! application calls itself, when the data of a legacy database is safe in the new one and every
+//! connection of its legacy client is closed. It says whether the database was deleted, was not
+//! there, or is blocked by a connection that is still open. The move that `surrealkv` makes never
+//! calls it.
 
 pub mod chunk;
 pub mod dump;
@@ -10,6 +21,9 @@ pub mod error;
 
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
+
+#[cfg(target_arch = "wasm32")]
+pub use wasm::{delete_database, DeleteOutcome};
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
