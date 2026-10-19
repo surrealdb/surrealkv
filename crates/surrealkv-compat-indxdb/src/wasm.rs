@@ -18,11 +18,21 @@
 //! timeout, a cancelled task) does not leave what the browser answers with open, or make a database
 //! that is not there: the request is given listeners that close the connection and abort the
 //! upgrade, since a connection that nobody closes holds up every later upgrade and deletion.
+//!
+//! A context that has no IndexedDB (the global scope has no `indexedDB`, or reading it throws) is
+//! told apart from every other failure: each function here that needs the factory fails with
+//! [`Error::Unavailable`] there, and with that error only. An error from opening or reading a
+//! database that is there is [`Error::Js`], so that a caller that treats "no IndexedDB" as "nothing
+//! to read" never takes a failure of a database for it.
+//!
+//! The reader never deletes a database. [`delete_database`] is the one call here that does, and
+//! only an application calls it, when it has what it needs from the database.
 
 #![cfg(target_arch = "wasm32")]
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::time::Duration;
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -46,28 +56,29 @@ use crate::error::{Error, Result};
 /// The name of the object store that the legacy `indxdb://` store keeps its rows in.
 pub const KV_STORE: &str = "kv";
 
-/// Checks whether IndexedDB is available in the current browser global scope.
+/// Checks whether IndexedDB is available in the current browser global scope: whether the scope
+/// has an `indexedDB` that can be read and is a factory.
 pub fn is_indexeddb_available() -> bool {
 	get_idb_factory().is_ok()
 }
 
+/// The `indexedDB` of the global scope, which a page and every kind of worker has under that name.
+/// It is read from the scope itself, as a script reads it, so that what the scope says is what
+/// counts: [`Error::Unavailable`] if there is none (`undefined`, `null`, or no such property) or
+/// if reading it throws, and [`Error::Js`] for a value that is there and is not a factory.
 fn get_idb_factory() -> Result<IdbFactory> {
 	let global = js_sys::global();
-	if let Ok(window) = global.clone().dyn_into::<web_sys::Window>() {
-		window
-			.indexed_db()
-			.map_err(|e| Error::Js(format!("Failed to access indexedDB: {}", describe(&e))))?
-			.ok_or_else(|| Error::Js("indexedDB is not supported on window".into()))
-	} else if let Ok(worker) = global.dyn_into::<web_sys::WorkerGlobalScope>() {
-		worker
-			.indexed_db()
-			.map_err(|e| {
-				Error::Js(format!("Failed to access indexedDB in worker: {}", describe(&e)))
-			})?
-			.ok_or_else(|| Error::Js("indexedDB is not supported in worker".into()))
-	} else {
-		Err(Error::Js("No browser window or worker global found".into()))
+	let value = js_sys::Reflect::get(&global, &JsValue::from_str("indexedDB"))
+		.map_err(|e| Error::Unavailable(format!("reading indexedDB failed: {}", describe(&e))))?;
+	if value.is_undefined() || value.is_null() {
+		return Err(Error::Unavailable("the global scope has no indexedDB".into()));
 	}
+	value.dyn_into::<IdbFactory>().map_err(|other| {
+		Error::Js(format!(
+			"indexedDB of the global scope is not an IDBFactory: {}",
+			describe(&other)
+		))
+	})
 }
 
 /// The name and the message of a `DOMException`, or what a value that is not one looks like.
@@ -555,6 +566,254 @@ pub async fn read_all_from_browser(db_name: &str) -> Result<Vec<(Vec<u8>, Vec<u8
 		}
 		after = chunk.last;
 	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Deleting a database
+// ---------------------------------------------------------------------------------------------
+
+/// How a request to delete a database ended: see [`delete_database`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeleteOutcome {
+	/// The browser said that it deleted the database, within the time that was given.
+	Deleted,
+	/// There was no database of that name: the browser does not list it, or opening it with no
+	/// version found none. Nothing was created, and no deletion was asked for.
+	NotFound,
+	/// The browser had not deleted the database when the time that was given ran out. The usual
+	/// reason is that a connection to it is still open (a tab, a worker, or a client of the page
+	/// that did not close when it was asked to), which the browser also reports as `blocked`; a
+	/// request that waits behind others in the browser ends in the same way. The request is not
+	/// cancelled, and the browser deletes the database as soon as it can, which is when the last
+	/// of the connections is closed.
+	Blocked,
+}
+
+/// What the promise of a deletion is settled with when the browser says that it is done.
+const DELETED: &str = "deleted";
+/// What the promise of a deadline is settled with when the time has run out.
+const TIMED_OUT: &str = "timed-out";
+
+/// A function of the global scope, which a page and every kind of worker has (`setTimeout`).
+fn global_function(name: &str) -> Result<js_sys::Function> {
+	js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str(name))
+		.ok()
+		.and_then(|function| function.dyn_into::<js_sys::Function>().ok())
+		.ok_or_else(|| Error::Js(format!("the global scope has no {name}")))
+}
+
+/// A timer of the global scope. Its callback is owned here, and the timer is cleared before the
+/// callback is freed, so that a callback is never called after it is gone, whichever way the code
+/// that holds the timer ends.
+struct Timer {
+	id: JsValue,
+	_callback: Closure<dyn FnMut()>,
+}
+
+impl Drop for Timer {
+	fn drop(&mut self) {
+		if let Ok(clear) = global_function("clearTimeout") {
+			let _ = clear.call1(&js_sys::global(), &self.id);
+		}
+	}
+}
+
+/// The delay of `wait` in milliseconds, for `setTimeout`, which takes at most `i32::MAX`.
+fn milliseconds(wait: Duration) -> f64 {
+	f64::from(i32::try_from(wait.as_millis()).unwrap_or(i32::MAX))
+}
+
+/// The time that a call has, from the moment that it was asked: a promise that is settled with
+/// [`TIMED_OUT`] when `wait` has run out, and the timer that settles it. It is made first, before
+/// anything that can wait, so that all the waiting of the call is counted in it, and it is cleared
+/// when this is dropped, on every path out.
+struct Deadline {
+	promise: js_sys::Promise,
+	_timer: Timer,
+}
+
+impl Deadline {
+	fn start(wait: Duration) -> Result<Self> {
+		let set_timeout = global_function("setTimeout")?;
+		let mut late = None;
+		let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+			late = Some(Closure::<dyn FnMut()>::new(move || {
+				let _ = resolve.call1(&JsValue::NULL, &JsValue::from_str(TIMED_OUT));
+			}));
+		});
+		let callback = late.expect("the executor of a promise runs at once");
+		let id = set_timeout
+			.call2(
+				&js_sys::global(),
+				callback.as_ref().unchecked_ref(),
+				&JsValue::from_f64(milliseconds(wait)),
+			)
+			.map_err(|e| Error::Js(format!("Failed to set a timer: {}", describe(&e))))?;
+		Ok(Self {
+			promise,
+			_timer: Timer {
+				id,
+				_callback: callback,
+			},
+		})
+	}
+
+	/// What `work` gives, or `None` if the time ran out first, in which case `work` is dropped
+	/// where it waits. `work` goes first if both are ready.
+	async fn before<T>(&self, work: impl std::future::Future<Output = T>) -> Option<T> {
+		use std::future::Future;
+		use std::task::Poll;
+
+		let mut work = std::pin::pin!(work);
+		let mut expired = std::pin::pin!(JsFuture::from(self.promise.clone()));
+		std::future::poll_fn(|context| {
+			if let Poll::Ready(value) = work.as_mut().poll(context) {
+				return Poll::Ready(Some(value));
+			}
+			if expired.as_mut().poll(context).is_ready() {
+				return Poll::Ready(None);
+			}
+			Poll::Pending
+		})
+		.await
+	}
+}
+
+/// What a request to delete a database is watched with: a promise that is settled by its `success`
+/// or its `error`, and, when it is asked for, a race of that with the time that the call has. The
+/// listeners are owned here and are taken off the request when this is dropped, on every path out:
+/// the answer, an error, and a future that is dropped while it waits.
+struct Deletion<'a> {
+	request: &'a web_sys::IdbOpenDbRequest,
+	promise: js_sys::Promise,
+	listeners: Vec<(&'static str, EventHandler)>,
+}
+
+impl<'a> Deletion<'a> {
+	/// Starts watching `request`, with no await between the request and the listeners, so that no
+	/// event of it goes by unseen.
+	fn watch(request: &'a web_sys::IdbOpenDbRequest) -> Self {
+		let mut listeners = Vec::new();
+		let promise = js_sys::Promise::new(&mut |resolve, reject| {
+			let on_success = Closure::<dyn FnMut(web_sys::Event)>::new(move |_event| {
+				let _ = resolve.call1(&JsValue::NULL, &JsValue::from_str(DELETED));
+			});
+			let on_error = {
+				let request = request.clone();
+				Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+					// The error is the answer of this wait: it is not for the page to report.
+					event.prevent_default();
+					let error = request
+						.error()
+						.ok()
+						.flatten()
+						.map_or_else(|| JsValue::from_str("Unknown error"), JsValue::from);
+					let _ = reject.call1(&JsValue::NULL, &error);
+				})
+			};
+			for (kind, closure) in [("success", on_success), ("error", on_error)] {
+				let _ = request
+					.add_event_listener_with_callback(kind, closure.as_ref().unchecked_ref());
+				listeners.push((kind, closure));
+			}
+		});
+		Self {
+			request,
+			promise,
+			listeners,
+		}
+	}
+
+	/// How the request ended, or `Blocked` if the time of the call ran out first.
+	async fn outcome(&self, name: &str, deadline: &Deadline) -> Result<DeleteOutcome> {
+		let first = js_sys::Promise::race(&js_sys::Array::of2(&self.promise, &deadline.promise));
+		match JsFuture::from(first).await {
+			Ok(answer) if answer.as_string().as_deref() == Some(DELETED) => {
+				Ok(DeleteOutcome::Deleted)
+			}
+			Ok(_) => Ok(DeleteOutcome::Blocked),
+			Err(e) => Err(Error::Js(format!("Failed to delete database {name}: {}", describe(&e)))),
+		}
+	}
+}
+
+impl Drop for Deletion<'_> {
+	fn drop(&mut self) {
+		for (kind, closure) in &self.listeners {
+			let _ = self
+				.request
+				.remove_event_listener_with_callback(kind, closure.as_ref().unchecked_ref());
+		}
+	}
+}
+
+/// Whether the database `name` is there: what `indexedDB.databases()` says, where the browser has
+/// the call, and otherwise what a non-creating open finds. Nothing is created, and a connection
+/// that the open makes is closed before this returns.
+async fn is_there(factory: &IdbFactory, name: &str) -> Result<bool> {
+	match is_listed(factory, name).await {
+		Some(listed) => Ok(listed),
+		None => Ok(open_existing(factory, name).await?.is_some()),
+	}
+}
+
+/// Deletes the IndexedDB database `name`, and says how that ended. Only an application calls it:
+/// nothing in this crate or in `surrealkv` does, the move of a legacy database never deletes the
+/// one that it copies, and it is for the application that has moved one and wants it gone.
+///
+/// **A deleted database cannot be brought back.** Call it when its data is safe somewhere else: for
+/// the legacy `indxdb://` store, after `surrealkv::migrate_from_indexeddb` returned `Imported`
+/// (with no row skipped, or with the skipped rows dealt with) or `Existing`, and after the
+/// application has checked that its data is in the new database. An `Existing` result does not say
+/// how the new database came to be: an application that opened it before it called the move did not
+/// have its data moved. Every connection of the legacy client has to be closed, or has to close
+/// when it is asked to (an `onversionchange` handler that calls `close()`).
+///
+/// * [`DeleteOutcome::NotFound`]: there is no database of that name, and none was made. A name that
+///   is not there is looked for first, since asking the browser to delete one would report success.
+/// * [`DeleteOutcome::Deleted`]: the browser said that the database is gone, within `wait`. A
+///   connection that closes when it hears of the deletion (as every well made client does) does not
+///   hold it up.
+/// * [`DeleteOutcome::Blocked`]: that did not happen within `wait`, which is what a connection that
+///   is still open and did not close causes. **The request is not cancelled**: a request to delete
+///   a database cannot be, and the browser carries it out as soon as the last connection is closed,
+///   whenever that is, also after this call has returned and after the page that made it is gone if
+///   the connection is held by another one.
+///
+/// `wait` is how long this call lasts at the most, from the moment that it was asked: the look for
+/// the database counts in it, and so does the wait for the browser to say that the database is
+/// deleted. It is to the millisecond and at most about twenty-four days, and it runs on the timers
+/// of the global scope, so this works on a page and in a worker, with no runtime. Asking again
+/// while an earlier request is still pending is the case that makes the look take time: in a
+/// browser that has no `indexedDB.databases()` the look is an open, which the browser puts behind
+/// the request that is pending. If `wait` runs out before the browser has answered the look, the
+/// request is made all the same, since it is not known whether the database is there and to ask
+/// for the deletion of one that is not there creates nothing, and the result is `Blocked`. A call
+/// whose future is dropped while it waits takes its listeners and its timer away and holds no
+/// connection; the request that it made goes on, as it cannot be undone.
+///
+/// # Errors
+///
+/// [`Error::Unavailable`] if there is no IndexedDB in this context, and [`Error::Js`] if the
+/// browser failed the request.
+pub async fn delete_database(name: &str, wait: Duration) -> Result<DeleteOutcome> {
+	let factory = get_idb_factory()?;
+	// First of all, so that the look for the database is counted in the time that the call has.
+	let deadline = Deadline::start(wait)?;
+	// A look that the time ran out on is dropped where it waits (the open that it made is answered
+	// later, and is closed and does not create the database), and the request is made without its
+	// answer: the deadline is over, and so the result is `Blocked`.
+	if let Some(there) = deadline.before(is_there(&factory, name)).await {
+		if !there? {
+			return Ok(DeleteOutcome::NotFound);
+		}
+	}
+	let request = factory
+		.delete_database(name)
+		.map_err(|e| Error::Js(format!("Failed to delete database {name}: {}", describe(&e))))?;
+	let deletion = Deletion::watch(&request);
+	deletion.outcome(name, &deadline).await
 }
 
 fn js_value_to_bytes(val: &JsValue, what: &str) -> Result<Vec<u8>> {

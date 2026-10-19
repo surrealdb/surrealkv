@@ -26,12 +26,17 @@ use super::fs_engine_tests::within;
 use super::fs_probe::{Call, ProbeFs, Verdict};
 use crate::error::Result;
 use crate::migrate::indexeddb::{
+	check_account,
 	compare,
+	refusal as row_refusal,
 	run,
+	Counted,
 	ImportReport,
 	ImportTuning,
 	IndexedDbMigration,
 	Mounter,
+	Presence,
+	Refusal,
 	Rows as Summary,
 	Source,
 	Tally as RowTally,
@@ -57,6 +62,13 @@ struct FakeState {
 	/// The rows as the store gives them: in the order of its keys, unless a test says otherwise.
 	rows: Rows,
 	present: bool,
+	/// There is no IndexedDB in this context: the probe says so, and a read fails.
+	unavailable: bool,
+	/// There is no IndexedDB from the probe after this many probes on.
+	unavailable_after: Option<usize>,
+	/// The probe gives this error at this probe, counted from one: any failure of the source
+	/// other than there being no IndexedDB.
+	probe_fails_at: Option<usize>,
 	/// The source is gone after this many reads of a chunk.
 	vanishes_after: Option<usize>,
 	/// The source gives this error at this read of a chunk, counted from one.
@@ -76,6 +88,9 @@ impl FakeSource {
 			state: Mutex::new(FakeState {
 				rows,
 				present: true,
+				unavailable: false,
+				unavailable_after: None,
+				probe_fails_at: None,
 				vanishes_after: None,
 				fails_at: None,
 			}),
@@ -87,6 +102,13 @@ impl FakeSource {
 	fn missing() -> Self {
 		let source = Self::in_order(Vec::new());
 		source.state.lock().unwrap().present = false;
+		source
+	}
+
+	/// A source in a context that has no IndexedDB.
+	fn unavailable() -> Self {
+		let source = Self::missing();
+		source.state.lock().unwrap().unavailable = true;
 		source
 	}
 
@@ -104,6 +126,18 @@ impl FakeSource {
 
 	fn set_present(&self, present: bool) {
 		self.state.lock().unwrap().present = present;
+	}
+
+	fn set_unavailable(&self, unavailable: bool) {
+		self.state.lock().unwrap().unavailable = unavailable;
+	}
+
+	fn unavailable_after(&self, probes: usize) {
+		self.state.lock().unwrap().unavailable_after = Some(probes);
+	}
+
+	fn fail_probe_at(&self, probe: usize) {
+		self.state.lock().unwrap().probe_fails_at = Some(probe);
 	}
 
 	fn set_rows(&self, rows: Rows) {
@@ -125,9 +159,20 @@ impl Source for FakeSource {
 	/// The position of the next row, which the move does not look at.
 	type Cursor = usize;
 
-	async fn exists(&self) -> Result<bool> {
-		self.probes.fetch_add(1, Ordering::SeqCst);
-		Ok(self.state.lock().unwrap().present)
+	async fn presence(&self) -> Result<Presence> {
+		let probe = self.probes.fetch_add(1, Ordering::SeqCst) + 1;
+		let state = self.state.lock().unwrap();
+		if state.probe_fails_at == Some(probe) {
+			return Err(Error::MigrationFailed("the probe of the source failed".to_string()));
+		}
+		if state.unavailable || state.unavailable_after.is_some_and(|probes| probe > probes) {
+			return Ok(Presence::Unavailable);
+		}
+		Ok(if state.present {
+			Presence::Present
+		} else {
+			Presence::Absent
+		})
 	}
 
 	async fn read_chunk(
@@ -142,6 +187,9 @@ impl Source for FakeSource {
 		}
 		if state.fails_at == Some(read) {
 			return Err(Error::MigrationFailed("the source failed".to_string()));
+		}
+		if state.unavailable {
+			return Err(Error::MigrationFailed("IndexedDB is not available".to_string()));
 		}
 		if !state.present {
 			return Ok(None);
@@ -395,9 +443,16 @@ fn weight(rows: &Rows) -> u64 {
 }
 
 fn imported(rows: &Rows) -> IndexedDbMigration {
+	imported_skipping(rows, 0)
+}
+
+/// What a copy of a source that has the rows `written` and `skipped` more that the engine refuses
+/// says.
+fn imported_skipping(written: &Rows, skipped: u64) -> IndexedDbMigration {
 	IndexedDbMigration::Imported {
-		entries: rows.len() as u64,
-		bytes: weight(rows),
+		entries: written.len() as u64,
+		bytes: weight(written),
+		skipped,
 	}
 }
 
@@ -590,7 +645,8 @@ async fn an_empty_store_is_an_empty_database_and_the_next_call_finds_it() {
 		result.unwrap(),
 		IndexedDbMigration::Imported {
 			entries: 0,
-			bytes: 0
+			bytes: 0,
+			skipped: 0
 		}
 	);
 	assert_database(&raw, &options, &Vec::new(), "an empty store").await;
@@ -837,7 +893,7 @@ async fn a_source_that_gives_a_row_twice_with_two_values_fails_the_verification(
 	let Err(Error::MigrationFailed(message)) = result else {
 		panic!("the verification must fail the copy: {result:?}");
 	};
-	assert!(message.contains("61 rows were read") && message.contains("holds 60"), "{message}");
+	assert!(message.contains("61 rows were written") && message.contains("holds 60"), "{message}");
 	assert_wiped_then_copied(&raw, &options, &rows, "a key twice").await;
 }
 
@@ -861,7 +917,7 @@ async fn a_database_that_lost_a_row_after_the_copy_fails_the_verification_and_is
 	let Err(Error::MigrationFailed(message)) = result else {
 		panic!("{result:?}");
 	};
-	assert!(message.contains("60 rows were read") && message.contains("holds 59"), "{message}");
+	assert!(message.contains("60 rows were written") && message.contains("holds 59"), "{message}");
 	assert_wiped_then_copied(&raw, &options(2 * 1024, false), &rows, "a row lost").await;
 }
 
@@ -873,7 +929,7 @@ async fn a_database_with_a_row_more_than_the_source_fails_the_verification_and_i
 	let Err(Error::MigrationFailed(message)) = result else {
 		panic!("{result:?}");
 	};
-	assert!(message.contains("60 rows were read") && message.contains("holds 61"), "{message}");
+	assert!(message.contains("60 rows were written") && message.contains("holds 61"), "{message}");
 	assert_wiped_then_copied(&raw, &options(2 * 1024, false), &rows, "a row more").await;
 }
 
@@ -893,31 +949,648 @@ async fn a_database_with_another_value_of_the_same_length_fails_on_the_digest() 
 }
 
 // ---------------------------------------------------------------------------------------------
-// Errors
+// Rows that the engine refuses
 // ---------------------------------------------------------------------------------------------
 
+/// The value of a row that the engine refuses: something that a log must not show.
+const REFUSED_VALUE: &[u8] = b"a value that is never logged";
+
+/// `good` with a row that has an empty key at each of `positions` of the sequence that results:
+/// the rows that the engine takes, in the order they were in, with those that it refuses among
+/// them.
+fn with_refused_at(good: &Rows, positions: &[usize]) -> Rows {
+	let mut rows = Rows::new();
+	let mut next = good.iter();
+	for at in 0..good.len() + positions.len() {
+		if positions.contains(&at) {
+			rows.push((Vec::new(), REFUSED_VALUE.to_vec()));
+		} else {
+			rows.push(next.next().expect("a row for every position").clone());
+		}
+	}
+	assert!(next.next().is_none());
+	rows
+}
+
+/// A tuning that cuts the source into chunks of four rows and the chunks into transactions of
+/// three.
+fn tuning_of_four_and_three() -> ImportTuning {
+	ImportTuning {
+		read: ChunkLimits::new(usize::MAX, 4),
+		write: ChunkLimits::new(usize::MAX, 3),
+		commit_pause: std::time::Duration::ZERO,
+		abandon_after_chunks: None,
+	}
+}
+
 #[test(tokio::test)]
-async fn a_row_with_an_empty_key_fails_the_copy_with_a_message_and_leaves_no_database() {
+async fn a_row_with_an_empty_key_is_skipped_and_counted_and_the_other_rows_are_copied() {
 	let options = options(2 * 1024, false);
-	let mut rows = small_rows(30);
-	rows.insert(0, (Vec::new(), b"value".to_vec()));
-	let source = FakeSource::new(rows);
+	let good = small_rows(30);
+	let source = FakeSource::in_order(with_refused_at(&good, &[7]));
+	let raw = MemRaw::new();
+
+	let result = small_call(&source, &raw, &options).await;
+	assert_eq!(result.unwrap(), imported_skipping(&good, 1));
+	assert_database(&raw, &options, &good, "a row with an empty key").await;
+
+	// The database is there, and the next call finds it and does not look at the source.
+	let calls = source.calls();
+	assert_eq!(small_call(&source, &raw, &options).await.unwrap(), IndexedDbMigration::Existing);
+	assert_eq!(source.calls(), calls);
+}
+
+#[test(tokio::test)]
+async fn rows_that_the_engine_refuses_are_skipped_wherever_they_are_in_the_source() {
+	let options = options(64 * 1024, false);
+	// Chunks of four rows, in transactions of three: the positions below are the edges of both.
+	let cases: Vec<(&str, usize, Vec<usize>)> = vec![
+		("the first row", 10, vec![0]),
+		("the last row", 10, vec![10]),
+		("a row in the middle", 10, vec![5]),
+		("several rows in a row", 10, vec![4, 5, 6]),
+		("the two ends of a chunk and the two ends of the next", 12, vec![3, 4, 7, 8]),
+		("the last of a chunk and the first of the next", 10, vec![3, 4]),
+		("every row of a transaction", 9, vec![0, 1, 2]),
+		("every row of a chunk, in the middle", 12, vec![4, 5, 6, 7]),
+		("every other row", 10, vec![1, 3, 5, 7, 9]),
+		("the first and the last", 10, vec![0, 11]),
+		("a row alone", 0, vec![0]),
+		("rows alone, more than a chunk of them", 0, vec![0, 1, 2, 3, 4, 5, 6]),
+	];
+	for (what, count, positions) in cases {
+		let good = small_rows(count);
+		let served = with_refused_at(&good, &positions);
+		let source = FakeSource::in_order(served.clone());
+		let raw = MemRaw::new();
+		let (result, report) =
+			call(&source, &MemMounter::new(raw.clone()), &options, &tuning_of_four_and_three())
+				.await;
+		assert_eq!(result.unwrap(), imported_skipping(&good, positions.len() as u64), "{what}");
+		assert_database(&raw, &options, &good, what).await;
+
+		// A transaction is committed if the engine took a row of it: one whose rows were all
+		// refused has nothing to commit.
+		let mut transactions = 0;
+		for chunk in served.chunks(4) {
+			transactions +=
+				chunk.chunks(3).filter(|piece| piece.iter().any(|(k, _)| !k.is_empty())).count();
+		}
+		assert_eq!(report.transactions, transactions, "{what}: transactions");
+
+		// The same source, copied again after the database was removed, is the same copy.
+		assert_eq!(
+			small_call(&source, &raw, &options).await.unwrap(),
+			IndexedDbMigration::Existing,
+			"{what}"
+		);
+	}
+}
+
+#[test(tokio::test)]
+async fn a_source_of_rows_that_the_engine_refuses_only_is_an_empty_database() {
+	let options = options(2 * 1024, false);
+	for count in [1usize, 3, 25] {
+		let source =
+			FakeSource::in_order(with_refused_at(&Vec::new(), &(0..count).collect::<Vec<_>>()));
+		let raw = MemRaw::new();
+		let result = small_call(&source, &raw, &options).await;
+		assert_eq!(
+			result.unwrap(),
+			IndexedDbMigration::Imported {
+				entries: 0,
+				bytes: 0,
+				skipped: count as u64
+			},
+			"{count} rows"
+		);
+		assert_database(&raw, &options, &Vec::new(), "only refused rows").await;
+		assert!(!contents(&raw).files.is_empty(), "an empty database has files, to be found");
+		assert_eq!(
+			small_call(&source, &raw, &options).await.unwrap(),
+			IndexedDbMigration::Existing
+		);
+	}
+}
+
+/// Collects what is logged on this thread while it is held, with the level.
+#[derive(Clone, Default)]
+struct Logged(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+impl tracing::Subscriber for Logged {
+	fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+		true
+	}
+
+	fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+		tracing::span::Id::from_u64(1)
+	}
+
+	fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+	fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+	fn event(&self, event: &tracing::Event<'_>) {
+		struct Message(String);
+		impl tracing::field::Visit for Message {
+			fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+				if field.name() == "message" {
+					self.0 = format!("{value:?}");
+				}
+			}
+		}
+		let mut message = Message(String::new());
+		event.record(&mut message);
+		self.0.lock().unwrap().push((*event.metadata().level(), message.0));
+	}
+
+	fn enter(&self, _: &tracing::span::Id) {}
+
+	fn exit(&self, _: &tracing::span::Id) {}
+}
+
+#[test(tokio::test)]
+async fn a_row_that_is_skipped_is_logged_once_at_warn_with_the_length_of_its_key_only() {
+	let options = options(2 * 1024, false);
+	let good = small_rows(20);
+	let logged = Logged::default();
+	let _guard = tracing::subscriber::set_default(logged.clone());
+	let source = FakeSource::in_order(with_refused_at(&good, &[0, 9, 20]));
+	let raw = MemRaw::new();
+	assert_eq!(small_call(&source, &raw, &options).await.unwrap(), imported_skipping(&good, 3));
+
+	let skipped: Vec<_> = logged
+		.0
+		.lock()
+		.unwrap()
+		.iter()
+		.filter(|(_, message)| message.contains("not copied"))
+		.cloned()
+		.collect();
+	assert_eq!(skipped.len(), 3, "once for each row: {skipped:?}");
+	for (level, message) in &skipped {
+		assert_eq!(*level, tracing::Level::WARN);
+		assert!(message.contains("its key is 0 bytes long"), "{message}");
+		assert!(message.contains("empty"), "the reason: {message}");
+		assert!(!message.contains("never logged"), "the value is not in the log: {message}");
+	}
+}
+
+#[test]
+fn the_engine_refuses_a_row_for_an_empty_key_and_for_its_size_and_for_nothing_that_is_not_the_row()
+{
+	assert_eq!(row_refusal(&Error::EmptyKey), Some(Refusal::EmptyKey));
+	assert_eq!(row_refusal(&Error::BatchTooLarge), Some(Refusal::TooLarge));
+	// What is not about the row fails the copy.
+	let io = Error::Io(Arc::new(std::io::Error::other("a disk")));
+	let full =
+		Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::StorageFull, "the quota")));
+	for error in [
+		io,
+		full,
+		Error::Abort,
+		Error::FilePoolExhausted,
+		Error::PipelineStall,
+		Error::ArenaFull,
+		Error::TransactionClosed,
+		Error::TransactionWriteConflict,
+		Error::DatabaseStopped("stopped".to_string()),
+		Error::InvalidArgument("an argument".to_string()),
+		Error::Other("another".to_string()),
+		Error::Corruption("a block".to_string()),
+		Error::MigrationFailed("a lock".to_string()),
+		Error::CommitFail("a commit".to_string()),
+	] {
+		assert_eq!(row_refusal(&error), None, "{error:?}");
+	}
+}
+
+#[test(tokio::test)]
+async fn the_engine_refuses_an_empty_key_as_the_copy_expects_and_takes_keys_and_values_of_any_size()
+{
+	let options = options(64 * 1024, true);
+	let (pool, _) = PoolFs::<MemRaw>::mount_sync(MemRaw::new(), PoolConfig::memory()).unwrap();
+	let fs = FileSystem(Arc::clone(&pool) as Arc<dyn Fs>);
+	let tree = TreeBuilder::with_options(Options {
+		fs: Arc::clone(&fs.0),
+		..options.clone()
+	})
+	.build_async()
+	.await
+	.unwrap();
+	// What the copy relies on: the refusal is at `set`, with this error, and the transaction goes
+	// on.
+	let mut txn = tree.begin().unwrap();
+	let refused = txn.set(&b""[..], &b"v"[..]).expect_err("an empty key is refused");
+	assert_eq!(row_refusal(&refused), Some(Refusal::EmptyKey), "{refused:?}");
+	txn.set(&b"k"[..], &b"v"[..]).expect("the transaction takes the next row");
+	txn.commit().await.unwrap();
+	tree.close().await.unwrap();
+	fs.close().await.unwrap();
+
+	// Keys and values of every size that a browser holds are taken, so nothing else is skipped: a
+	// key longer than a `u16` can count, a megabyte, and a value of several.
+	let odd: Rows = vec![
+		(vec![0], Vec::new()),
+		(vec![0xff; 300], vec![1]),
+		(vec![7; 70_000], vec![2; 10]),
+		(vec![8; 1_000_000], Vec::new()),
+		(vec![9; 100], vec![3; 5_000_000]),
+	];
+	let mut wanted = odd.clone();
+	wanted.sort();
+	let source = FakeSource::in_order(odd);
+	let raw = MemRaw::new();
+	let result = small_call(&source, &raw, &options).await;
+	assert_eq!(result.unwrap(), imported(&wanted));
+	assert_database(&raw, &options, &wanted, "keys and values of every size").await;
+}
+
+/// How far a sweep of a write that fails goes: past the last write of a copy of the rows of the
+/// test, which is about a hundred.
+const WRITES_OF_A_SMALL_COPY: usize = 400;
+
+#[test(tokio::test)]
+async fn a_commit_that_fails_for_one_row_is_a_failure_of_the_copy_and_never_a_skipped_row() {
+	// A commit of one row that is refused for the size of the row is that row's refusal. A commit
+	// of one row that fails for any other reason (a write that fails, which the quota of the
+	// browser does too) is not: if it were taken for one, rows would be dropped, and the call
+	// would say that it copied the rest. Transactions of one row make every commit one of
+	// those, and a write fails once at each point of the call in turn.
+	let options = options(64 * 1024, false);
+	let rows = small_rows(60);
+	let tuning = ImportTuning {
+		read: ChunkLimits::new(usize::MAX, 9),
+		write: ChunkLimits::new(usize::MAX, 1),
+		commit_pause: std::time::Duration::ZERO,
+		abandon_after_chunks: None,
+	};
+	let (mut complete, mut in_a_commit, mut elsewhere) = (0, 0, 0);
+	let mut dropped_rows = Vec::new();
+	let mut last = None;
+	for at in 0..WRITES_OF_A_SMALL_COPY {
+		let raw = MemRaw::new();
+		raw.fail_write_after(at);
+		let source = FakeSource::new(rows.clone());
+		let (result, _) = call(&source, &MemMounter::new(raw.clone()), &options, &tuning).await;
+		last = Some(result.is_ok());
+		match result {
+			Ok(done) if done == imported(&rows) => complete += 1,
+			Ok(done) => dropped_rows.push((at, format!("{done:?}"))),
+			Err(Error::MigrationFailed(message)) if message.contains("writing rows") => {
+				in_a_commit += 1;
+			}
+			Err(Error::MigrationFailed(_)) => elsewhere += 1,
+			Err(other) => dropped_rows.push((at, format!("not a failure of the copy: {other:?}"))),
+		}
+	}
+	assert!(
+		dropped_rows.is_empty(),
+		"a write that failed once was taken for a row that is skipped, or ended the call another way: {dropped_rows:?}"
+	);
+	// What the sweep shows is what it reached: the commits, and the rest of the call, and the end
+	// of the call, past which a write that fails is never met.
+	assert!(in_a_commit > 0, "no write that failed was met by a commit of one row");
+	assert!(elsewhere > 0, "no write that failed was met outside a commit");
+	assert!(complete > 0 && last == Some(true), "the sweep did not go past the last write");
+}
+
+#[test]
+fn the_account_of_a_copy_must_add_up_to_the_rows_that_were_read() {
+	let rows: [(&[u8], &[u8]); 3] = [(b"a", b"1"), (b"b", b"22"), (b"c", b"")];
+	let account = |read: u64, skipped: u64| Counted {
+		read,
+		skipped,
+		written: tallied(&rows),
+	};
+	check_account(&account(3, 0)).expect("every row was written");
+	check_account(&account(5, 2)).expect("two rows were skipped");
+	let message = |counted: Counted| match check_account(&counted) {
+		Err(Error::MigrationFailed(message)) => message,
+		other => panic!("{other:?}"),
+	};
+	// A lie about the number of rows that were skipped, either way, and a row that was lost.
+	let fewer = message(account(5, 1));
+	assert!(
+		fewer.contains("5 rows were read")
+			&& fewer.contains("3 were written")
+			&& fewer.contains("1 skipped"),
+		"{fewer}"
+	);
+	let more = message(account(5, 3));
+	assert!(more.contains("3 were written") && more.contains("3 skipped"), "{more}");
+	assert!(message(account(2, 0)).contains("2 rows were read"));
+	assert!(message(account(3, u64::MAX)).contains("rows were read"), "no overflow");
+}
+
+#[test(tokio::test)]
+async fn a_copy_with_skipped_rows_is_checked_against_the_rows_that_were_written() {
+	let options = options(2 * 1024, false);
+	let good = small_rows(60);
+	let served = with_refused_at(&good, &[0, 30, 61]);
+
+	// A row lost after the copy, and a row more: the message names what was written.
+	for (change, message_has) in [
+		(Tamper::Delete(good[10].0.clone()), ["60 rows were written", "holds 59"]),
+		(
+			Tamper::Set(b"an extra row".to_vec(), b"v".to_vec()),
+			["60 rows were written", "holds 61"],
+		),
+	] {
+		let source = FakeSource::in_order(served.clone());
+		let raw = MemRaw::new();
+		let mounter = MemMounter::new(raw.clone());
+		mounter.tamper_at_mount(2, change, options.clone());
+		let (result, _) = call(&source, &mounter, &options, &small_tuning()).await;
+		let Err(Error::MigrationFailed(message)) = result else {
+			panic!("{result:?}");
+		};
+		for wanted in message_has {
+			assert!(message.contains(wanted), "{message}");
+		}
+		// The database is removed, and the call that follows makes it, with the same skipped rows.
+		let left = contents(&raw);
+		assert!(left.marker && left.files.is_empty(), "{:?}", left.files);
+		let source = FakeSource::in_order(served.clone());
+		assert_eq!(small_call(&source, &raw, &options).await.unwrap(), imported_skipping(&good, 3));
+		assert_database(&raw, &options, &good, "after the verification failed").await;
+	}
+
+	// Another value of the same length.
+	let (key, value) = good[20].clone();
+	let mut other = value.clone();
+	other[0] ^= 0xff;
+	let source = FakeSource::in_order(served.clone());
+	let raw = MemRaw::new();
+	let mounter = MemMounter::new(raw.clone());
+	mounter.tamper_at_mount(2, Tamper::Set(key, other), options.clone());
+	let (result, _) = call(&source, &mounter, &options, &small_tuning()).await;
+	let Err(Error::MigrationFailed(message)) = result else {
+		panic!("{result:?}");
+	};
+	assert!(message.contains("contents differ") && message.contains("60 rows"), "{message}");
+}
+
+#[test(tokio::test)]
+async fn two_keys_that_are_the_same_bytes_still_fail_the_copy_when_rows_are_skipped_too() {
+	let options = options(2 * 1024, false);
+	let good = small_rows(30);
+	// A string key and a binary key of the same bytes come out of a store as two rows of one key,
+	// and one of them would replace the other: the copy fails, and the skipped rows do not hide it.
+	let mut served = with_refused_at(&good, &[0, 12]);
+	served.push((good[3].0.clone(), b"the other row of that key".to_vec()));
+	let source = FakeSource::in_order(served);
 	let raw = MemRaw::new();
 	let result = small_call(&source, &raw, &options).await;
 	let Err(Error::MigrationFailed(message)) = result else {
 		panic!("{result:?}");
 	};
-	assert!(message.contains("key is empty"), "{message}");
+	assert!(message.contains("rows were written") && message.contains("same key"), "{message}");
 	let left = contents(&raw);
-	assert!(left.marker, "what is there is not a database");
-	assert!(left.files.is_empty(), "the files of the copy were removed: {:?}", left.files);
+	assert!(left.marker && left.files.is_empty(), "{:?}", left.files);
 
-	// The source is mended, and the copy is made.
-	let mended = small_rows(30);
-	source.set_rows(mended.clone());
-	assert_eq!(small_call(&source, &raw, &options).await.unwrap(), imported(&mended));
-	assert_database(&raw, &options, &mended, "a mended source").await;
+	// Two empty keys, a string and a binary one, are both refused: neither replaces the other, and
+	// both are skipped.
+	let source = FakeSource::in_order(with_refused_at(&good, &[0, 1]));
+	let raw = MemRaw::new();
+	assert_eq!(small_call(&source, &raw, &options).await.unwrap(), imported_skipping(&good, 2));
 }
+
+/// Several rows that the engine refuses, among them the first, in the middle, in a row, and the
+/// last: in the order that the source gives them.
+fn refused(vlog: bool) -> Shape {
+	let good = small_rows(12);
+	Shape {
+		name: if vlog {
+			"refused rows, with the value log"
+		} else {
+			"refused rows"
+		},
+		rows: with_refused_at(&good, &[0, 4, 5, 10, 14]),
+		options: options(1024, vlog),
+		tuning: small_tuning(),
+	}
+}
+
+#[test(tokio::test)]
+async fn a_crash_at_every_operation_of_a_copy_with_skipped_rows_is_made_a_database_of_with_the_same_rows_skipped(
+) {
+	for vlog in [false, true] {
+		let shape = refused(vlog);
+		assert_eq!(shape.imported(), imported_skipping(&small_rows(12), 5));
+		let marks = marks_of(&shape).await;
+		let stride = if vlog {
+			2
+		} else {
+			1
+		};
+		let (tally, _) = sweep(&shape, &marks, &every(&marks, stride), true, 8).await;
+		assert_covered(&tally, &marks, shape.name);
+	}
+}
+
+#[test(tokio::test)]
+async fn a_copy_that_was_cut_short_with_skipped_rows_skips_them_again_when_it_is_made_again() {
+	let shape = refused(false);
+	let source = shape.source();
+	let whole = {
+		let raw = MemRaw::new();
+		call(&source, &MemMounter::new(raw), &shape.options, &shape.tuning).await.1.chunks
+	};
+	assert!(whole >= 2, "{whole}");
+	for stop in 1..whole {
+		let raw = MemRaw::new();
+		let tuning = ImportTuning {
+			abandon_after_chunks: Some(stop),
+			..shape.tuning
+		};
+		let (result, _) =
+			call(&source, &MemMounter::new(raw.clone()), &shape.options, &tuning).await;
+		assert!(
+			matches!(result, Err(Error::MigrationFailed(_))),
+			"stopped after {stop}: {result:?}"
+		);
+		let result =
+			call(&source, &MemMounter::new(raw.clone()), &shape.options, &shape.tuning).await;
+		assert_eq!(result.0.unwrap(), shape.imported(), "stopped after {stop}");
+		assert_database(&raw, &shape.options, &shape.written(), "made again").await;
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// A context that has no IndexedDB
+// ---------------------------------------------------------------------------------------------
+
+#[test(tokio::test)]
+async fn without_indexeddb_and_without_a_database_the_call_is_no_source_and_nothing_is_made() {
+	let options = options(4 * 1024, false);
+
+	// No pool at all: nothing is mounted, so nothing is made.
+	let raw = MemRaw::new();
+	let source = FakeSource::unavailable();
+	let mounter = MemMounter::new(raw.clone());
+	let (result, report) = call(&source, &mounter, &options, &small_tuning()).await;
+	assert_eq!(result.unwrap(), IndexedDbMigration::NoSource);
+	assert_eq!(report, ImportReport::default());
+	assert_eq!(mounter.mounts(), 0);
+	assert!(raw.names().is_empty(), "{:?}", raw.names());
+	assert_eq!((source.probes(), source.reads()), (1, 0));
+
+	// A pool that was mounted before and holds nothing: no marker, no file of a database.
+	let held = MemRaw::new();
+	let (pool, _) = PoolFs::<MemRaw>::mount_sync(held.clone(), PoolConfig::memory()).unwrap();
+	FileSystem(pool as Arc<dyn Fs>).close().await.unwrap();
+	let source = FakeSource::unavailable();
+	assert_eq!(small_call(&source, &held, &options).await.unwrap(), IndexedDbMigration::NoSource);
+	assert_eq!((source.probes(), source.reads()), (1, 0));
+	let now = contents(&held);
+	assert!(!now.marker && now.files.is_empty(), "{:?}", now.files);
+
+	// And the application, which starts with a new database, finds it at its next start, as it
+	// does after any other start: the call that follows is `Existing`, with IndexedDB back or not.
+	app_writes(&held, &options, &small_rows(3)).await;
+	for unavailable in [true, false] {
+		let source = FakeSource::new(small_rows(9));
+		source.set_unavailable(unavailable);
+		assert_eq!(
+			small_call(&source, &held, &options).await.unwrap(),
+			IndexedDbMigration::Existing
+		);
+		assert_eq!(source.calls(), 0, "the source is not asked for a database that exists");
+	}
+}
+
+#[test(tokio::test)]
+async fn with_an_unfinished_copy_and_without_indexeddb_the_call_fails_and_no_database_is_made() {
+	let options = options(2 * 1024, false);
+	let rows = small_rows(100);
+	let source = FakeSource::new(rows.clone());
+	let raw = MemRaw::new();
+	let tuning = ImportTuning {
+		abandon_after_chunks: Some(4),
+		..small_tuning()
+	};
+	let (result, _) = call(&source, &MemMounter::new(raw.clone()), &options, &tuning).await;
+	assert!(result.is_err());
+	assert!(!contents(&raw).files.is_empty());
+
+	// IndexedDB is not available at the next start: the partial files are removed, the marker
+	// stays, and the error says that the copy cannot be made again for that reason.
+	source.set_unavailable(true);
+	for _ in 0..3 {
+		let result = small_call(&source, &raw, &options).await;
+		let Err(Error::MigrationFailed(message)) = result else {
+			panic!("the call must fail with a typed error: {result:?}");
+		};
+		assert!(
+			message.contains("cannot be made again")
+				&& message.contains("IndexedDB is not available"),
+			"{message}"
+		);
+		assert!(!message.contains("is not there to be copied"), "{message}");
+		let left = contents(&raw);
+		assert!(left.marker, "the marker stays");
+		assert!(left.files.is_empty(), "no file of a database is left: {:?}", left.files);
+	}
+	// No database opens from what is there.
+	assert!(database(&raw, &options).await.is_none());
+
+	// IndexedDB is back, and the copy is made.
+	source.set_unavailable(false);
+	assert_eq!(small_call(&source, &raw, &options).await.unwrap(), imported(&rows));
+	assert_database(&raw, &options, &rows, "IndexedDB came back").await;
+}
+
+#[test(tokio::test)]
+async fn a_failure_of_the_source_is_never_taken_for_there_being_no_indexeddb() {
+	let options = options(2 * 1024, false);
+	let rows = small_rows(30);
+
+	// The probe fails with no pool: the call fails, and nothing is mounted or made.
+	let raw = MemRaw::new();
+	let source = FakeSource::new(rows.clone());
+	source.fail_probe_at(1);
+	let mounter = MemMounter::new(raw.clone());
+	let (result, _) = call(&source, &mounter, &options, &small_tuning()).await;
+	assert!(
+		matches!(result, Err(Error::MigrationFailed(ref m)) if m.contains("the probe of the source failed")),
+		"{result:?}"
+	);
+	assert_eq!(mounter.mounts(), 0);
+	assert!(raw.names().is_empty(), "{:?}", raw.names());
+	// The next start is not the one that skipped the move: it makes it.
+	assert_eq!(small_call(&source, &raw, &options).await.unwrap(), imported(&rows));
+	assert_database(&raw, &options, &rows, "the call after a failed probe").await;
+
+	// The same in a pool that was made and holds nothing: there the first look is the second one.
+	let held = MemRaw::new();
+	let (pool, _) = PoolFs::<MemRaw>::mount_sync(held.clone(), PoolConfig::memory()).unwrap();
+	FileSystem(pool as Arc<dyn Fs>).close().await.unwrap();
+	let source = FakeSource::new(rows.clone());
+	source.fail_probe_at(1);
+	assert!(matches!(
+		small_call(&source, &held, &options).await,
+		Err(Error::MigrationFailed(ref m)) if m.contains("the probe of the source failed")
+	));
+	let now = contents(&held);
+	assert!(!now.marker && now.files.is_empty(), "{:?}", now.files);
+	assert_eq!(small_call(&source, &held, &options).await.unwrap(), imported(&rows));
+
+	// A failure of the look after the mount, when the look before it found the source.
+	let raw = MemRaw::new();
+	let source = FakeSource::new(rows.clone());
+	source.fail_probe_at(2);
+	assert!(matches!(
+		small_call(&source, &raw, &options).await,
+		Err(Error::MigrationFailed(ref m)) if m.contains("the probe of the source failed")
+	));
+	let now = contents(&raw);
+	assert!(!now.marker && now.files.is_empty(), "{:?}", now.files);
+	assert_eq!(small_call(&source, &raw, &options).await.unwrap(), imported(&rows));
+
+	// With a marker, the failure is a failure too, and no database is made.
+	let raw = MemRaw::new();
+	let source = FakeSource::new(rows.clone());
+	let tuning = ImportTuning {
+		abandon_after_chunks: Some(2),
+		..small_tuning()
+	};
+	let (result, _) = call(&source, &MemMounter::new(raw.clone()), &options, &tuning).await;
+	assert!(result.is_err());
+	source.fail_probe_at(source.probes() + 1);
+	assert!(matches!(
+		small_call(&source, &raw, &options).await,
+		Err(Error::MigrationFailed(ref m)) if m.contains("the probe of the source failed")
+	));
+	assert!(contents(&raw).marker);
+	assert_eq!(small_call(&source, &raw, &options).await.unwrap(), imported(&rows));
+}
+
+#[test(tokio::test)]
+async fn indexeddb_that_goes_away_while_the_call_runs_is_a_failure_and_not_a_new_database() {
+	let options = options(2 * 1024, false);
+	let rows = small_rows(30);
+	let raw = MemRaw::new();
+	let source = FakeSource::new(rows.clone());
+	// There when the call looks first, not there when it looks again after the mount.
+	source.unavailable_after(1);
+	let result = small_call(&source, &raw, &options).await;
+	let Err(Error::MigrationFailed(message)) = result else {
+		panic!("{result:?}");
+	};
+	assert!(message.contains("not any more"), "{message}");
+	let now = contents(&raw);
+	assert!(!now.marker && now.files.is_empty(), "{:?}", now.files);
+
+	// The next call finds it again, and copies.
+	let source = FakeSource::new(rows.clone());
+	assert_eq!(small_call(&source, &raw, &options).await.unwrap(), imported(&rows));
+	assert_database(&raw, &options, &rows, "after IndexedDB came back").await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------------------------
 
 #[test(tokio::test)]
 async fn an_error_of_the_source_is_a_migration_error_and_the_next_call_starts_again() {
@@ -1256,12 +1929,34 @@ const PHASES: [&str; 6] = [
 	"the commit",
 ];
 
-/// A copy to crash: the rows, the options of the database and the size of the pieces.
+/// A copy to crash: the rows, in the order that the source gives them, the options of the database
+/// and the size of the pieces.
 struct Shape {
 	name: &'static str,
 	rows: Rows,
 	options: Options,
 	tuning: ImportTuning,
+}
+
+impl Shape {
+	/// The source of the copy: the rows, in the order that they are in.
+	fn source(&self) -> FakeSource {
+		FakeSource::in_order(self.rows.clone())
+	}
+
+	/// The rows that the database holds once it is made: those of the source that the engine does
+	/// not refuse, in the order of their keys.
+	fn written(&self) -> Rows {
+		let mut rows: Rows = self.rows.iter().filter(|(k, _)| !k.is_empty()).cloned().collect();
+		rows.sort();
+		rows
+	}
+
+	/// What a call of the copy says.
+	fn imported(&self) -> IndexedDbMigration {
+		let skipped = self.rows.iter().filter(|(k, _)| k.is_empty()).count();
+		imported_skipping(&self.written(), skipped as u64)
+	}
 }
 
 /// Where in a call each phase begins, in operations of the memory, from a call that was not
@@ -1304,7 +1999,7 @@ async fn marks_of(shape: &Shape) -> Marks {
 			});
 		}
 	});
-	let source = FakeSource::new(shape.rows.clone());
+	let source = shape.source();
 	let (result, _) = call(&source, &mounter, &shape.options, &shape.tuning).await;
 	result.unwrap();
 	let at = *at.lock().unwrap();
@@ -1329,7 +2024,7 @@ async fn marks_of(shape: &Shape) -> Marks {
 async fn run_until_dead(shape: &Shape, n: u64) -> MemRaw {
 	let raw = MemRaw::new();
 	raw.die_after(n);
-	let source = FakeSource::new(shape.rows.clone());
+	let source = shape.source();
 	let _ = call(&source, &MemMounter::new(raw.clone()), &shape.options, &shape.tuning).await;
 	raw
 }
@@ -1375,19 +2070,22 @@ async fn finish(shape: &Shape, image: &MemRaw, what: &str, tally: &mut Tally, ag
 	} else {
 		tally.with_nothing += 1;
 	}
-	let source = FakeSource::new(shape.rows.clone());
+	let source = shape.source();
 	let (result, _) =
 		call(&source, &MemMounter::new(image.clone()), &shape.options, &shape.tuning).await;
 	match result {
 		Ok(IndexedDbMigration::Imported {
 			entries,
 			bytes,
+			skipped,
+			..
 		}) => {
 			assert_eq!(
-				imported(&shape.rows),
+				shape.imported(),
 				IndexedDbMigration::Imported {
 					entries,
-					bytes
+					bytes,
+					skipped
 				},
 				"{what}"
 			);
@@ -1405,9 +2103,9 @@ async fn finish(shape: &Shape, image: &MemRaw, what: &str, tally: &mut Tally, ag
 		}
 		other => panic!("{what}: the call ended with {other:?}"),
 	}
-	assert_database(image, &shape.options, &shape.rows, what).await;
+	assert_database(image, &shape.options, &shape.written(), what).await;
 	if again {
-		let source = FakeSource::new(shape.rows.clone());
+		let source = shape.source();
 		let (result, _) =
 			call(&source, &MemMounter::new(image.clone()), &shape.options, &shape.tuning).await;
 		assert!(matches!(result, Ok(IndexedDbMigration::Existing)), "{what}: {result:?}");
@@ -1565,7 +2263,7 @@ async fn the_copy_of_thousands_of_rows_rotates_the_log_flushes_tables_and_rolls_
 				});
 			}
 		});
-		let source = FakeSource::new(shape.rows.clone());
+		let source = shape.source();
 		let (result, _) = call(&source, &mounter, &shape.options, &shape.tuning).await;
 		assert_eq!(result.unwrap(), imported(&shape.rows));
 		let (segments, tables, vlog_files) = *made.lock().unwrap();
@@ -1637,7 +2335,7 @@ async fn operations_to_wipe(shape: &Shape, image: &MemRaw) -> u64 {
 			});
 		}
 	});
-	let source = FakeSource::new(shape.rows.clone());
+	let source = shape.source();
 	let _ = call(&source, &mounter, &shape.options, &shape.tuning).await;
 	let at = *first.lock().unwrap();
 	at.expect("the call makes the files of a new copy")
@@ -1655,7 +2353,7 @@ async fn a_crash_while_the_call_removes_an_unfinished_copy_leaves_what_the_next_
 		for m in 0..=window + 1 {
 			let copy = image.snapshot();
 			copy.die_after(m);
-			let source = FakeSource::new(shape.rows.clone());
+			let source = shape.source();
 			let _ =
 				call(&source, &MemMounter::new(copy.clone()), &shape.options, &shape.tuning).await;
 			for (what, again) in images_of(&copy, m, false) {
@@ -1730,7 +2428,7 @@ async fn a_crash_while_the_call_removes_a_copy_that_failed_the_verification_is_m
 		let raw = MemRaw::new();
 		let mounter = MemMounter::new(raw.clone());
 		mounter.tamper_at_mount(2, tamper.clone(), shape.options.clone());
-		let source = FakeSource::new(shape.rows.clone());
+		let source = shape.source();
 		let (result, _) = call(&source, &mounter, &shape.options, &shape.tuning).await;
 		assert!(matches!(result, Err(Error::MigrationFailed(_))), "{result:?}");
 		assert_wiped_then_copied(&raw, &shape.options, &shape.rows, "a copy that failed").await;
@@ -1738,7 +2436,7 @@ async fn a_crash_while_the_call_removes_a_copy_that_failed_the_verification_is_m
 		let raw = MemRaw::new();
 		let mounter = MemMounter::new(raw.clone());
 		mounter.tamper_at_mount(2, tamper.clone(), shape.options.clone());
-		let source = FakeSource::new(shape.rows.clone());
+		let source = shape.source();
 		let _ = call(&source, &mounter, &shape.options, &shape.tuning).await;
 		raw.ops() - mounter.finished()[1]
 	};
@@ -1750,7 +2448,7 @@ async fn a_crash_while_the_call_removes_a_copy_that_failed_the_verification_is_m
 		let mounter = MemMounter::new(raw.clone());
 		mounter.tamper_at_mount(2, tamper.clone(), shape.options.clone());
 		mounter.die_after_mount(2, m);
-		let source = FakeSource::new(shape.rows.clone());
+		let source = shape.source();
 		let _ = call(&source, &mounter, &shape.options, &shape.tuning).await;
 		for (what, image) in images_of(&raw, m, true) {
 			let what = format!("the removal after a failed verification, {what}");
@@ -1766,7 +2464,7 @@ async fn once_the_call_returns_no_crash_brings_the_marker_or_a_partial_database_
 	for vlog in [false, true] {
 		let shape = tiny(vlog);
 		let raw = MemRaw::new();
-		let source = FakeSource::new(shape.rows.clone());
+		let source = shape.source();
 		let (result, _) =
 			call(&source, &MemMounter::new(raw.clone()), &shape.options, &shape.tuning).await;
 		assert_eq!(result.unwrap(), imported(&shape.rows));
@@ -2016,7 +2714,7 @@ async fn a_whole_copy_that_another_page_left_is_checked_against_what_this_call_r
 	let Err(Error::MigrationFailed(message)) = result else {
 		panic!("{result:?}");
 	};
-	assert!(message.contains("40 rows were read") && message.contains("holds 30"), "{message}");
+	assert!(message.contains("40 rows were written") && message.contains("holds 30"), "{message}");
 	assert_wiped_then_copied(&raw, &options, &rows, "another copy").await;
 }
 
@@ -2028,15 +2726,15 @@ async fn a_whole_copy_that_another_page_left_is_checked_against_what_this_call_r
 async fn a_copy_that_fails_removes_the_files_that_it_made_and_keeps_the_marker() {
 	let options = options(2 * 1024, false);
 	let rows = small_rows(80);
-	// Rows are written before each of these fails.
-	let mut with_empty_key = rows.clone();
-	with_empty_key.push((Vec::new(), b"v".to_vec()));
+	// Rows are written before each of these fails. The last fails the verification, at the end.
+	let mut with_key_twice = rows.clone();
+	with_key_twice.push((rows[0].0.clone(), b"another value".to_vec()));
 	let failing_source = FakeSource::new(rows.clone());
 	failing_source.fail_at(5);
 	let vanishing_source = FakeSource::new(rows.clone());
 	vanishing_source.vanish_after(4);
 	let cases = [
-		("an empty key at the end", FakeSource::in_order(with_empty_key)),
+		("a key twice at the end", FakeSource::in_order(with_key_twice)),
 		("an error of the source", failing_source),
 		("a source that goes away", vanishing_source),
 	];
@@ -2123,9 +2821,8 @@ async fn the_engine_does_not_open_a_database_while_a_copy_of_it_is_not_finished(
 
 	// A copy that failed, whose files were removed and whose marker is kept, is refused as well.
 	let raw = MemRaw::new();
-	let mut with_empty_key = rows.clone();
-	with_empty_key.push((Vec::new(), b"v".to_vec()));
-	let failing = FakeSource::in_order(with_empty_key);
+	let failing = FakeSource::new(rows.clone());
+	failing.fail_at(3);
 	assert!(small_call(&failing, &raw, &options).await.is_err());
 	let left = contents(&raw);
 	assert!(left.marker && left.files.is_empty());
@@ -2177,7 +2874,7 @@ fn the_comparison_of_a_copy_names_what_differs_and_compares_the_sequence_of_an_o
 		Err(Error::MigrationFailed(message)) => message,
 		other => panic!("{other:?}"),
 	};
-	assert!(message(&tallied(&rows[..2])).contains("3 rows were read and the database holds 2"));
+	assert!(message(&tallied(&rows[..2])).contains("3 rows were written and the database holds 2"));
 	assert!(
 		message(&tallied(&[(b"a", b"11"), (b"b", b"2"), (b"c", b"")])).contains("bytes of keys"),
 		"one value is shorter"
@@ -2244,13 +2941,13 @@ fn lines_of(text: &str) -> Vec<String> {
 	text.lines().map(str::trim).filter(|line| !line.is_empty()).map(str::to_string).collect()
 }
 
-/// The code of the README that `migrate_from_indexeddb` is called in cannot be built by the
-/// doctests of the crate: it needs a browser. `tests/opfs_migrate_test.rs` holds the same code and
-/// is built for `wasm32-unknown-unknown` (by `wasm-pack test`, and by `cargo check --tests` for
-/// that target), and this fails when the two are not the same, so that the README cannot say
-/// something that does not build.
+/// The code of the README that `migrate_from_indexeddb` and `delete_indexeddb` are called in cannot
+/// be built by the doctests of the crate: it needs a browser. `tests/opfs_migrate_test.rs` holds
+/// the same code and is built for `wasm32-unknown-unknown` (by `wasm-pack test`, and by `cargo
+/// check --tests` for that target), and this fails when the two are not the same, so that the
+/// README cannot say something that does not build.
 #[test]
-fn the_example_of_the_readme_is_the_code_that_the_browser_test_builds() {
+fn the_examples_of_the_readme_are_the_code_that_the_browser_test_builds() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
 	let built = std::fs::read_to_string(root.join("tests/opfs_migrate_test.rs")).unwrap();
@@ -2259,18 +2956,27 @@ fn the_example_of_the_readme_is_the_code_that_the_browser_test_builds() {
 		.split("### Moving data from IndexedDB")
 		.nth(1)
 		.expect("the README has the section on moving data from IndexedDB");
-	let (_, after_fence) =
-		section.split_once("```rust,ignore\n").expect("the section has an example");
-	let (example, _) = after_fence.split_once("```").expect("the example ends");
-	let example = lines_of(example);
-	assert!(example.iter().any(|l| l.contains("migrate_from_indexeddb(")), "{example:?}");
+	// The section ends at the next heading of its own level.
+	let section = section.split("\n### ").next().unwrap();
+	let mut examples = Vec::new();
+	let mut rest = section;
+	while let Some((_, after_fence)) = rest.split_once("```rust,ignore\n") {
+		let (example, after) = after_fence.split_once("```").expect("the example ends");
+		examples.push(lines_of(example));
+		rest = after;
+	}
+	assert_eq!(examples.len(), 2, "the section has the example of the move and of the removal");
+	assert!(examples[0].iter().any(|l| l.contains("migrate_from_indexeddb(")), "{:?}", examples[0]);
+	assert!(examples[1].iter().any(|l| l.contains("delete_indexeddb(")), "{:?}", examples[1]);
 
 	let built = lines_of(&built);
-	let found = built.windows(example.len()).any(|window| window == example.as_slice());
-	assert!(
-		found,
-		"the example of the README is not in tests/opfs_migrate_test.rs, where it is built for a \
-		 browser, line for line (indentation aside):\n{}",
-		example.join("\n")
-	);
+	for example in examples {
+		let found = built.windows(example.len()).any(|window| window == example.as_slice());
+		assert!(
+			found,
+			"an example of the README is not in tests/opfs_migrate_test.rs, where it is built for a \
+			 browser, line for line (indentation aside):\n{}",
+			example.join("\n")
+		);
+	}
 }

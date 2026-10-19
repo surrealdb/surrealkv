@@ -20,11 +20,45 @@
 //!
 //! * a marker means that an earlier call did not finish. Every file of the database is removed, and
 //!   the copy is made again from the source, which was not touched. If the source is gone by then,
-//!   the call fails and the marker stays, so that a database that is not there is never taken for
-//!   an empty one;
+//!   or IndexedDB is not available, the call fails and the marker stays, so that a database that is
+//!   not there is never taken for an empty one;
 //! * no marker and a database means that the application has its database, and whatever the source
 //!   holds, it is not read, and nothing is written;
-//! * no marker and no database is a copy to be made, if there is a source.
+//! * no marker and no database is a copy to be made, if there is a source. If there is none, or
+//!   IndexedDB is not available, there is nothing to copy and the application starts with a new
+//!   database.
+//!
+//! # When IndexedDB is not available
+//!
+//! A context that has no IndexedDB (the global scope has no `indexedDB`, or reading it throws) is
+//! told apart by the reader of the source, which gives it as its own error, and a source reports it
+//! as `Presence::Unavailable`. It means that there is no database to read, and it is not an
+//! error: with no database and no marker, the call is [`IndexedDbMigration::NoSource`]. Nothing
+//! else is taken for it. A failure to open or to read a database that is there stays a failure,
+//! since an application that started with a new database after it would find that database at the
+//! next start, and never read IndexedDB again: a move must not be skipped for good because of a
+//! failure that passes. With a marker the call fails, since the copy that was begun cannot be made
+//! again without a source, and a database that is not there is never taken for an empty one.
+//!
+//! The result does not tell the two causes of `NoSource` apart: a database that is not there, and
+//! no IndexedDB in this context. The database that the application starts with is found by the next
+//! call, which is `Existing` and does not read IndexedDB, so where IndexedDB held data and could
+//! not be reached, the data is not moved at a later start. An application that needs to know looks
+//! at `indexedDB` of its worker before the call (in a `try`: reading it throws where the browser
+//! blocks it).
+//!
+//! # Rows that the engine refuses
+//!
+//! A row that the engine refuses for a reason of the row itself, which no state of the database
+//! changes, is left out of the copy: it is skipped, logged once at `warn` with the length of its
+//! key and the reason (never what it holds), and counted in the result. The rows that the engine
+//! can refuse are those with an empty key, and a single row that is larger than one commit can hold
+//! (a batch encodes to at most `u32::MAX` bytes, so such a row is some four gigabytes, which a
+//! browser cannot hold). A refusal is the same on every call, so a copy that is made again skips
+//! the same rows, and a crash changes nothing about that. An error that is not about the row (I/O,
+//! the quota, a pool with no free file, a lock, a task that was cancelled) fails the copy, as it
+//! did. The copy is checked against the rows that were written: the database must hold exactly
+//! those, and those and the skipped rows must be the rows that were read.
 //!
 //! The marker is removed only after every file of the database was made durable, one by one: a
 //! flush of a file in a pool covers that file and no other, so the removal of the marker, which is
@@ -88,21 +122,29 @@ const COMMIT_PAUSE: Duration = Duration::from_millis(10);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum IndexedDbMigration {
-	/// There is no database to open and no IndexedDB database to copy: nothing was made, and the
-	/// application starts with an empty database.
+	/// There is no database to open and nothing to copy: there is no IndexedDB database with the
+	/// object store to read, or no IndexedDB in this context at all. Nothing was made, and the
+	/// application starts with a new, empty database. The two cases are not told apart, and the
+	/// database that the application makes is `Existing` for every later call, which does not read
+	/// IndexedDB: data that was there and could not be reached is not moved at a later start.
 	NoSource,
 	/// The database is there already, and this call did not change it. Nothing was read from
 	/// IndexedDB, but for one case: another page finished a copy while this call was checking its
 	/// own, and this call, which had read the rows, left the database of that page as it was.
 	Existing,
 	/// The rows of the IndexedDB database were copied into a database that did not exist, and the
-	/// copy was checked: the database holds the same rows, and no others.
+	/// copy was checked: the database holds the rows that were written, and no others.
+	#[non_exhaustive]
 	Imported {
 		/// How many rows were copied. An IndexedDB database that has the object store and no row
 		/// in it is a copy of none, and the database that it makes is empty.
 		entries: u64,
 		/// The length of the keys and of the values of those rows, added up.
 		bytes: u64,
+		/// How many rows of the IndexedDB database were not copied because the engine refuses
+		/// them: a row with an empty key is the one that there is. They are not in the database.
+		/// They are still in IndexedDB, which is not changed.
+		skipped: u64,
 	},
 }
 
@@ -144,15 +186,28 @@ pub struct ImportReport {
 	pub transactions: usize,
 }
 
+/// What a source says when it is asked whether it is there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Presence {
+	/// The database and its store are there.
+	Present,
+	/// They are not: there is no such database, or it has no such store.
+	Absent,
+	/// There is no IndexedDB in this context (see the module): nothing is known of any database,
+	/// and there is none to read. Only that, and not an error of opening or of reading a database.
+	Unavailable,
+}
+
 /// The IndexedDB database that is moved, as far as the move needs to see it.
 pub(crate) trait Source {
 	/// Where the next read continues from: whatever the source gave with the last row. The move
 	/// never looks inside it.
 	type Cursor;
 
-	/// Whether the database and its store are there. A source that is not there is not made by
-	/// asking.
-	async fn exists(&self) -> Result<bool>;
+	/// Whether the database and its store are there, or there is no IndexedDB at all. A source
+	/// that is not there is not made by asking. Any error of the source, another than there being
+	/// no IndexedDB, is an `Err`, and fails the call.
+	async fn presence(&self) -> Result<Presence>;
 
 	/// The chunk of rows after `after`, or from the first row if there is none. `None` if the
 	/// source is gone.
@@ -421,9 +476,9 @@ fn remove_marker(fs: &dyn Fs) -> io::Result<()> {
 ///   is all that can be compared, and a verification must not fail a copy for the order.
 /// * `ascending` is whether every key was greater than the one before as bytes, which is the order
 ///   of a database whatever the source did: the rows of the database must be so, and so must the
-///   rows that were read, if they are to be compared in sequence.
+///   rows that were written, if they are to be compared in sequence.
 /// * `chain` is a hash of the rows in the sequence that they came in. It is compared when the rows
-///   that were read are ascending too, and then the two sequences are the same sequence.
+///   that were written are ascending too, and then the two sequences are the same sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Rows {
 	pub(crate) entries: u64,
@@ -490,26 +545,47 @@ impl Tally {
 	}
 }
 
-/// `Ok` if the database holds what was read, and the error that names what differs if not.
-pub(crate) fn compare(read: &Rows, found: &Rows) -> Result<()> {
+/// What a copy did with the rows that it read: how many it read, how many the engine refused (and
+/// so were left out), and what it wrote.
+pub(crate) struct Counted {
+	pub(crate) read: u64,
+	pub(crate) skipped: u64,
+	pub(crate) written: Rows,
+}
+
+/// `Ok` if the rows that were written and the rows that were skipped are the rows that were read,
+/// and the error that names the three counts if not: a row of the source that is neither is a row
+/// that the copy lost, and one that is both was counted twice.
+pub(crate) fn check_account(counted: &Counted) -> Result<()> {
+	if counted.written.entries.checked_add(counted.skipped) == Some(counted.read) {
+		return Ok(());
+	}
+	Err(Error::MigrationFailed(format!(
+		"the copy does not account for the rows of the source: {} rows were read, and {} were written and {} skipped",
+		counted.read, counted.written.entries, counted.skipped
+	)))
+}
+
+/// `Ok` if the database holds what was written, and the error that names what differs if not.
+pub(crate) fn compare(written: &Rows, found: &Rows) -> Result<()> {
 	let hint =
 		"if the database holds fewer, two rows of the source have the same key once it is bytes";
-	if read.entries != found.entries {
+	if written.entries != found.entries {
 		return Err(Error::MigrationFailed(format!(
-			"the copy does not match the source: {} rows were read and the database holds {} ({hint})",
-			read.entries, found.entries
+			"the copy does not match the source: {} rows were written and the database holds {} ({hint})",
+			written.entries, found.entries
 		)));
 	}
-	if read.bytes != found.bytes {
+	if written.bytes != found.bytes {
 		return Err(Error::MigrationFailed(format!(
-			"the copy does not match the source: the {} rows read are {} bytes of keys and values, and the database holds {}",
-			read.entries, read.bytes, found.bytes
+			"the copy does not match the source: the {} rows written are {} bytes of keys and values, and the database holds {}",
+			written.entries, written.bytes, found.bytes
 		)));
 	}
-	if read.sum != found.sum {
+	if written.sum != found.sum {
 		return Err(Error::MigrationFailed(format!(
 			"the copy does not match the source: the database holds {} rows like the source, and their contents differ (digest {:016x} against {:016x})",
-			read.entries, found.sum, read.sum
+			written.entries, found.sum, written.sum
 		)));
 	}
 	// The rows of a database are in the order of their keys. A database that gives them in another
@@ -522,10 +598,10 @@ pub(crate) fn compare(read: &Rows, found: &Rows) -> Result<()> {
 	}
 	// A source that gave its keys in the order of the bytes is compared in sequence. One that did
 	// not (a store of strings or of keys of several types) has only had its rows compared as a set.
-	if read.ascending && read.chain != found.chain {
+	if written.ascending && written.chain != found.chain {
 		return Err(Error::MigrationFailed(format!(
-			"the copy does not match the source: the {} rows of the database, in the order of their keys, are not the rows that were read (digest of the sequence {:016x} against {:016x})",
-			read.entries, found.chain, read.chain
+			"the copy does not match the source: the {} rows of the database, in the order of their keys, are not the rows that were written (digest of the sequence {:016x} against {:016x})",
+			written.entries, found.chain, written.chain
 		)));
 	}
 	Ok(())
@@ -540,49 +616,107 @@ fn is_passing(error: &Error) -> bool {
 	matches!(error, Error::PipelineStall | Error::WriteStall { .. } | Error::FilePoolExhausted)
 }
 
-/// What a transaction that cannot take a row says: an empty key is a fault of the source, which the
-/// database cannot hold, and anything else is the engine's.
-fn row_error(error: Error) -> Error {
+/// Why the engine refuses a row: a reason of the row itself, which nothing else about the engine or
+/// the database changes, so that a refused row is refused again by every call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refusal {
+	/// The key is empty.
+	EmptyKey,
+	/// The row, alone in a commit, is more than a commit can hold.
+	TooLarge,
+}
+
+impl Refusal {
+	fn reason(self) -> &'static str {
+		match self {
+			Self::EmptyKey => "its key is empty, which a SurrealKV database cannot hold",
+			Self::TooLarge => "it is larger than a commit can hold",
+		}
+	}
+}
+
+/// Whether `error`, from a transaction that was given a row, is the engine refusing that row, and
+/// why. Anything else is not about the row: an I/O error, the quota, a pool that has no free file,
+/// a lock, a task that was cancelled, a database that stopped.
+///
+/// What the engine refuses of a key and a value is two things. `Transaction::set` refuses an empty
+/// key. A commit refuses a batch that would encode to more bytes than one WAL record holds
+/// (`BatchTooLarge`), which, for a transaction that holds one row, is that row: such a row is some
+/// four gigabytes, more than a browser can hold, so this is for the sake of the rule. The length of
+/// a key or of a value is not otherwise limited, and no prefix of a key is reserved.
+pub(crate) fn refusal(error: &Error) -> Option<Refusal> {
 	match error {
-		Error::EmptyKey => Error::MigrationFailed(
-			"the source has a row whose key is empty, which a SurrealKV database cannot hold"
-				.to_string(),
-		),
-		other => failed("writing a row", other),
+		Error::EmptyKey => Some(Refusal::EmptyKey),
+		Error::BatchTooLarge => Some(Refusal::TooLarge),
+		_ => None,
 	}
 }
 
 /// Commits `batch` in one transaction, again as often as the engine says that it cannot take it
-/// yet. A transaction that failed to commit is closed, so each try is a new one.
+/// yet, and says for each row whether the engine refused it, and why. A row that the engine refuses
+/// is left out of the transaction, and the others are committed. A transaction that failed to
+/// commit is closed, so each try is a new one, which refuses the same rows again: what is counted
+/// and logged is the outcome of the last try, by the caller.
 async fn commit_batch(
 	tree: &Tree,
 	batch: &[(Vec<u8>, Vec<u8>)],
 	tuning: &ImportTuning,
-) -> Result<()> {
+) -> Result<Vec<Option<Refusal>>> {
 	let mut attempt = 1;
 	loop {
 		let mut txn = tree.begin().map_err(|e| failed("beginning a transaction", e))?;
 		txn.set_durability(Durability::Eventual);
+		let mut refused = Vec::with_capacity(batch.len());
 		for (key, value) in batch {
-			txn.set(&key[..], &value[..]).map_err(row_error)?;
+			match txn.set(&key[..], &value[..]) {
+				Ok(()) => refused.push(None),
+				Err(e) => match refusal(&e) {
+					Some(why) => refused.push(Some(why)),
+					None => return Err(failed("writing a row", e)),
+				},
+			}
+		}
+		let taken = refused.iter().filter(|why| why.is_none()).count();
+		if taken == 0 {
+			// Every row was refused: there is nothing to commit.
+			txn.rollback();
+			return Ok(refused);
 		}
 		match txn.commit().await {
-			Ok(()) => return Ok(()),
+			Ok(()) => return Ok(refused),
 			Err(e) if is_passing(&e) && attempt < COMMIT_ATTEMPTS => {
 				attempt += 1;
 				crate::rt::sleep(tuning.commit_pause).await;
+			}
+			// A commit that is refused for the size of what it holds, and holds one row, is refused
+			// for that row. With more than one it is not known which row it is, and it is a
+			// failure.
+			Err(e) if taken == 1 && refusal(&e).is_some() => {
+				let at = refused.iter().position(Option::is_none).expect("one row was taken");
+				refused[at] = refusal(&e);
+				return Ok(refused);
 			}
 			Err(e) => return Err(failed("writing rows to the database", e)),
 		}
 	}
 }
 
-/// Writes `entries` in transactions of the size that `tuning` says, and counts them.
+/// What a copy has done with the rows that it read so far.
+struct Progress {
+	read: u64,
+	skipped: u64,
+	written: Tally,
+}
+
+/// Writes `entries` in transactions of the size that `tuning` says, and counts them: the rows that
+/// the engine took go into the tally of what was written, and each row that it refused is skipped,
+/// logged once, and counted.
 async fn write_chunk(
 	tree: &Tree,
 	entries: Vec<(Vec<u8>, Vec<u8>)>,
 	tuning: &ImportTuning,
 	report: &mut ImportReport,
+	progress: &mut Progress,
 ) -> Result<()> {
 	let mut rest = entries.into_iter().peekable();
 	while rest.peek().is_some() {
@@ -601,30 +735,50 @@ async fn write_chunk(
 				break;
 			}
 		}
-		commit_batch(tree, &batch, tuning).await?;
-		report.transactions += 1;
+		let refused = commit_batch(tree, &batch, tuning).await?;
+		if refused.iter().any(Option::is_none) {
+			report.transactions += 1;
+		}
+		for ((key, value), why) in batch.iter().zip(refused) {
+			match why {
+				None => progress.written.add(key, value),
+				Some(why) => {
+					progress.skipped += 1;
+					tracing::warn!(
+						"a row of the IndexedDB database is not copied, the engine refuses it: {}; its key is {} bytes long",
+						why.reason(),
+						key.len()
+					);
+				}
+			}
+		}
 	}
 	Ok(())
 }
 
 /// How the reading and writing of the rows ended, when it did not fail.
 enum Copied {
-	/// Every row of the source was written, and the tree was closed and so flushed. What was read.
-	Whole(Rows),
+	/// Every row of the source was written or skipped, and the tree was closed and so flushed.
+	/// What was done with the rows.
+	Whole(Counted),
 	/// The tuning said to stop, as a worker that dies stops: nothing was flushed, and nothing is
 	/// removed. After this many chunks.
 	CutShort(usize),
 }
 
 /// Reads the source to its end, chunk by chunk, and writes each chunk before the next is read.
-/// Returns what was read, or `None` if the tuning says to stop before the end.
+/// Returns what was done with the rows, or `None` if the tuning says to stop before the end.
 async fn write_all<S: Source>(
 	source: &S,
 	tree: &Tree,
 	tuning: &ImportTuning,
 	report: &mut ImportReport,
-) -> Result<Option<Rows>> {
-	let mut read = Tally::new();
+) -> Result<Option<Counted>> {
+	let mut progress = Progress {
+		read: 0,
+		skipped: 0,
+		written: Tally::new(),
+	};
 	let mut after: Option<S::Cursor> = None;
 	loop {
 		let chunk = source.read_chunk(after.as_ref(), &tuning.read).await?.ok_or_else(|| {
@@ -638,16 +792,18 @@ async fn write_all<S: Source>(
 				"the IndexedDB database gave an empty chunk before its end".to_string(),
 			));
 		}
-		for (key, value) in &chunk.entries {
-			read.add(key, value);
-		}
+		progress.read += chunk.entries.len() as u64;
 		let (done, last) = (chunk.done, chunk.last);
-		write_chunk(tree, chunk.entries, tuning, report).await?;
+		write_chunk(tree, chunk.entries, tuning, report, &mut progress).await?;
 		if tuning.abandon_after_chunks.is_some_and(|n| report.chunks >= n) {
 			return Ok(None);
 		}
 		if done {
-			return Ok(Some(read.finish()));
+			return Ok(Some(Counted {
+				read: progress.read,
+				skipped: progress.skipped,
+				written: progress.written.finish(),
+			}));
 		}
 		if last.is_none() {
 			return Err(Error::MigrationFailed(
@@ -670,9 +826,9 @@ async fn copy<S: Source>(
 ) -> Result<Copied> {
 	let tree = open_tree(files, options).await?;
 	match write_all(source, tree.tree(), tuning, report).await {
-		Ok(Some(read)) => {
+		Ok(Some(counted)) => {
 			tree.close().await.map_err(|e| failed("closing the database", e))?;
-			Ok(Copied::Whole(read))
+			Ok(Copied::Whole(counted))
 		}
 		// Dropped, and so let go as a crash lets go.
 		Ok(None) => Ok(Copied::CutShort(report.chunks)),
@@ -762,8 +918,8 @@ async fn import<S: Source, M: Mounter>(
 	// Before any other file of the database: the marker, durably.
 	write_marker(first.dyn_fs()).map_err(|e| failed("making the marker of the copy", e))?;
 
-	let read = match copy(source, &first, options, tuning, report).await {
-		Ok(Copied::Whole(read)) => read,
+	let counted = match copy(source, &first, options, tuning, report).await {
+		Ok(Copied::Whole(counted)) => counted,
 		Ok(Copied::CutShort(chunks)) => {
 			return Err(Error::MigrationFailed(format!(
 				"stopped after {chunks} chunks, as a worker that dies would"
@@ -794,13 +950,18 @@ async fn import<S: Source, M: Mounter>(
 			))
 		};
 	}
+	// What was read is what was written and what was skipped, and the database holds what was
+	// written. The first needs no look at the database, and is tested first.
+	if let Err(mismatch) = check_account(&counted) {
+		return Err(discard(second, mismatch).await);
+	}
 	let found = match scan(&second, options).await {
 		Ok(found) => found,
 		Err(e) => return Err(discard(second, e).await),
 	};
-	if let Err(mismatch) = compare(&read, &found) {
-		// The database is not what the source was: remove it, and say so. The marker stays, so
-		// that nothing takes what is left for a database if this is interrupted.
+	if let Err(mismatch) = compare(&counted.written, &found) {
+		// The database is not what was written: remove it, and say so. The marker stays, so that
+		// nothing takes what is left for a database if this is interrupted.
 		return Err(discard(second, mismatch).await);
 	}
 
@@ -815,8 +976,9 @@ async fn import<S: Source, M: Mounter>(
 		tracing::warn!("closing the files after a copy from IndexedDB failed: {e}");
 	}
 	Ok(IndexedDbMigration::Imported {
-		entries: read.entries,
-		bytes: read.bytes,
+		entries: counted.written.entries,
+		bytes: counted.written.bytes,
+		skipped: counted.skipped,
 	})
 }
 
@@ -833,9 +995,15 @@ pub(crate) async fn run<S: Source, M: Mounter>(
 
 	// A pool that is not there is not made to find out that it is empty. The answer only spares
 	// that: once the files are mounted, what is in them is looked at, whatever this said, because
-	// another page may have made them, and used them, since.
-	if !present && !source.exists().await? {
-		return Ok(IndexedDbMigration::NoSource);
+	// another page may have made them, and used them, since. A pool that is not there has no
+	// marker and no database, so a source that is not there, or that cannot be, leaves nothing to
+	// do.
+	let mut looked = None;
+	if !present {
+		match source.presence().await? {
+			Presence::Present => looked = Some(Presence::Present),
+			Presence::Absent | Presence::Unavailable => return Ok(IndexedDbMigration::NoSource),
+		}
 	}
 
 	let first = mount(mounter).await?;
@@ -843,26 +1011,54 @@ pub(crate) async fn run<S: Source, M: Mounter>(
 	if found.marker {
 		// An earlier call did not finish, and what it made is not a database.
 		wipe(first.dyn_fs()).map_err(|e| failed("removing the files of an unfinished copy", e))?;
-		if !source.exists().await? {
-			let _ = first.close().await;
-			return Err(Error::MigrationFailed(
-				"an earlier copy of the IndexedDB database was not finished, its files were removed, \
-				 and the IndexedDB database is not there to be copied again. No database was made. \
-				 Remove the files of the database (FileSystem::destroy_opfs) to start without one"
-					.to_string(),
-			));
-		}
-		return import(source, mounter, first, options, tuning, report).await;
+		return match source.presence().await? {
+			Presence::Present => import(source, mounter, first, options, tuning, report).await,
+			Presence::Absent => {
+				let _ = first.close().await;
+				Err(Error::MigrationFailed(
+					"an earlier copy of the IndexedDB database was not finished, its files were removed, \
+					 and the IndexedDB database is not there to be copied again. No database was made. \
+					 Remove the files of the database (FileSystem::destroy_opfs) to start without one"
+						.to_string(),
+				))
+			}
+			Presence::Unavailable => {
+				let _ = first.close().await;
+				Err(Error::MigrationFailed(
+					"an earlier copy of the IndexedDB database was not finished, its files were removed, \
+					 and the copy cannot be made again because IndexedDB is not available in this \
+					 context. No database was made. Call again where IndexedDB is available, or remove \
+					 the files of the database (FileSystem::destroy_opfs) to start without one"
+						.to_string(),
+				))
+			}
+		};
 	}
 	if found.database {
 		let _ = first.close().await;
 		return Ok(IndexedDbMigration::Existing);
 	}
-	if !source.exists().await? {
-		let _ = first.close().await;
-		return Ok(IndexedDbMigration::NoSource);
+	match source.presence().await? {
+		Presence::Present => import(source, mounter, first, options, tuning, report).await,
+		Presence::Absent => {
+			let _ = first.close().await;
+			Ok(IndexedDbMigration::NoSource)
+		}
+		// IndexedDB was there when the call began and is not now: not a source that is not
+		// there, which is nothing to copy, and a copy that is skipped for good if it is taken so.
+		Presence::Unavailable if looked == Some(Presence::Present) => {
+			let _ = first.close().await;
+			Err(Error::MigrationFailed(
+				"IndexedDB was available when the call began and is not any more. No database was \
+				 made. Calling again makes the copy"
+					.to_string(),
+			))
+		}
+		Presence::Unavailable => {
+			let _ = first.close().await;
+			Ok(IndexedDbMigration::NoSource)
+		}
 	}
-	import(source, mounter, first, options, tuning, report).await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -886,8 +1082,15 @@ mod browser {
 	impl Source for IndexedDb {
 		type Cursor = JsValue;
 
-		async fn exists(&self) -> Result<bool> {
-			self.0.exists().await.map_err(|e| failed("looking for the IndexedDB database", e))
+		async fn presence(&self) -> Result<Presence> {
+			match self.0.exists().await {
+				Ok(true) => Ok(Presence::Present),
+				Ok(false) => Ok(Presence::Absent),
+				// The one error that is not a failure: there is no IndexedDB here. An error of
+				// opening or of reading a database is another one, and fails the call.
+				Err(surrealkv_compat_indxdb::Error::Unavailable(_)) => Ok(Presence::Unavailable),
+				Err(e) => Err(failed("looking for the IndexedDB database", e)),
+			}
 		}
 
 		async fn read_chunk(
@@ -932,31 +1135,46 @@ mod browser {
 	/// `Error::MigrationFailed` that names the unfinished copy: what is there is part of a
 	/// copy, which the next call removes and makes again.
 	///
-	/// * [`IndexedDbMigration::NoSource`]: there is no database called `opfs`, and no IndexedDB
-	///   database called `indexeddb` with an object store `kv`. Nothing was made, and the
-	///   application starts with a database of its own.
+	/// * [`IndexedDbMigration::NoSource`]: there is no database called `opfs`, and nothing to copy:
+	///   no IndexedDB database called `indexeddb` with an object store `kv`, or no IndexedDB in
+	///   this context at all (there is no `indexedDB` in the global scope, or reading it throws, as
+	///   in a context where the browser blocks storage). Nothing was made, and the application
+	///   starts with a new database of its own. Only that is taken for "no IndexedDB": an error
+	///   from opening or reading a database that is there fails the call, since an application that
+	///   started with a new database after it would find that database at the next start, and never
+	///   read IndexedDB again. For the same reason the call does not tell the two causes apart, and
+	///   a database that was started with where IndexedDB could not be reached is not filled from
+	///   it at a later start: an application that needs to know reads `indexedDB` of its worker
+	///   before it calls, in a `try`, since reading it throws where the browser blocks it.
 	/// * [`IndexedDbMigration::Existing`]: the database `opfs` is there, and was not changed.
 	///   IndexedDB was not looked at. This is the answer of every call after the first, and of one
 	///   that comes after the application opened the database itself, which it should not have (the
 	///   data of IndexedDB is not moved in that case).
-	/// * [`IndexedDbMigration::Imported`]: the rows were copied, and the copy was checked against
-	///   what was read: the database holds the same rows, and no others.
+	/// * [`IndexedDbMigration::Imported`]: the rows were copied, and the copy was checked: the
+	///   database holds the rows that were written, and no others, and those and the rows that were
+	///   skipped are the rows that were read. `skipped` is the number of rows that the engine
+	///   refuses, which are left out: a row with an empty key (IndexedDB allows one, as a string
+	///   and as bytes). Each is logged at `warn` with the length of its key and the reason, and is
+	///   still in IndexedDB.
 	///
 	/// The IndexedDB database is only read: it is not created, changed or deleted, by a success
-	/// either, and it is left for the application to remove when it wants to. Do not write to it
-	/// while it is copied.
+	/// either. The application removes it when it wants to, with [`crate::delete_indexeddb`] or
+	/// otherwise, once it has what it needs from it. Do not write to it while it is copied.
 	///
 	/// A call that was interrupted (the page was closed, the worker was terminated, the power went)
 	/// leaves a marker file in the database `opfs`, and the next call removes whatever is there and
-	/// copies again from IndexedDB. If IndexedDB has no such database by then, the call fails and
-	/// no database is made; `FileSystem::destroy_opfs` removes what is left, to start without one.
+	/// copies again from IndexedDB. If IndexedDB has no such database by then, or is not available,
+	/// the call fails and no database is made; `FileSystem::destroy_opfs` removes what is left, to
+	/// start without one.
 	///
 	/// # Errors
 	///
 	/// [`Error::MigrationFailed`], with a message that says what failed, if the copy could not be
-	/// made, or was made and does not match the source (the database is removed in that case), and
-	/// an error for which [`Error::is_database_locked`] is true if another tab or worker has the
-	/// database `opfs` open. Calling again is the way to try again.
+	/// made, or was made and does not match the source (the database is removed in that case), if
+	/// a key or a value of the source is of a type that cannot be read as bytes, or if two keys
+	/// of the source are the same bytes (a string key and a binary key: one row would replace the
+	/// other), and an error for which [`Error::is_database_locked`] is true if another tab or
+	/// worker has the database `opfs` open. Calling again is the way to try again.
 	pub async fn migrate_from_indexeddb(
 		indexeddb: &str,
 		opfs: &str,

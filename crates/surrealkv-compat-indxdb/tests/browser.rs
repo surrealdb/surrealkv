@@ -10,13 +10,28 @@
 //! version after the read is shown to be the first to), what is there is the same afterwards
 //! (version, stores, rows), and no connection is left open (a database that is deleted after the
 //! read is not blocked).
+//!
+//! The same goes for the deletion of a database (`delete_database`): a name that is not there is
+//! not made by asking, a connection that holds a deletion up is told apart from one that closes
+//! when it is asked to, and a call that is dropped leaves no connection, listener or timer behind.
+//! A context that has no IndexedDB is made by hiding `indexedDB` on the window, and put back after
+//! each test that does it.
 
 #![cfg(target_arch = "wasm32")]
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use surrealkv_compat_indxdb::wasm::{is_indexeddb_available, read_all_from_browser, IdbSource};
-use surrealkv_compat_indxdb::{is_indxdb_available, read_all_latest, Chunk, ChunkLimits};
+use surrealkv_compat_indxdb::{
+	delete_database,
+	is_indxdb_available,
+	read_all_latest,
+	Chunk,
+	ChunkLimits,
+	DeleteOutcome,
+	Error,
+};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -328,21 +343,12 @@ fn sizes_of(chunks: &[Chunk<JsValue>]) -> Vec<usize> {
 // Nothing is created
 // ---------------------------------------------------------------------------------------------
 
-/// Looks at a name that is not there in every way the crate has, and checks that the browser still
-/// does not list it, and that a client that creates it afterwards at version 7 is the one that
-/// does: the upgrade it runs goes from nothing, and the database is at version 7.
-async fn nothing_is_created_by_looking(source: IdbSource) {
-	let name = source.name().to_string();
-	assert!(!source.exists().await.unwrap());
-	assert!(source.read_chunk(None, &ChunkLimits::default()).await.unwrap().is_none());
-	assert_eq!(listed_version(&name).await, None, "the probe made the database");
-	assert!(read_all_from_browser(&name).await.unwrap().is_empty());
-	assert_eq!(listed_version(&name).await, None, "the read made the database");
-	assert!(read_all_latest(&name).await.unwrap().is_empty());
-	assert_eq!(listed_version(&name).await, None, "the public read made the database");
-
-	// The legacy client that creates the database at its own version.
-	let open = factory().open_with_u32(&name, 7).unwrap();
+/// The legacy client that creates the database `name`, which is not there, at its own version, 7:
+/// it is the one that does, since the upgrade it runs goes from nothing, and the database is then
+/// at version 7. It deletes the database again, and fails the test if that is held up.
+async fn a_client_creates_it_from_nothing_at_version_seven(name: &str) {
+	assert_eq!(listed_version(name).await, None, "the database is there");
+	let open = factory().open_with_u32(name, 7).unwrap();
 	let old_version = std::rc::Rc::new(std::cell::Cell::new(f64::NAN));
 	let seen = std::rc::Rc::clone(&old_version);
 	let upgrade = Closure::once_into_js(move |event: web_sys::Event| {
@@ -358,8 +364,23 @@ async fn nothing_is_created_by_looking(source: IdbSource) {
 	assert_eq!(old_version.get(), 0.0, "the client did not create the database");
 	assert_eq!(db.version(), 7.0);
 	db.close();
-	assert_eq!(listed_version(&name).await, Some(7.0));
-	delete_db_unblocked(&name).await;
+	assert_eq!(listed_version(name).await, Some(7.0));
+	delete_db_unblocked(name).await;
+}
+
+/// Looks at a name that is not there in every way the crate has, and checks that the browser still
+/// does not list it, and that a client that creates it afterwards at version 7 is the one that
+/// does: the upgrade it runs goes from nothing, and the database is at version 7.
+async fn nothing_is_created_by_looking(source: IdbSource) {
+	let name = source.name().to_string();
+	assert!(!source.exists().await.unwrap());
+	assert!(source.read_chunk(None, &ChunkLimits::default()).await.unwrap().is_none());
+	assert_eq!(listed_version(&name).await, None, "the probe made the database");
+	assert!(read_all_from_browser(&name).await.unwrap().is_empty());
+	assert_eq!(listed_version(&name).await, None, "the read made the database");
+	assert!(read_all_latest(&name).await.unwrap().is_empty());
+	assert_eq!(listed_version(&name).await, None, "the public read made the database");
+	a_client_creates_it_from_nothing_at_version_seven(&name).await;
 }
 
 #[wasm_bindgen_test]
@@ -570,11 +591,14 @@ async fn a_key_of_a_type_that_has_no_bytes_is_an_error_and_not_a_silent_skip() {
 	create_db_of(&name, 1, &["kv"], &[(JsValue::from_f64(1.0), bytes(b"v"))]).await;
 	let error = read_all_from_browser(&name).await.expect_err("a number is not bytes");
 	assert!(error.to_string().contains("key"), "{error}");
+	// A failure of a database that is there is never the error for there being no IndexedDB.
+	assert!(!matches!(error, Error::Unavailable(_)), "{error}");
 	let error = IdbSource::new(&name)
 		.read_chunk(None, &ChunkLimits::default())
 		.await
 		.expect_err("a number is not bytes");
 	assert!(error.to_string().contains("key"), "{error}");
+	assert!(!matches!(error, Error::Unavailable(_)), "{error}");
 	// The connection of the read that failed is closed.
 	delete_db_unblocked(&name).await;
 }
@@ -980,4 +1004,471 @@ async fn a_dropped_open_does_not_hold_up_an_upgrade_and_the_opens_that_queue_beh
 		);
 		delete_db_unblocked(&name).await;
 	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// A context that has no IndexedDB
+// ---------------------------------------------------------------------------------------------
+
+/// What `indexedDB` of the global scope is made to be for as long as this is held: the scope is put
+/// back as it was when this is dropped, as it is when a test fails, so that one test cannot hide
+/// IndexedDB from the next. The property is looked at as a script looks at it, so that what a test
+/// sees through this is what the code under test sees.
+struct HiddenIndexedDb {
+	/// The own property that the scope had before, `undefined` if it had none (it is then
+	/// inherited, and the property that was made is removed to bring that back).
+	own: JsValue,
+}
+
+impl HiddenIndexedDb {
+	/// Reading `indexedDB` gives `undefined`.
+	fn as_undefined() -> Self {
+		Self::as_value(JsValue::UNDEFINED)
+	}
+
+	/// Reading `indexedDB` gives `value`.
+	fn as_value(value: JsValue) -> Self {
+		let descriptor = js_sys::Object::new();
+		js_sys::Reflect::set(&descriptor, &"value".into(), &value).unwrap();
+		let hidden = Self::put(&descriptor);
+		let read = js_sys::Reflect::get(&js_sys::global(), &"indexedDB".into());
+		assert!(read.is_ok_and(|read| read == value), "indexedDB is still there");
+		hidden
+	}
+
+	/// Reading `indexedDB` throws a `SecurityError`, as it does where the browser blocks storage.
+	fn as_throwing() -> Self {
+		let descriptor = js_sys::Object::new();
+		let getter = js_sys::Function::new_no_args(
+			"throw new DOMException('The operation is insecure.', 'SecurityError');",
+		);
+		js_sys::Reflect::set(&descriptor, &"get".into(), &getter).unwrap();
+		let hidden = Self::put(&descriptor);
+		let read = js_sys::Reflect::get(&js_sys::global(), &"indexedDB".into());
+		assert!(read.is_err(), "reading indexedDB does not throw");
+		hidden
+	}
+
+	fn put(descriptor: &js_sys::Object) -> Self {
+		let (global, key) = (js_sys::global(), JsValue::from_str("indexedDB"));
+		let own = js_sys::Object::get_own_property_descriptor(&global, &key);
+		js_sys::Reflect::set(descriptor, &"configurable".into(), &JsValue::TRUE).unwrap();
+		let defined = js_sys::Reflect::define_property(&global, &key, descriptor)
+			.expect("the scope lets indexedDB be defined again");
+		assert!(defined, "the scope does not let indexedDB be defined again");
+		Self {
+			own,
+		}
+	}
+}
+
+impl Drop for HiddenIndexedDb {
+	fn drop(&mut self) {
+		let (global, key) = (js_sys::global(), JsValue::from_str("indexedDB"));
+		if self.own.is_undefined() {
+			let _ = js_sys::Reflect::delete_property(&global, &key);
+		} else {
+			let _ = js_sys::Reflect::define_property(&global, &key, self.own.unchecked_ref());
+		}
+	}
+}
+
+/// A way of hiding `indexedDB`.
+type Hide = fn() -> HiddenIndexedDb;
+
+/// How `indexedDB` is hidden, for the tests below, and what it is called in their messages.
+fn hidings() -> [(&'static str, Hide); 2] {
+	[
+		("indexedDB is undefined", HiddenIndexedDb::as_undefined),
+		("reading indexedDB throws", HiddenIndexedDb::as_throwing),
+	]
+}
+
+#[wasm_bindgen_test]
+async fn a_window_without_indexeddb_is_reported_as_unavailable_by_every_function() {
+	let name = unique_name("nothing");
+	for (what, hide) in hidings() {
+		let _hidden = hide();
+		assert!(!is_indexeddb_available(), "{what}");
+		assert!(!is_indxdb_available("no-such-dump-directory"), "{what}");
+		let source = IdbSource::new(&name);
+		for (call, error) in [
+			("exists", source.exists().await.err()),
+			("read_chunk", source.read_chunk(None, &ChunkLimits::default()).await.err()),
+			("read_all_from_browser", read_all_from_browser(&name).await.err()),
+			("read_all_latest", read_all_latest(&name).await.err()),
+			("delete_database", delete_database(&name, Duration::from_millis(50)).await.err()),
+		] {
+			let error = error.unwrap_or_else(|| panic!("{what}: {call} did not fail"));
+			assert!(matches!(error, Error::Unavailable(_)), "{what}: {call}: {error:?}");
+			assert!(error.to_string().contains("not available"), "{what}: {call}: {error}");
+		}
+	}
+
+	// With IndexedDB there, the same calls find a name that is not there, and make nothing.
+	assert!(is_indexeddb_available());
+	assert!(!IdbSource::new(&name).exists().await.unwrap());
+	assert!(read_all_latest(&name).await.unwrap().is_empty());
+	assert_eq!(
+		delete_database(&name, Duration::from_secs(5)).await.unwrap(),
+		DeleteOutcome::NotFound
+	);
+	assert_eq!(listed_version(&name).await, None);
+}
+
+#[wasm_bindgen_test]
+async fn a_value_that_is_not_a_factory_is_a_failure_and_not_the_error_for_no_indexeddb() {
+	let name = unique_name("not-a-factory");
+	let _hidden = HiddenIndexedDb::as_value(js_sys::Object::new().into());
+	let source = IdbSource::new(&name);
+	let error = source.exists().await.expect_err("an object is not a factory");
+	assert!(matches!(error, Error::Js(_)), "{error:?}");
+	let error = delete_database(&name, Duration::from_millis(50)).await.expect_err("not a factory");
+	assert!(matches!(error, Error::Js(_)), "{error:?}");
+	assert!(!is_indexeddb_available());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Deleting a database
+// ---------------------------------------------------------------------------------------------
+
+/// `indexedDB.databases` is hidden for as long as this is held, as it is in a browser that does not
+/// have the call: what the crate does then is to open the database without a version, and see.
+struct HiddenListing;
+
+impl HiddenListing {
+	fn new() -> Self {
+		let descriptor = js_sys::Object::new();
+		js_sys::Reflect::set(&descriptor, &"value".into(), &JsValue::UNDEFINED).unwrap();
+		js_sys::Reflect::set(&descriptor, &"configurable".into(), &JsValue::TRUE).unwrap();
+		let factory = factory();
+		let defined =
+			js_sys::Reflect::define_property(factory.as_ref(), &"databases".into(), &descriptor);
+		assert!(defined.unwrap(), "databases cannot be hidden");
+		Self
+	}
+}
+
+impl Drop for HiddenListing {
+	fn drop(&mut self) {
+		let _ = js_sys::Reflect::delete_property(factory().as_ref(), &"databases".into());
+	}
+}
+
+/// How a client of a database that is open behaves when the browser says that the database is to
+/// be deleted (a `versionchange` event).
+#[derive(Clone, Copy)]
+enum Behaviour {
+	/// It does not listen, and stays open.
+	Ignores,
+	/// It closes at once.
+	ClosesAtOnce,
+	/// It closes after this many milliseconds: the browser fires `blocked` before it does, and
+	/// then goes on.
+	ClosesAfter(i32),
+}
+
+/// A client of the database `name` with a connection that is open until it is closed or dropped.
+struct Client {
+	db: IdbDatabase,
+	_listener: Option<Closure<dyn FnMut(web_sys::Event)>>,
+}
+
+impl Client {
+	async fn open(name: &str, behaviour: Behaviour) -> Self {
+		let request = factory().open(name).unwrap();
+		wait_for(request.as_ref(), "success").await;
+		let db: IdbDatabase = request.result().unwrap().unchecked_into();
+		let listener = match behaviour {
+			Behaviour::Ignores => None,
+			Behaviour::ClosesAtOnce => {
+				let closing = db.clone();
+				Some(Closure::<dyn FnMut(web_sys::Event)>::new(move |_event| closing.close()))
+			}
+			Behaviour::ClosesAfter(ms) => {
+				let closing = db.clone();
+				Some(Closure::<dyn FnMut(web_sys::Event)>::new(move |_event| {
+					let closing = closing.clone();
+					let later = Closure::once_into_js(move || closing.close());
+					web_sys::window()
+						.unwrap()
+						.set_timeout_with_callback_and_timeout_and_arguments_0(
+							later.unchecked_ref(),
+							ms,
+						)
+						.unwrap();
+				}))
+			}
+		};
+		if let Some(listener) = &listener {
+			db.set_onversionchange(Some(listener.as_ref().unchecked_ref()));
+		}
+		Self {
+			db,
+			_listener: listener,
+		}
+	}
+
+	fn close(&self) {
+		self.db.close();
+	}
+}
+
+impl Drop for Client {
+	fn drop(&mut self) {
+		self.db.set_onversionchange(None);
+		self.db.close();
+	}
+}
+
+/// Waits until `indexedDB.databases()` no longer lists `name`, and fails the test if that takes
+/// longer than `limit_ms`.
+async fn wait_until_unlisted(name: &str, limit_ms: f64, what: &str) {
+	let started = js_sys::Date::now();
+	while listed_version(name).await.is_some() {
+		assert!(js_sys::Date::now() - started < limit_ms, "{what}: the database is still listed");
+		tick(25).await;
+	}
+}
+
+/// The uncaught errors that the page reports while this is held: a callback that is called after
+/// it was freed is one, and so is anything else that is thrown from an event handler.
+struct ErrorEvents {
+	count: std::rc::Rc<std::cell::Cell<u32>>,
+	listener: Closure<dyn FnMut(web_sys::Event)>,
+}
+
+impl ErrorEvents {
+	fn watch() -> Self {
+		let count = std::rc::Rc::new(std::cell::Cell::new(0));
+		let seen = std::rc::Rc::clone(&count);
+		let listener = Closure::<dyn FnMut(web_sys::Event)>::new(move |_event| {
+			seen.set(seen.get() + 1);
+		});
+		web_sys::window()
+			.unwrap()
+			.add_event_listener_with_callback("error", listener.as_ref().unchecked_ref())
+			.unwrap();
+		Self {
+			count,
+			listener,
+		}
+	}
+
+	fn count(&self) -> u32 {
+		self.count.get()
+	}
+}
+
+impl Drop for ErrorEvents {
+	fn drop(&mut self) {
+		let _ = web_sys::window()
+			.unwrap()
+			.remove_event_listener_with_callback("error", self.listener.as_ref().unchecked_ref());
+	}
+}
+
+#[wasm_bindgen_test]
+async fn a_database_that_is_there_is_deleted_and_no_longer_listed() {
+	for listing in [true, false] {
+		let name = unique_name("deleted");
+		create_db_of(&name, 4, &["kv", "other"], &numbered(5, 4)).await;
+		assert_eq!(listed_version(&name).await, Some(4.0));
+		// With the listing, and in a browser that has no `databases()` and has to open to find out.
+		let _hidden = (!listing).then(HiddenListing::new);
+		let outcome = delete_database(&name, Duration::from_secs(10)).await.unwrap();
+		assert_eq!(outcome, DeleteOutcome::Deleted, "listing: {listing}");
+		drop(_hidden);
+		assert_eq!(listed_version(&name).await, None, "listing: {listing}: still listed");
+		// A reader finds nothing, and a client creates it from nothing.
+		assert!(!IdbSource::new(&name).exists().await.unwrap());
+		a_client_creates_it_from_nothing_at_version_seven(&name).await;
+	}
+}
+
+#[wasm_bindgen_test]
+async fn a_database_that_is_not_there_is_not_found_and_is_not_made_by_asking() {
+	for listing in [true, false] {
+		let name = unique_name("not-there");
+		let _hidden = (!listing).then(HiddenListing::new);
+		for _ in 0..2 {
+			let outcome = delete_database(&name, Duration::from_secs(10)).await.unwrap();
+			assert_eq!(outcome, DeleteOutcome::NotFound, "listing: {listing}");
+		}
+		drop(_hidden);
+		assert_eq!(listed_version(&name).await, None, "listing: {listing}: the call made it");
+		// A client that creates it at its own version afterwards is the one that makes it.
+		a_client_creates_it_from_nothing_at_version_seven(&name).await;
+	}
+}
+
+#[wasm_bindgen_test]
+async fn a_database_with_no_kv_store_is_deleted_as_well() {
+	let name = unique_name("other-store-deleted");
+	create_db_of(&name, 2, &["something-else"], &[]).await;
+	let outcome = delete_database(&name, Duration::from_secs(10)).await.unwrap();
+	assert_eq!(outcome, DeleteOutcome::Deleted);
+	assert_eq!(listed_version(&name).await, None);
+}
+
+#[wasm_bindgen_test]
+async fn a_connection_that_ignores_the_deletion_blocks_it_and_it_completes_when_it_closes() {
+	for listing in [true, false] {
+		let name = unique_name("blocked");
+		create_db_of(&name, 3, &["kv"], &numbered(3, 3)).await;
+		let client = Client::open(&name, Behaviour::Ignores).await;
+		let _hidden = (!listing).then(HiddenListing::new);
+
+		let started = js_sys::Date::now();
+		let outcome = delete_database(&name, Duration::from_millis(400)).await.unwrap();
+		assert_eq!(outcome, DeleteOutcome::Blocked, "listing: {listing}");
+		assert!(
+			js_sys::Date::now() - started >= 350.0,
+			"listing: {listing}: it did not wait for the time that it was given"
+		);
+		drop(_hidden);
+		// The request is not cancelled, and the database is still there while it is held.
+		assert_eq!(listed_version(&name).await, Some(3.0), "listing: {listing}");
+
+		// The client lets go, and the browser carries the deletion out.
+		client.close();
+		wait_until_unlisted(&name, 10_000.0, "after the connection was closed").await;
+		drop(client);
+		assert!(!IdbSource::new(&name).exists().await.unwrap());
+	}
+}
+
+/// What `future` gives, or `None` if it does not give it within `ms` milliseconds, when it is
+/// dropped. A call that never returns is a failure of the test, and not a test that never ends.
+async fn within<T>(ms: i32, future: impl std::future::Future<Output = T>) -> Option<T> {
+	use std::future::Future;
+
+	let mut future = Box::pin(future);
+	let mut late = Box::pin(tick(ms));
+	std::future::poll_fn(|context| {
+		if let std::task::Poll::Ready(value) = future.as_mut().poll(context) {
+			return std::task::Poll::Ready(Some(value));
+		}
+		if late.as_mut().poll(context).is_ready() {
+			return std::task::Poll::Ready(None);
+		}
+		std::task::Poll::Pending
+	})
+	.await
+}
+
+#[wasm_bindgen_test]
+async fn a_second_call_while_a_deletion_is_pending_waits_at_most_the_time_it_is_given() {
+	for listing in [true, false] {
+		let name = unique_name("asked-again");
+		create_db_of(&name, 3, &["kv"], &numbered(3, 3)).await;
+		let client = Client::open(&name, Behaviour::Ignores).await;
+
+		// The first call asks for the deletion, which the connection holds up, and it is left
+		// pending in the browser.
+		let first = delete_database(&name, Duration::from_millis(200)).await.unwrap();
+		assert_eq!(first, DeleteOutcome::Blocked, "listing: {listing}");
+
+		// The natural retry. In a browser that has no `databases()` the look for the database is
+		// an open, which the browser queues behind the deletion that is still pending: the time
+		// that the call is given has to cover that look too.
+		let _hidden = (!listing).then(HiddenListing::new);
+		let started = js_sys::Date::now();
+		let second =
+			within(HELD_UP_AFTER_MS, delete_database(&name, Duration::from_millis(200))).await;
+		let took = js_sys::Date::now() - started;
+		drop(_hidden);
+		let second =
+			second.unwrap_or_else(|| {
+				panic!("listing: {listing}: the call was not over after {took} ms, for a wait of 200 ms")
+			});
+		assert_eq!(second.unwrap(), DeleteOutcome::Blocked, "listing: {listing}");
+		assert!(
+			took >= 150.0,
+			"listing: {listing}: it did not wait for the time that it was given"
+		);
+		assert!(
+			took < 2_000.0,
+			"listing: {listing}: it waited for {took} ms, for a wait of 200 ms"
+		);
+		assert_eq!(listed_version(&name).await, Some(3.0), "listing: {listing}");
+
+		// The deletion that is pending is carried out when the connection lets go, and the open
+		// that the second call left behind does not make the database again.
+		client.close();
+		wait_until_unlisted(&name, 10_000.0, "after the connection was closed").await;
+		tick(300).await;
+		assert_eq!(listed_version(&name).await, None, "listing: {listing}: it was made again");
+		drop(client);
+		a_client_creates_it_from_nothing_at_version_seven(&name).await;
+	}
+}
+
+#[wasm_bindgen_test]
+async fn a_connection_that_closes_when_it_is_asked_does_not_hold_the_deletion_up() {
+	for (what, behaviour) in [
+		("it closes at once", Behaviour::ClosesAtOnce),
+		// The browser says `blocked` and then goes on when the connection is closed: that is a
+		// deletion that is done within the time given, and not one that is blocked.
+		("it closes after a while", Behaviour::ClosesAfter(100)),
+	] {
+		let name = unique_name("closes-when-asked");
+		create_db_of(&name, 2, &["kv"], &numbered(3, 3)).await;
+		let client = Client::open(&name, behaviour).await;
+
+		let started = js_sys::Date::now();
+		let outcome = delete_database(&name, Duration::from_secs(10)).await.unwrap();
+		assert_eq!(outcome, DeleteOutcome::Deleted, "{what}");
+		assert!(js_sys::Date::now() - started < 5_000.0, "{what}: it waited for the whole time");
+		assert_eq!(listed_version(&name).await, None, "{what}: still listed");
+		drop(client);
+	}
+}
+
+#[wasm_bindgen_test]
+async fn a_deletion_that_is_dropped_wherever_it_waits_holds_nothing_and_leaves_nothing_to_fire() {
+	let errors = ErrorEvents::watch();
+	let (mut held, mut deleted_anyway) = (Vec::new(), 0);
+	for polls in 1..=10 {
+		for settle in [false, true] {
+			let name = unique_name("dropped-deletion");
+			create_db_of(&name, 2, &["kv"], &numbered(3, 3)).await;
+			// A client that holds the deletion up, so that a call that got as far as the request is
+			// waiting for its timer when it is dropped.
+			let client = Client::open(&name, Behaviour::Ignores).await;
+			{
+				let name = name.clone();
+				poll_then_drop(
+					async move {
+						let _ = delete_database(&name, Duration::from_millis(150)).await;
+					},
+					polls,
+					settle,
+				)
+				.await;
+			}
+			// Past the time that the call was given, so that its timer would have fired.
+			tick(300).await;
+
+			// A request that the dropped call made is not cancelled: it completes when the client
+			// lets go.
+			client.close();
+			tick(100).await;
+			if listed_version(&name).await.is_none() {
+				deleted_anyway += 1;
+			}
+			// And nothing of the call is open: a deletion that a connection of it held up would not
+			// be answered.
+			if deletion_is_held_up(&name).await {
+				held.push((polls, settle));
+			}
+			drop(client);
+		}
+	}
+	assert!(
+		held.is_empty(),
+		"a dropped deletion left a connection open at (polls, settle): {held:?}"
+	);
+	assert_eq!(errors.count(), 0, "a callback was called after it was freed, or threw");
+	assert!(deleted_anyway > 0, "no dropped call had made the request that goes on without it");
 }

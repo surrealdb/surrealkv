@@ -1222,6 +1222,7 @@ async fn a_move_out_of_indexeddb_that_a_kill_cut_short_is_made_again_by_the_next
 	assert_eq!(done.text("result"), "imported");
 	assert_eq!(done.number("entries"), rows.len() as i64);
 	assert_eq!(done.number("bytes") as u64, total_bytes);
+	assert_eq!(done.number("skipped"), 0);
 	let copy_ms = done.number("ms").max(1) as u64;
 	k.exit().await;
 	check_database(&calibration, rows.len(), &wanted_digest, "the calibration copy").await;
@@ -1308,6 +1309,7 @@ async fn a_move_out_of_indexeddb_that_a_kill_cut_short_is_made_again_by_the_next
 				assert!(!a_finished, "A had finished and B copied again");
 				assert_eq!(reply.number("entries"), rows.len() as i64);
 				assert_eq!(reply.number("bytes") as u64, total_bytes);
+				assert_eq!(reply.number("skipped"), 0);
 				imported += 1;
 			}
 			"existing" => {
