@@ -20,8 +20,9 @@
 //! they are read, and an entry of a sealed file is held to its length and to the checksum of what
 //! is stored, which is what can be told without the key.
 //!
-//! The records that are kept are made durable before the open starts another segment: the files
-//! that their pointers name, and the segment itself, see [`TailCheck::make_durable`].
+//! The records that are kept are made durable before the open starts another segment: first the
+//! files that their pointers name, see [`TailCheck::make_durable`], and then the segment itself,
+//! with every other segment that the open replays.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -58,8 +59,6 @@ pub(crate) struct TailCheck<'a> {
 	files: BTreeSet<u32>,
 	/// The files that the pointers of the record that is looked at name.
 	record_files: Vec<u32>,
-	/// The segment that was read, if a record of it that is kept points into the value log.
-	segment: Option<SegmentRef>,
 }
 
 /// The last segment of the log in `wal_dir`, if the replay reads it: one that is not below
@@ -83,7 +82,6 @@ impl<'a> TailCheck<'a> {
 			buf: Vec::new(),
 			files: BTreeSet::new(),
 			record_files: Vec::new(),
-			segment: None,
 		}
 	}
 
@@ -122,7 +120,6 @@ impl<'a> TailCheck<'a> {
 		mode: WalRecoveryMode,
 	) -> Result<TailEnd> {
 		self.files.clear();
-		self.segment = None;
 
 		let file = context.fs.open_read(&segment.file_path)?;
 		let mut reader = Reader::with_context(file, None, segment.id, context);
@@ -178,9 +175,6 @@ impl<'a> TailCheck<'a> {
 			record += 1;
 		}
 
-		if !self.files.is_empty() {
-			self.segment = Some(segment.clone());
-		}
 		Ok(match failed {
 			None => TailEnd::Whole,
 			Some((record, offset)) => TailEnd::Cut {
@@ -192,16 +186,11 @@ impl<'a> TailCheck<'a> {
 	}
 
 	/// Makes durable what the records that are kept point to: the files of the value log that
-	/// their pointers name, and then the segment, so that no record of it is on disk without its
-	/// value. Nothing is synced if no kept record points into the value log. Called once the
-	/// segment has been cut if it was to be, and before the open starts another segment: a
-	/// segment that is not the last one is not checked when the database is opened again.
-	pub(crate) fn make_durable(&self, fs: &dyn Fs) -> Result<()> {
-		let Some(segment) = &self.segment else {
-			return Ok(());
-		};
-		self.vlog.sync_files(&self.files)?;
-		fs.sync_file(&segment.file_path)?;
-		Ok(())
+	/// their pointers name. Nothing is synced if no kept record points into the value log. Called
+	/// once the segment has been cut if it was to be, and before the segment itself is synced, so
+	/// that no record of it is on disk without its value: a segment that is not the last one is not
+	/// checked when the database is opened again.
+	pub(crate) fn make_durable(&self) -> Result<()> {
+		self.vlog.sync_files(&self.files)
 	}
 }

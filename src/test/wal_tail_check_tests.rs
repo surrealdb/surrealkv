@@ -1190,7 +1190,7 @@ fn calls_to<'a>(calls: &'a [String], prefix: &str, directory: &str) -> Vec<&'a S
 }
 
 #[test(tokio::test)]
-async fn an_open_that_has_no_value_to_look_for_reads_no_entry_and_makes_no_new_sync() {
+async fn an_open_that_has_no_value_to_look_for_reads_no_entry_and_syncs_only_what_it_replays() {
 	within("not done", async {
 		for kind in
 			[Kind::Closed, Kind::WithoutValueLog, Kind::InlineValues, Kind::Deletes, Kind::Empty]
@@ -1203,9 +1203,16 @@ async fn an_open_that_has_no_value_to_look_for_reads_no_entry_and_makes_no_new_s
 			for read in calls_to(&calls, "read_at ", "vlog/") {
 				assert_eq!(offset_of(read), 0, "{kind:?}: a read of the value log: {read}");
 			}
-			// Nothing is synced by name, and no segment of the log: the segment that is recovered
-			// is synced only if what it keeps points into the value log.
-			assert!(calls_to(&calls, "sync_file ", "").is_empty(), "{kind:?}: {calls:#?}");
+			// What is synced by name is the segments of the log that the open replays, each once,
+			// and nothing of the value log: no record points into it. No segment is synced through
+			// a handle.
+			let by_name = calls_to(&calls, "sync_file ", "");
+			assert!(
+				by_name.iter().all(|call| call.starts_with("sync_file wal/")),
+				"{kind:?}: {calls:#?}"
+			);
+			let segments: std::collections::HashSet<_> = by_name.iter().collect();
+			assert_eq!(segments.len(), by_name.len(), "{kind:?}: {calls:#?}");
 			assert!(calls_to(&calls, "sync ", "wal/").is_empty(), "{kind:?}: {calls:#?}");
 			// The newest file of the value log is synced once if there is one, as it always was.
 			assert!(calls_to(&calls, "sync ", "vlog/").len() <= 1, "{kind:?}: {calls:#?}");
