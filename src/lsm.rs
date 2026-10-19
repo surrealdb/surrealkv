@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
 use crate::batch::Batch;
 use crate::checkpoint::{CheckpointGate, CheckpointMetadata, DatabaseCheckpoint};
 use crate::compaction::compactor::{CompactionOptions, Compactor};
+use crate::compaction::manual::RangeStrategy;
 use crate::compaction::CompactionStrategy;
 use crate::error::{BackgroundErrorHandler, Result};
 use crate::levels::{
@@ -39,6 +40,7 @@ use crate::wal::tail::{self, TailCheck, TailEnd};
 use crate::wal::{self, cleanup_old_segments_for_in, list_segment_ids_in, Wal, WalManager};
 use crate::{
 	rt,
+	CompactRangeOptions,
 	Comparator,
 	Error,
 	FilterPolicy,
@@ -215,6 +217,11 @@ pub(crate) struct CoreInner {
 	/// write over the ones that have the ids of its outputs, and list what it made in a manifest
 	/// it was not computed from.
 	pub(crate) compactions: parking_lot::RwLock<()>,
+
+	/// Held by one compaction at a time, from the pick of its inputs to the removal of them. The
+	/// background task and `Tree::compact_range` both pick from the manifest, and two picks that
+	/// overlap would merge the same tables twice.
+	compaction_serial: parking_lot::Mutex<()>,
 
 	/// Held for the whole of a rotation of the memtable and the WAL (`rotate_memtable()`,
 	/// `seal_active_wal_segment()`, `replace_failed_wal()`), taken before the active memtable's
@@ -504,6 +511,7 @@ impl CoreInner {
 			immutable_memtables,
 			flush_lock: parking_lot::Mutex::new(()),
 			compactions: parking_lot::RwLock::new(()),
+			compaction_serial: parking_lot::Mutex::new(()),
 			rotations: parking_lot::Mutex::new(()),
 			level_manifest,
 			snapshot_tracker: SnapshotTracker::new(),
@@ -1978,6 +1986,7 @@ impl CompactionOperations for CoreInner {
 
 		// Kept for the whole run, so that a restore waits for it, see `compactions`.
 		let _running = self.compactions.read();
+		let _serial = self.compaction_serial.lock();
 
 		// Create compaction options from the current LSM tree state
 		let options = CompactionOptions::from(self);
@@ -3801,6 +3810,77 @@ impl Tree {
 		// Step 3: Signal stall controller that work completed
 		self.core.write_stall.signal_work_done();
 
+		Ok(())
+	}
+
+	/// Compacts the keys of `[start, end)` down the tree, blocking until it is done. `None` leaves
+	/// a bound open, so `compact_range(None, None, ..)` compacts the whole tree.
+	///
+	/// Memtables are flushed first when [`CompactRangeOptions::flush_memtable`] is set, since only
+	/// tables are compacted. Then, one level at a time from level 0, every table that overlaps the
+	/// range is merged into the next level, down to [`CompactRangeOptions::target_level`]. A table
+	/// that only partly overlaps is merged whole, as are the tables that share a user key with it.
+	/// Merging into the last level drops the tombstones and the versions that no reader can see,
+	/// which is what frees the space of deleted data.
+	///
+	/// The compaction runs between the steps of the background compactor, never at the same time
+	/// as one, and writes and reads carry on meanwhile. Data that is written after the call began
+	/// may be left uncompacted. It keeps every version a snapshot or a transaction can still see.
+	///
+	/// This is blocking file I/O: call it from `spawn_blocking` in an async context. A failure
+	/// leaves the tree as it was before the step that failed, and the steps that finished stay
+	/// done. A tree that is closing makes it return [`Error::DatabaseStopped`].
+	///
+	/// # Errors
+	///
+	/// [`Error::InvalidArgument`] if `start` is greater than `end`.
+	pub fn compact_range(
+		&self,
+		start: Option<&[u8]>,
+		end: Option<&[u8]>,
+		options: &CompactRangeOptions,
+	) -> Result<()> {
+		let inner = &self.core.inner;
+		if let (Some(start), Some(end)) = (start, end) {
+			if inner.opts.comparator.compare(start, end) == std::cmp::Ordering::Greater {
+				return Err(Error::InvalidArgument("compact_range: start is after end".into()));
+			}
+		}
+		let stopped = || {
+			self.core.is_closed.load(Ordering::SeqCst)
+				|| self.core.inner.error_handler.commit_group_error().is_some()
+		};
+		let stopped_error = || Error::DatabaseStopped("compact_range: the tree is closing".into());
+		if stopped() {
+			return Err(stopped_error());
+		}
+
+		if options.flush_memtable {
+			let has_data = !inner.active_memtable.read()?.is_empty();
+			if has_data {
+				inner.rotate_memtable()?;
+			}
+			inner.flush_all_immutables_sync()?;
+		}
+
+		let last = inner.opts.level_count.saturating_sub(1);
+		let target = options.target_level.map_or(last, |level| level.min(last));
+		let comparator = || Arc::clone(&inner.opts.comparator);
+		let run = |source: u8, same_level: bool| -> Result<()> {
+			if stopped() {
+				return Err(stopped_error());
+			}
+			let strategy = RangeStrategy::new(source, same_level, start, end, comparator());
+			self.core.inner.compact(Arc::new(strategy))?;
+			self.core.write_stall.signal_work_done();
+			Ok(())
+		};
+		for source in 0..target {
+			run(source, false)?;
+		}
+		if target == last && options.rewrite_bottommost {
+			run(last, true)?;
+		}
 		Ok(())
 	}
 

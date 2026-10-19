@@ -2,6 +2,7 @@
 
 pub(crate) mod compactor;
 pub(crate) mod leveled;
+pub(crate) mod manual;
 
 use crate::levels::LevelManifest;
 use crate::Result;

@@ -67,6 +67,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub use compaction::leveled::CompactionPriority;
+pub use compaction::manual::CompactRangeOptions;
 pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator};
 use sstable::bloom::LevelDBBloomFilter;
 pub use sstable::ribbon::RibbonFilter;
