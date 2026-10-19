@@ -780,6 +780,53 @@ pub(crate) fn quarantine_wal_segment_in(
 	Ok(corrupt_base)
 }
 
+/// Makes durable every segment of the log in `wal_dir` that a replay from `min_wal_number` reads,
+/// and the directory that names them. Called once the replay has read and repaired them, before
+/// the open takes a commit.
+///
+/// What a replay reads is what the file system serves, which is not only what is on the disk: a
+/// process that appended a commit and was killed before its fsync leaves the bytes in the page
+/// cache, where every later process reads them. The replay applies them as committed, and a commit
+/// that reads them is logged in a later segment and synced. Unless the replayed segments are
+/// synced first, a power loss takes the replayed records and keeps the commits that were made on
+/// top of them, and the log no longer describes an order of commits. The rotation that follows the
+/// replay does not sync the segment it leaves, because this process appended nothing to it.
+///
+/// Every mode of syncing gets this, the one that never syncs a commit included: it is one fsync
+/// per replayed segment at open, and it keeps what this process acknowledges from depending on
+/// records that may not be on the disk. A plaintext segment and a sealed one are synced alike: a
+/// sealed segment is never appended to again, so the fsync is the only thing that makes its
+/// replayed records durable.
+///
+/// An fsync makes durable what the file system still holds as dirty. A segment whose fsync failed
+/// in an earlier process may have pages that the kernel marked clean without writing them, which
+/// this fsync does not write and which a power loss still takes. Such a process failed the commits
+/// that waited for that fsync and held the log until the memtables of the segment were in tables,
+/// so what it held there past its last good fsync was never acknowledged as durable; if it was
+/// killed before those tables were made, this open replays such records and they stay exposed to a
+/// power cut. Covering that case too would take a rewrite of every replayed segment to a new file,
+/// which is a copy of the whole unflushed log at every open that replays one, for a failure that
+/// only a device that fails its writes produces.
+pub(crate) fn sync_replayed_segments_in(
+	fs: &dyn Fs,
+	wal_dir: &Path,
+	min_wal_number: u64,
+) -> Result<()> {
+	if !directory_present(fs, wal_dir)? {
+		return Ok(());
+	}
+	let segments = SegmentRef::read_segments_from_directory_in(fs, wal_dir, Some("wal"))?;
+	let mut synced = false;
+	for segment in segments.iter().filter(|segment| segment.id >= min_wal_number) {
+		fs.sync_file(&segment.file_path)?;
+		synced = true;
+	}
+	if synced {
+		fs.sync_dir(wal_dir)?;
+	}
+	Ok(())
+}
+
 #[cfg_attr(
 	not(test),
 	allow(dead_code, reason = "kept for callers that have not moved to the _in form")

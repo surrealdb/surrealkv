@@ -2352,8 +2352,14 @@ impl Core {
 		// What the records of the last segment point to is made durable before anything else is
 		// started on top of them: the open starts the next segment once this returns.
 		if let Some(tail) = tail.as_deref() {
-			tail.make_durable(&*wal_context.fs)?;
+			tail.make_durable()?;
 		}
+
+		// Every replayed record is durable before anything is built on it: a record that was
+		// readable but never synced would otherwise be lost to a power cut that keeps the
+		// commits made on top of it. After the values of the last segment, so that none of its
+		// records reaches the disk ahead of its value.
+		wal::recovery::sync_replayed_segments_in(&*wal_context.fs, wal_path, min_wal_number)?;
 
 		// If no memtables, nothing was recovered
 		if memtables.is_empty() {
