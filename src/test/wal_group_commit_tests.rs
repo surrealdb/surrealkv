@@ -78,6 +78,8 @@ fn options(path: &Path) -> Arc<Options> {
 		path: path.to_path_buf(),
 		// Crash semantics: nothing may be flushed on drop or close.
 		flush_on_close: false,
+		// The framing under test is of groups; a sync mark in front of one would move it.
+		wal_sync_marks: false,
 		..Default::default()
 	})
 }

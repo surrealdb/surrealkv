@@ -316,6 +316,8 @@ fn options(path: &Path, vlog: bool) -> Arc<Options> {
 		clock: Arc::new(StepClock::default()),
 		enable_vlog: vlog,
 		vlog_value_threshold: VLOG_THRESHOLD,
+		// The framing under test is of groups; a sync mark in front of one would move it.
+		wal_sync_marks: false,
 		..Default::default()
 	})
 }

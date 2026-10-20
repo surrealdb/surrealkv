@@ -262,8 +262,15 @@ pub const MANIFEST_FORMAT_VERSION_V1: u16 = 1;
 /// misread the flat-key tables a V2 manifest lists, refuses the directory instead.
 pub const MANIFEST_FORMAT_VERSION_V2: u16 = 2;
 
+/// The manifest format written since the WAL segments of SurrealKV may hold sync marks
+/// (`RecordType::SyncMark`). The byte layout is the same as V2; the version exists so that a binary
+/// that only knows V2, which would take a mark for damage and cut or refuse the segment, refuses
+/// the directory instead. An open makes the manifest of this version before any segment is
+/// written, see [`LevelManifest::upgrade_format_in`].
+pub const MANIFEST_FORMAT_VERSION_V3: u16 = 3;
+
 /// The manifest format version this code writes.
-pub const MANIFEST_FORMAT_VERSION: u16 = MANIFEST_FORMAT_VERSION_V2;
+pub const MANIFEST_FORMAT_VERSION: u16 = MANIFEST_FORMAT_VERSION_V3;
 
 /// Snapshot information stored in the manifest
 #[derive(Debug, Clone)]
@@ -457,10 +464,13 @@ impl DecodedManifest {
 		let mut u16_buf = [0u8; 2];
 		level_manifest.read_exact(&mut u16_buf)?;
 		let version = u16::from_be_bytes(u16_buf);
-		if version != MANIFEST_FORMAT_VERSION_V1 && version != MANIFEST_FORMAT_VERSION_V2 {
+		if !matches!(
+			version,
+			MANIFEST_FORMAT_VERSION_V1 | MANIFEST_FORMAT_VERSION_V2 | MANIFEST_FORMAT_VERSION_V3
+		) {
 			return Err(Error::LoadManifestFail(format!(
 				"Unsupported manifest format version: {version}. Expected: \
-				 {MANIFEST_FORMAT_VERSION_V1} or {MANIFEST_FORMAT_VERSION_V2}"
+				 {MANIFEST_FORMAT_VERSION_V1} to {MANIFEST_FORMAT_VERSION_V3}"
 			)));
 		}
 
@@ -598,6 +608,22 @@ impl LevelManifest {
 		}
 
 		Ok(manifest)
+	}
+
+	/// Makes the manifest on disk of [`MANIFEST_FORMAT_VERSION`] if it is of an older one, so that
+	/// a binary that only knows the older one refuses the directory before anything of the newer
+	/// format is in it. Called by an open before it writes a WAL segment.
+	pub(crate) fn upgrade_format_in(&mut self, fs: &dyn Fs) -> Result<()> {
+		if self.manifest_format_version >= MANIFEST_FORMAT_VERSION {
+			return Ok(());
+		}
+		let previous = self.manifest_format_version;
+		self.manifest_format_version = MANIFEST_FORMAT_VERSION;
+		if let Err(e) = write_manifest_to_disk_in(fs, self) {
+			self.manifest_format_version = previous;
+			return Err(e);
+		}
+		Ok(())
 	}
 
 	/// Returns the minimum WAL number that contains unflushed data

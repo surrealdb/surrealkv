@@ -18,6 +18,7 @@ use crate::wal::{
 	WalContext,
 	BLOCK_SIZE,
 	HEADER_SIZE,
+	SYNC_MARK_LEN,
 };
 
 /// Detailed summary of actions taken during WAL recovery.
@@ -40,6 +41,16 @@ pub(crate) enum WalDamage {
 	/// A torn tail at the end of the last segment with no valid records following it.
 	TornTail {
 		last_valid_offset: usize,
+		file_size: u64,
+	},
+	/// Damage in the last segment, which holds sync marks, that intact records follow, none of
+	/// whose marks claims that the damage was synced: what a power cut to bytes that were
+	/// never synced leaves, as the pages of the file are written back in any order. Every record
+	/// acknowledged as durable was synced before it was acknowledged, and so lies below the
+	/// damage, which is cut off as a torn tail is, the intact records after it with it.
+	UnsyncedTail {
+		last_valid_offset: usize,
+		intact_records_after: usize,
 		file_size: u64,
 	},
 	/// Interior corruption: valid records follow the corruption, or corruption occurs in an older
@@ -520,6 +531,36 @@ fn try_validate_record(
 	None
 }
 
+/// The synced length of the [`RecordType::SyncMark`] whose header is at `data[pos..]`, `data`
+/// starting at offset `start_offset` of the segment: `None` unless a whole mark is there, within
+/// its block, and its checksum holds.
+pub(crate) fn sync_mark_in(data: &[u8], start_offset: u64, pos: usize) -> Option<u64> {
+	let end = pos.checked_add(HEADER_SIZE + SYNC_MARK_LEN)?;
+	let record = data.get(pos..end)?;
+	let offset_in_block = ((start_offset + pos as u64) % BLOCK_SIZE as u64) as usize;
+	if offset_in_block + HEADER_SIZE + SYNC_MARK_LEN > BLOCK_SIZE
+		|| record[6] != RecordType::SyncMark as u8
+		|| u16::from_be_bytes([record[4], record[5]]) as usize != SYNC_MARK_LEN
+	{
+		return None;
+	}
+	let crc = u32::from_be_bytes([record[0], record[1], record[2], record[3]]);
+	let payload = &record[HEADER_SIZE..];
+	if calculate_crc32(&[record[6]], payload) != crc {
+		return None;
+	}
+	Some(u64::from_be_bytes(payload.try_into().ok()?))
+}
+
+/// What [`scan_after_in`] found after an offset of a segment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AfterDamage {
+	/// The intact records, sync marks not counted.
+	pub(crate) intact_records: usize,
+	/// The highest synced length of the intact sync marks.
+	pub(crate) highest_mark: Option<u64>,
+}
+
 /// Scans the WAL segment file starting at `start_offset` for valid records.
 /// Returns the number of intact records found after `start_offset`.
 #[allow(dead_code, reason = "kept for callers that have not moved to the _in form")]
@@ -533,10 +574,20 @@ pub(crate) fn scan_valid_records_after_in(
 	file_path: &Path,
 	start_offset: u64,
 ) -> Result<usize> {
+	Ok(scan_after_in(fs, file_path, start_offset)?.intact_records)
+}
+
+/// The intact records of the WAL segment file from `start_offset` on, and the highest synced
+/// length that an intact sync mark among them claims.
+pub(crate) fn scan_after_in(
+	fs: &dyn Fs,
+	file_path: &Path,
+	start_offset: u64,
+) -> Result<AfterDamage> {
 	let file = fs.open_read(file_path)?;
 	let file_size = file.len()?;
 	if start_offset >= file_size {
-		return Ok(0);
+		return Ok(AfterDamage::default());
 	}
 
 	// The same file answers for the compression of the segment, so a pool is not asked for a
@@ -554,6 +605,7 @@ pub(crate) fn scan_valid_records_after_in(
 	data.truncate(read);
 
 	let mut intact_count = 0;
+	let mut highest_mark: Option<u64> = None;
 	let mut pos = 0;
 
 	while pos + HEADER_SIZE <= data.len() {
@@ -567,6 +619,12 @@ pub(crate) fn scan_valid_records_after_in(
 			continue;
 		}
 
+		if let Some(mark) = sync_mark_in(&data, start_offset, pos) {
+			highest_mark = Some(highest_mark.map_or(mark, |h| h.max(mark)));
+			pos += HEADER_SIZE + SYNC_MARK_LEN;
+			continue;
+		}
+
 		if let Some(next_pos) = try_validate_record(&data, start_offset, pos, compression) {
 			intact_count += 1;
 			pos = next_pos;
@@ -575,7 +633,10 @@ pub(crate) fn scan_valid_records_after_in(
 		}
 	}
 
-	Ok(intact_count)
+	Ok(AfterDamage {
+		intact_records: intact_count,
+		highest_mark,
+	})
 }
 
 #[allow(dead_code, reason = "kept for callers that have not moved to the _in form")]
@@ -593,6 +654,20 @@ pub(crate) fn classify_wal_damage(
 }
 
 /// [`classify_wal_damage`] in the file system `fs`.
+///
+/// Damage at the end of the last segment, with no intact record after it, is a torn tail. Damage
+/// in the last segment that intact records follow is an unsynced tail if the segment holds a sync
+/// mark and no intact mark after the damage claims a synced length above its offset: the
+/// last fsync to complete before any of those records was written ended at or below the damage,
+/// so nothing at or after it was synced when they were, and a record acknowledged as durable
+/// after them would have had to wait for an fsync that covered the damage too, which a power cut
+/// does not undo. Everything else is interior corruption, which a segment without marks, an older
+/// segment, or damage that a mark says was synced always is.
+///
+/// What the marks cannot see is an fsync that completed after the last mark was written: damage
+/// below the length it covered, followed by records of the same stretch, is cut as an unsynced
+/// tail although it was synced. A power cut cannot leave such damage; only a disk that loses
+/// synced bytes can.
 pub(crate) fn classify_wal_damage_in(
 	fs: &dyn Fs,
 	file_path: &Path,
@@ -601,12 +676,23 @@ pub(crate) fn classify_wal_damage_in(
 ) -> Result<WalDamage> {
 	let file_size = fs.file_len(file_path)?;
 
-	let intact_records_after =
-		scan_valid_records_after_in(fs, file_path, last_valid_offset as u64)?;
+	let after = scan_after_in(fs, file_path, last_valid_offset as u64)?;
+	let intact_records_after = after.intact_records;
 
 	if is_last_segment && intact_records_after == 0 {
-		Ok(WalDamage::TornTail {
+		return Ok(WalDamage::TornTail {
 			last_valid_offset,
+			file_size,
+		});
+	}
+	// A segment holds marks from the first append after its first fsync on, see
+	// `Writer::write_sync_marks`. One with none at all was written by a binary that writes none,
+	// or was never synced, and is read as before.
+	let marked = is_last_segment && scan_after_in(fs, file_path, 0)?.highest_mark.is_some();
+	if marked && after.highest_mark.is_none_or(|mark| mark <= last_valid_offset as u64) {
+		Ok(WalDamage::UnsyncedTail {
+			last_valid_offset,
+			intact_records_after,
 			file_size,
 		})
 	} else {

@@ -246,7 +246,14 @@ impl Wal {
 			// Create buffered file writer
 			let buffered_writer = BufferedFileWriter::new(Arc::clone(&file), BLOCK_SIZE);
 
-			Ok((Writer::new(buffered_writer, false, detected_compression, block_offset), file))
+			let mut writer =
+				Writer::new(buffered_writer, false, detected_compression, block_offset);
+			// Marks only from the next fsync on, which covers everything in the file: the writer
+			// knows nothing of what the segment had synced before.
+			if opts.sync_marks {
+				writer.write_sync_marks();
+			}
+			Ok((writer, file))
 		} else {
 			// New file - use compression type from options
 			let compression_type = opts.compression_type;
@@ -257,6 +264,9 @@ impl Wal {
 			let mut writer = Writer::new(buffered_writer, false, compression_type, 0);
 			if compression_type != CompressionType::None {
 				writer.add_compression_type_record()?;
+			}
+			if opts.sync_marks {
+				writer.write_sync_marks();
 			}
 			Ok((writer, file))
 		}

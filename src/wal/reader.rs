@@ -17,6 +17,7 @@ use crate::wal::{
 	WalContext,
 	BLOCK_SIZE,
 	HEADER_SIZE as WAL_RECORD_HEADER_SIZE,
+	SYNC_MARK_LEN,
 };
 
 /// Reporter interface for WAL corruption and errors.
@@ -420,6 +421,31 @@ impl Reader {
 				continue; // Don't return this as a data record
 			}
 
+			// A sync mark is for recovery to read, see `classify_wal_damage_in`. It stands between
+			// records, never between the fragments of one, and is checked like a fragment is.
+			if self.cur_rec_type == RecordType::SyncMark {
+				if fragment_index != 0 {
+					return Err(Error::IO(IOError::new(
+						io::ErrorKind::Other,
+						"sync mark inside a record",
+					)));
+				}
+				if (length as usize) > self.buffer_remaining() {
+					return Err(Error::IO(IOError::new(
+						io::ErrorKind::Other,
+						"bad record length - exceeds block boundary",
+					)));
+				}
+				let mark = &self.buffer[self.buffer_offset..self.buffer_offset + length as usize];
+				if usize::from(length) != SYNC_MARK_LEN
+					|| calculate_crc32(&[type_byte], mark) != crc
+				{
+					return Err(Error::IO(IOError::new(io::ErrorKind::Other, "checksum mismatch")));
+				}
+				self.buffer_offset += length as usize;
+				continue;
+			}
+
 			// Validate the record type for fragment sequencing
 			validate_record_type(self.cur_rec_type, fragment_index)?;
 
@@ -653,7 +679,7 @@ impl Reader {
 				return Err(physical("zeros where the header of the segment should be"));
 			}
 			// The first record of a plaintext segment, or the record of its compression.
-			1..=4 | 9 => return Err(EncryptionError::PlaintextInEncryptedDb.into()),
+			1..=4 | 9 | 11 => return Err(EncryptionError::PlaintextInEncryptedDb.into()),
 			_ => return Err(EncryptionError::UnsupportedVersion.into()),
 		}
 		if length > self.buffer_remaining() {

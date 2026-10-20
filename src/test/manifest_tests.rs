@@ -4,7 +4,7 @@ use std::sync::Arc;
 use test_log::test;
 
 use super::tfs;
-use crate::levels::{LevelManifest, ManifestChangeSet, SnapshotInfo, MANIFEST_FORMAT_VERSION_V2};
+use crate::levels::{LevelManifest, ManifestChangeSet, SnapshotInfo, MANIFEST_FORMAT_VERSION};
 use crate::sstable::table::{Table, TableWriter};
 use crate::{InternalKey, InternalKeyKind, Options, Result};
 
@@ -127,7 +127,7 @@ fn test_level_manifest_persistence() {
 		"Next table ID not persisted correctly"
 	);
 	assert_eq!(
-		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V2,
+		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION,
 		"Manifest version not persisted correctly"
 	);
 	assert_eq!(loaded_manifest.snapshots.len(), 2, "Snapshots not persisted correctly");
@@ -178,7 +178,7 @@ fn test_level_manifest_persistence() {
 		"Next table ID not loaded correctly in new manifest"
 	);
 	assert_eq!(
-		new_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V2,
+		new_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION,
 		"Manifest version not loaded correctly"
 	);
 	assert_eq!(new_manifest.snapshots.len(), 2, "Snapshots not loaded correctly");
@@ -687,8 +687,8 @@ fn test_manifest_v1_with_log_number_and_last_sequence() {
 	// Every manifest this code writes is of the current version, whatever the in-memory
 	// manifest was created or loaded as.
 	assert_eq!(
-		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V2,
-		"Should be V2 format"
+		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION,
+		"Should be the current format"
 	);
 
 	// Verify new fields persisted correctly

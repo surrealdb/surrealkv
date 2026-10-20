@@ -248,6 +248,8 @@ pub mod wal_sealed_tree_tests;
 pub mod wal_sealed_writer_tests;
 #[cfg(test)]
 pub mod wal_stale_rounds_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod wal_sync_mark_tests;
 #[cfg(test)]
 pub mod wal_tail_check_crash_tests;
 #[cfg(test)]
