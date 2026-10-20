@@ -39,6 +39,8 @@ pub mod commit_pipeline_gate_tests;
 #[cfg(test)]
 pub mod commit_pipeline_tests;
 #[cfg(test)]
+pub mod compact_range_tests;
+#[cfg(test)]
 pub mod compaction_crash_tests;
 #[cfg(test)]
 pub mod compaction_failure_recovery_tests;
