@@ -453,6 +453,9 @@ pub enum BackgroundErrorReason {
 	ManifestWrite,
 	/// A commit group failed after part of it was applied to a memtable or an L0 table.
 	CommitGroup,
+	/// An fsync of the value log failed: the values it was to make durable may be lost, and no
+	/// later fsync can make them durable.
+	ValueLogSync,
 }
 
 /// Reason for write stall - used for logging and metrics.
@@ -526,6 +529,11 @@ impl BackgroundErrorHandler {
 			// A memtable or a table holds batches that were never published: the process
 			// cannot go on
 			(BackgroundErrorReason::CommitGroup, _) => ErrorSeverity::Unrecoverable,
+
+			// The value log refuses every sync after a failed one, so no write can be made
+			// durable until the database is opened again. Above the arms of a pool and of a
+			// full disk: a full disk that fails an fsync has lost its pages all the same.
+			(BackgroundErrorReason::ValueLogSync, _) => ErrorSeverity::FatalError,
 
 			// A pool of files that has none free for now: a flush, a compaction or a manifest write
 			// that met it did not fail, it has to wait, and nothing it wrote is wrong. It must

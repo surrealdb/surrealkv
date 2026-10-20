@@ -475,8 +475,11 @@ impl CoreInner {
 		// The value log is opened before the WAL is: opening the WAL makes a segment and removes
 		// what a repair left, and an open that the value log refuses (a file in the clear in an
 		// encrypted database, or one that the key does not open) must not have done either.
+		let error_handler = Arc::new(BackgroundErrorHandler::new());
 		let vlog = if opts.enable_vlog {
-			Some(Arc::new(VLog::new_in(Arc::clone(&opts.fs), Arc::clone(&opts))?))
+			let vlog = VLog::new_in(Arc::clone(&opts.fs), Arc::clone(&opts))?;
+			vlog.set_error_handler(Arc::clone(&error_handler));
+			Some(Arc::new(vlog))
 		} else {
 			None
 		};
@@ -519,7 +522,7 @@ impl CoreInner {
 			vlog,
 			wal: WalManager::new(wal_instance),
 			lockfile: Mutex::new(lockfile),
-			error_handler: Arc::new(BackgroundErrorHandler::new()),
+			error_handler,
 			visible_seq_num,
 			group_wal_pin: AtomicU64::new(u64::MAX),
 			unapplied_group_below: AtomicU64::new(0),
