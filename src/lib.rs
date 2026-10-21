@@ -983,12 +983,22 @@ pub(crate) fn user_range_to_internal_range(
 // gives a binary number with 56 ones, which is the maximum value for 56 bits.
 pub(crate) const INTERNAL_KEY_SEQ_NUM_MAX: u64 = (1 << 56) - 1;
 
-// Helper function for reading u64 from byte slices without unwrap()
-// Safe to use when bounds have already been checked
+/// The number of trailer bytes every encoded internal key carries after its
+/// user key (the packed sequence number and kind). An encoded key shorter than
+/// this is malformed.
+pub(crate) const INTERNAL_KEY_TRAILER_SIZE: usize = 8;
+
+// Helper function for reading a big-endian u64 from a byte slice. It is
+// bounds-checked: a malformed key whose computed offset lies outside the
+// buffer yields 0 rather than an incorrect read. Callers that have
+// already validated the length (every key read from a block carries the 8-byte
+// trailer, enforced at block decode) never hit that path.
 #[inline(always)]
 fn read_u64_be(buffer: &[u8], offset: usize) -> u64 {
-	// SAFETY: Caller must ensure buffer has at least offset + 8 bytes
-	unsafe { u64::from_be_bytes(*(buffer.as_ptr().add(offset) as *const [u8; 8])) }
+	match buffer.get(offset..).and_then(|rest| rest.get(..8)) {
+		Some(bytes) => u64::from_be_bytes(bytes.try_into().expect("slice of 8 bytes")),
+		None => 0,
+	}
 }
 
 /// Converts a trailer byte to InternalKeyKind
@@ -1083,7 +1093,10 @@ impl InternalKey {
 	}
 
 	pub(crate) fn decode(encoded_key: &[u8]) -> Self {
-		let n = encoded_key.len() - 8;
+		// `saturating_sub` keeps a malformed key shorter than the trailer from
+		// underflowing into an out-of-bounds slice index or read; such a key is
+		// already rejected at block decode, this only bounds the primitive.
+		let n = encoded_key.len().saturating_sub(INTERNAL_KEY_TRAILER_SIZE);
 		let trailer = read_u64_be(encoded_key, n);
 		let user_key = encoded_key[..n].to_vec();
 
@@ -1096,13 +1109,13 @@ impl InternalKey {
 	/// Extract user key slice without allocation
 	#[inline]
 	pub(crate) fn user_key_from_encoded(encoded: &[u8]) -> &[u8] {
-		&encoded[..encoded.len() - 8]
+		&encoded[..encoded.len().saturating_sub(INTERNAL_KEY_TRAILER_SIZE)]
 	}
 
 	/// Extract trailer (seq_num + kind) without allocation
 	#[inline]
 	pub(crate) fn trailer_from_encoded(encoded: &[u8]) -> u64 {
-		let n = encoded.len() - 8;
+		let n = encoded.len().saturating_sub(INTERNAL_KEY_TRAILER_SIZE);
 		read_u64_be(encoded, n)
 	}
 
@@ -1190,7 +1203,11 @@ pub struct InternalKeyRef<'a> {
 impl<'a> InternalKeyRef<'a> {
 	#[inline]
 	pub fn from_encoded(encoded: &'a [u8]) -> Self {
-		debug_assert!(encoded.len() >= 8);
+		// A well-formed encoded key is at least `INTERNAL_KEY_TRAILER_SIZE`
+		// bytes; keys read from a block are validated to be so at decode time.
+		// The accessors are bounds-checked regardless, so a shorter slice here
+		// yields an empty user key and a zero trailer rather than an
+		// incorrect read.
 		Self {
 			encoded,
 			timestamp: 0,
@@ -1450,6 +1467,36 @@ mod options_bound_tests {
 			let options = Options::default().with_max_memtable_size(size);
 			options.validate_for_pointer_width(32).expect("within the 32-bit limit");
 			options.validate().expect("valid on this target");
+		}
+	}
+}
+
+#[cfg(test)]
+mod internal_key_bounds_tests {
+	use super::{read_u64_be, InternalKey, InternalKeyRef};
+
+	#[test]
+	fn read_u64_be_is_bounds_checked() {
+		// A computed offset past the end of the buffer (as an underflowed
+		// `len - 8` would be) yields 0 rather than an incorrect read.
+		assert_eq!(read_u64_be(&[], 0), 0);
+		assert_eq!(read_u64_be(&[1, 2, 3], 0), 0);
+		assert_eq!(read_u64_be(&[1, 2, 3], usize::MAX), 0);
+		assert_eq!(read_u64_be(&[0, 0, 0, 0, 0, 0, 0, 1], 0), 1);
+	}
+
+	#[test]
+	fn internal_key_accessors_are_safe_on_a_short_encoded_key() {
+		// A truncated or corrupt key shorter than the 8-byte trailer must not
+		// panic or misread; the accessors return empty / zero instead.
+		for len in 0..8usize {
+			let encoded = vec![0u8; len];
+			assert!(InternalKey::user_key_from_encoded(&encoded).is_empty());
+			assert_eq!(InternalKey::trailer_from_encoded(&encoded), 0);
+			// Must not panic or misread.
+			let _ = InternalKey::decode(&encoded);
+			let key_ref = InternalKeyRef::from_encoded(&encoded);
+			assert!(key_ref.user_key().is_empty());
 		}
 	}
 }
