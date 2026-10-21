@@ -3,7 +3,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError};
 
 use crc32fast::Hasher;
@@ -102,7 +102,22 @@ pub enum RecordType {
 	/// The first record of a sealed segment, which holds its encryption header. A plaintext
 	/// segment never has one, and a sealed segment has no other record of the metadata types.
 	SegmentHeader = 10,
+
+	/// How far the segment was synced when the record was written: the payload is a big-endian
+	/// `u64` of [`SYNC_MARK_LEN`] bytes, the length of the segment that the last fsync to complete
+	/// before it covered. Every byte below it was on disk when the mark was written. A plaintext
+	/// segment holds one before every append that finds the synced length moved on since the
+	/// last, so a segment that was never synced holds none.
+	/// Recovery reads them to tell damage that only a power cut to unsynced bytes can leave from
+	/// damage to bytes that were synced, see `classify_wal_damage_in`. Never in a sealed segment.
+	///
+	/// A binary that knows no marks would take one for damage, so a directory whose segments may
+	/// hold them has a manifest of `MANIFEST_FORMAT_VERSION_V3`, which such a binary refuses.
+	SyncMark = 11,
 }
+
+/// The length of the payload of a [`RecordType::SyncMark`] record.
+pub(crate) const SYNC_MARK_LEN: usize = 8;
 
 impl RecordType {
 	/// Converts a u8 value to a RecordType.
@@ -119,6 +134,7 @@ impl RecordType {
 			4 => Ok(RecordType::Last),
 			9 => Ok(RecordType::SetCompressionType),
 			10 => Ok(RecordType::SegmentHeader),
+			11 => Ok(RecordType::SyncMark),
 			_ => Err(Error::IO(IOError::new(io::ErrorKind::InvalidInput, "Invalid Record Type"))),
 		}
 	}
@@ -275,6 +291,10 @@ pub struct Options {
 
 	/// The maximum size of the segment file.
 	pub(crate) max_file_size: u64,
+
+	/// Whether the plaintext segments that are written hold sync marks, see
+	/// [`RecordType::SyncMark`]. Only tests turn them off.
+	pub(crate) sync_marks: bool,
 }
 
 impl Default for Options {
@@ -288,6 +308,7 @@ impl Default for Options {
 			compression_type: CompressionType::None,
 			file_extension: Some("wal".to_string()),
 			max_file_size: DEFAULT_FILE_SIZE,
+			sync_marks: true,
 		}
 	}
 }
@@ -298,6 +319,8 @@ impl Options {
 	pub(crate) fn for_tree(opts: &crate::Options) -> crate::Result<Self> {
 		Ok(Self {
 			context: WalContext::for_options(opts)?,
+			#[cfg(test)]
+			sync_marks: opts.wal_sync_marks,
 			..Self::default()
 		})
 	}
@@ -792,6 +815,9 @@ pub(crate) struct SyncGate {
 	serial: parking_lot::Mutex<()>,
 	/// Set by the first fsync that fails, never cleared.
 	failed: AtomicBool,
+	/// The length of the file that the last fsync to complete covered: the length it had when
+	/// that fsync began. Only grows, and is never more than what is on disk.
+	synced: AtomicU64,
 	/// Fault injection for tests: how many more fsyncs succeed before one fails.
 	#[cfg(test)]
 	fail_after: parking_lot::Mutex<Option<usize>>,
@@ -809,8 +835,17 @@ impl SyncGate {
 		self.failed.load(Ordering::Acquire)
 	}
 
+	/// The length of the segment that the last fsync to complete covered, see
+	/// [`RecordType::SyncMark`]. 0 until one completes.
+	pub(crate) fn synced(&self) -> u64 {
+		self.synced.load(Ordering::Acquire)
+	}
+
 	/// fsyncs `file`, unless an earlier fsync of the segment failed. The first failure is
 	/// returned as it happened, and every later call fails with [`sync_poisoned`].
+	///
+	/// A successful fsync covers what the file held when it began, so that length is what
+	/// [`SyncGate::synced`] moves to. A length that cannot be read moves it nowhere.
 	pub(crate) fn sync(&self, file: &dyn FsFile) -> Result<()> {
 		#[cfg(test)]
 		self.arrivals.fetch_add(1, Ordering::SeqCst);
@@ -818,9 +853,14 @@ impl SyncGate {
 		if self.failed() {
 			return Err(sync_poisoned());
 		}
+		let covered = file.len().ok();
 		let result = self.fsync(file);
-		if result.is_err() {
-			self.failed.store(true, Ordering::Release);
+		match (&result, covered) {
+			(Err(_), _) => self.failed.store(true, Ordering::Release),
+			(Ok(()), Some(covered)) => {
+				self.synced.fetch_max(covered, Ordering::AcqRel);
+			}
+			(Ok(()), None) => {}
 		}
 		result
 	}

@@ -185,6 +185,8 @@ fn opts(path: &Path, max_memtable_size: usize) -> Arc<Options> {
 		memtable_stall_threshold: 100_000,
 		level0_max_files: 10_000,
 		l0_stall_threshold: 10_000,
+		// The framing under test is of groups; a sync mark in front of one would move it.
+		wal_sync_marks: false,
 		..Default::default()
 	})
 }

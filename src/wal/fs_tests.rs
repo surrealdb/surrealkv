@@ -50,6 +50,15 @@ const GROUPS: &[&[usize]] = &[
 	&[5_000; 12],
 ];
 
+/// The options of a log that writes no sync marks, whose segments are framed as the ones written
+/// before marks were: the goldens below are of those.
+fn unmarked() -> Options {
+	Options {
+		sync_marks: false,
+		..Options::default()
+	}
+}
+
 /// What `GROUPS` made of the file: the `write(2)` calls that each group needed, the length of the
 /// file, and the checksum of its bytes.
 fn run_groups(dir: &Path, opts: Options, sync_each: bool) -> (Vec<usize>, u64, u32) {
@@ -74,7 +83,7 @@ fn run_groups(dir: &Path, opts: Options, sync_each: bool) -> (Vec<usize>, u64, u
 #[test]
 fn the_writes_of_a_commit_group_are_the_ones_of_the_log_before_the_seam() {
 	let dir = TempDir::new().unwrap();
-	let (writes, len, checksum) = run_groups(dir.path(), Options::default(), true);
+	let (writes, len, checksum) = run_groups(dir.path(), unmarked(), true);
 	assert_eq!(writes, GOLDEN_WRITES, "the write(2) calls of each group changed");
 	assert_eq!(len, GOLDEN_LEN, "the length of the segment changed");
 	assert_eq!(checksum, GOLDEN_CRC, "the bytes of the segment changed");
@@ -84,8 +93,8 @@ fn the_writes_of_a_commit_group_are_the_ones_of_the_log_before_the_seam() {
 fn syncing_after_each_group_or_once_leaves_the_same_segment() {
 	let each = TempDir::new().unwrap();
 	let once = TempDir::new().unwrap();
-	let (_, len_each, crc_each) = run_groups(each.path(), Options::default(), true);
-	let (_, len_once, crc_once) = run_groups(once.path(), Options::default(), false);
+	let (_, len_each, crc_each) = run_groups(each.path(), unmarked(), true);
+	let (_, len_once, crc_once) = run_groups(once.path(), unmarked(), false);
 	assert_eq!((len_each, crc_each), (len_once, crc_once));
 }
 
@@ -109,7 +118,7 @@ fn read_all(reader: &mut Reader) -> (Vec<u64>, u32, String) {
 #[test]
 fn the_reader_returns_the_records_that_the_groups_wrote_at_the_offsets_it_always_did() {
 	let dir = TempDir::new().unwrap();
-	run_groups(dir.path(), Options::default(), true);
+	run_groups(dir.path(), unmarked(), true);
 	let file = fs::File::open(dir.path().join(format!("{:020}.wal", 1))).unwrap();
 	let mut reader = Reader::new(file);
 	let (offsets, checksum, end) = read_all(&mut reader);
@@ -461,7 +470,7 @@ impl Fs for RecordingFs {
 }
 
 fn options_over(fs: Arc<dyn Fs>) -> Options {
-	let mut opts = Options::default();
+	let mut opts = unmarked();
 	opts.context.fs = fs;
 	opts
 }

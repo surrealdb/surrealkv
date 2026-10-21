@@ -453,7 +453,7 @@ impl CoreInner {
 		// Initialize level manifest FIRST to get log_number. Whether it exists must be read
 		// first, because `LevelManifest::new` creates one when it does not.
 		let manifest_loaded_from_disk = opts.fs.exists(&opts.manifest_file_path(0));
-		let manifest = LevelManifest::new_in(&*opts.fs, Arc::clone(&opts))?;
+		let mut manifest = LevelManifest::new_in(&*opts.fs, Arc::clone(&opts))?;
 		let manifest_log_number = manifest.get_log_number();
 
 		// Whether the table files that the manifest does not list are this database's is read
@@ -483,6 +483,10 @@ impl CoreInner {
 		} else {
 			None
 		};
+
+		// The WAL segments that the open writes may hold sync marks, which a binary that knows no
+		// marks must not read: the manifest is of the version that such a binary refuses first.
+		manifest.upgrade_format_in(&*opts.fs)?;
 
 		// Initialize WAL starting from manifest.log_number
 		let wal_path = opts.wal_dir();
@@ -2271,6 +2275,27 @@ impl Core {
 								report.quarantined_files.push(quarantine_path);
 								report.bytes_trimmed += bytes_trimmed;
 							}
+							WalDamage::UnsyncedTail {
+								last_valid_offset,
+								intact_records_after,
+								file_size,
+							} => {
+								tracing::info!(
+										"Damage in the unsynced tail of the last WAL segment {segment_id} at offset {last_valid_offset} \
+										(file size {file_size}): no sync mark after it says it was synced. Trimming the tail, with \
+										its {intact_records_after} intact record(s) that were never synced, and quarantining the original."
+									);
+								let (quarantine_path, bytes_trimmed) =
+									repair_corrupted_wal_segment_in(
+										&*wal_context.fs,
+										wal_path,
+										segment_id,
+										last_valid_offset,
+									)?;
+								report.records_dropped += intact_records_after;
+								report.quarantined_files.push(quarantine_path);
+								report.bytes_trimmed += bytes_trimmed;
+							}
 							WalDamage::InteriorCorruption {
 								last_valid_offset,
 								intact_records_after,
@@ -2333,6 +2358,11 @@ impl Core {
 								last_valid_offset,
 								..
 							} => (last_valid_offset, 0),
+							WalDamage::UnsyncedTail {
+								last_valid_offset,
+								intact_records_after,
+								..
+							} => (last_valid_offset, intact_records_after),
 							WalDamage::InteriorCorruption {
 								last_valid_offset,
 								intact_records_after,
@@ -3579,7 +3609,9 @@ impl Tree {
 		// Step 2: Reload in-memory state to match restored files
 
 		// Read from disk with none of the locks of the state held.
-		let new_levels = LevelManifest::new(Arc::clone(&self.core.inner.opts))?;
+		let mut new_levels = LevelManifest::new(Arc::clone(&self.core.inner.opts))?;
+		// The WAL is reopened on the restored directory below, see `CoreInner::new`.
+		new_levels.upgrade_format_in(&*self.core.inner.opts.fs)?;
 
 		// The files of the value log were replaced: the log's writer, its handles and its next
 		// file id belong to the ones that are gone. Before the swap below, so that a reader of the

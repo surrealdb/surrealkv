@@ -18,6 +18,7 @@ use super::{
 	WritableFile,
 	BLOCK_SIZE,
 	HEADER_SIZE,
+	SYNC_MARK_LEN,
 };
 use crate::tde::{FileCipher, TAG_LEN};
 
@@ -63,6 +64,13 @@ pub struct Writer {
 	/// Set when an append failed and the segment could not be cut back to its last whole record,
 	/// so that it may hold the start of a record, or whole records that were never acknowledged.
 	uncut: bool,
+
+	/// Whether appends write sync marks, see [`RecordType::SyncMark`]. Never in a sealed segment.
+	marks: bool,
+
+	/// The synced length of this writer's last mark, 0 before its first. An append writes a mark
+	/// first when the synced length differs from it.
+	last_mark: Option<u64>,
 }
 
 impl Writer {
@@ -87,7 +95,45 @@ impl Writer {
 			held: None,
 			sealer: None,
 			uncut: false,
+			marks: false,
+			last_mark: None,
 		}
+	}
+
+	/// Has every later append to this plaintext segment write a mark first when the synced length
+	/// moved on since the last mark, see [`RecordType::SyncMark`]. Nothing is written until an
+	/// fsync of the segment completes: a segment that was never synced holds no mark.
+	pub(crate) fn write_sync_marks(&mut self) {
+		if self.sealer.is_none() {
+			self.marks = true;
+			self.last_mark = Some(0);
+		}
+	}
+
+	/// Frames a mark of how far the segment is synced into the buffer, unless the segment holds
+	/// no marks or its last mark says the same. A mark is one physical record that never crosses
+	/// a block: a block with too little room left for it is padded with zeros first, which the
+	/// readers take for the padding of a block.
+	///
+	/// The synced length is the one the last fsync to complete covered, see `SyncGate::synced`,
+	/// so a mark never claims bytes that an fsync in flight may not cover.
+	fn write_sync_mark_unflushed(&mut self) -> Result<()> {
+		if !self.marks {
+			return Ok(());
+		}
+		let synced = self.dest.gate().synced();
+		if self.last_mark == Some(synced) {
+			return Ok(());
+		}
+		let leftover = BLOCK_SIZE - self.block_offset;
+		if leftover < HEADER_SIZE + SYNC_MARK_LEN {
+			const ZEROS: [u8; HEADER_SIZE + SYNC_MARK_LEN] = [0u8; HEADER_SIZE + SYNC_MARK_LEN];
+			self.dest.append(&ZEROS[..leftover])?;
+			self.block_offset = 0;
+		}
+		self.emit_physical_record(RecordType::SyncMark, &synced.to_be_bytes())?;
+		self.last_mark = Some(synced);
+		Ok(())
 	}
 
 	/// Starts a sealed segment on the new, empty file behind `dest`: writes its header record, and
@@ -217,7 +263,10 @@ impl Writer {
 		}
 		let compressed = self.compress_records(slice, &[slice.len()])?;
 		let slice = compressed.as_ref().map_or(slice, |(blocks, _)| &blocks[..]);
-		self.guard_append(|writer| writer.write_record(slice))
+		self.guard_append(|writer| {
+			writer.write_sync_mark_unflushed()?;
+			writer.write_record(slice)
+		})
 	}
 
 	/// Adds several records, `buf[ends[i - 1]..ends[i]]` being record `i` (`ends[-1]` is 0),
@@ -246,6 +295,7 @@ impl Writer {
 			// cut back to it. Checked once the writer is known not to be poisoned: a failed
 			// cut can leave bytes in the buffer, and that must be an error, not a panic.
 			debug_assert!(writer.dest.is_flushed());
+			writer.write_sync_mark_unflushed()?;
 			let mut start = 0;
 			for &end in ends {
 				writer.write_record_unflushed(&buf[start..end])?;
@@ -501,12 +551,16 @@ impl Writer {
 		// cutting it there would extend it.
 		let last_good_len = self.dest.len().filter(|_| self.dest.is_flushed());
 		let last_good_block_offset = self.block_offset;
+		let last_good_mark = self.last_mark;
 
 		let result = append(self);
 		if result.is_err() {
 			self.poisoned = true;
 			match last_good_len.map(|len| self.dest.truncate(len)) {
-				Some(Ok(())) => self.block_offset = last_good_block_offset,
+				Some(Ok(())) => {
+					self.block_offset = last_good_block_offset;
+					self.last_mark = last_good_mark;
+				}
 				Some(Err(e)) => {
 					self.uncut = true;
 					tracing::error!("Failed to cut a partial record off the WAL segment: {e}")

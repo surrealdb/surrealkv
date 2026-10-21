@@ -28,7 +28,7 @@ use tempfile::TempDir;
 use test_log::test;
 
 use super::tfs;
-use crate::levels::{DecodedManifest, MANIFEST_FORMAT_VERSION_V2};
+use crate::levels::{DecodedManifest, MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION_V2};
 use crate::migrate::for_each_entry;
 use crate::migrate::legacy::{
 	migrate_failing_after,
@@ -168,7 +168,7 @@ pub(crate) fn assert_every_value_resolves(opts: &Arc<Options>, what: &str) {
 
 pub(crate) fn migrated_entries(opts: &Arc<Options>) -> Vec<MigratedEntry> {
 	let manifest = DecodedManifest::decode(fs::read(opts.manifest_file_path(0)).unwrap()).unwrap();
-	assert_eq!(manifest.version, MANIFEST_FORMAT_VERSION_V2);
+	assert_eq!(manifest.version, MANIFEST_FORMAT_VERSION);
 	tfs::create_dir_all(opts, opts.vlog_dir()).unwrap();
 	let vlog = Arc::new(VLog::new(Arc::clone(opts)).unwrap());
 	let mut out = Vec::new();
@@ -453,7 +453,7 @@ fn what_was_replaced_is_kept_and_what_was_derived_is_removed() {
 	assert!(fs::read_dir(opts.wal_dir()).map(|d| d.count()).unwrap_or(0) == 0, "no WAL left");
 
 	let after = DecodedManifest::decode(fs::read(opts.manifest_file_path(0)).unwrap()).unwrap();
-	assert_eq!(after.version, MANIFEST_FORMAT_VERSION_V2);
+	assert_eq!(after.version, MANIFEST_FORMAT_VERSION);
 	assert!(after.log_number > before.log_number, "the WAL tail counts as flushed");
 	assert!(after.last_sequence >= before.last_sequence);
 }

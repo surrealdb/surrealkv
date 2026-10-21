@@ -372,6 +372,12 @@ pub struct Options {
 	/// The file system the database lives in. `std::fs` on a native build, and nothing in a
 	/// browser, where one has to be mounted and given with `with_file_system`.
 	pub(crate) fs: Arc<dyn vfs::Fs>,
+
+	/// Test-only: whether the WAL writes sync marks (`wal::RecordType::SyncMark`). On by default;
+	/// the tests that put a record at a given place in a block turn them off, as a mark in front
+	/// of it would move it.
+	#[cfg(test)]
+	pub(crate) wal_sync_marks: bool,
 }
 
 /// The sizes that `Options::default()` starts from. A native build has the memory of a server and
@@ -450,6 +456,8 @@ impl Default for Options {
 			encryption_cipher: CipherPreference::default(),
 			encryption_context: None,
 			fs: vfs::options_default_fs(),
+			#[cfg(test)]
+			wal_sync_marks: true,
 		}
 	}
 }
