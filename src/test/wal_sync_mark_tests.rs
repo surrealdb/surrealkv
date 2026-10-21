@@ -15,7 +15,7 @@ use super::format_gate_tests::{manifest_version, set_manifest_version};
 use super::{sfs as fs, tfs};
 use crate::levels::MANIFEST_FORMAT_VERSION_V2;
 use crate::vfs::IntoFsFile;
-use crate::wal::manager::Wal;
+use crate::wal::manager::{Wal, WalManager};
 use crate::wal::reader::Reader;
 use crate::wal::recovery::{scan_after_in, segment_holds_marks_in, AfterDamage};
 use crate::wal::{
@@ -524,4 +524,42 @@ async fn an_open_that_refuses_the_wal_leaves_the_manifest_as_it_was() {
 
 	Tree::new(opts(dir.path(), true)).err().expect("the damage must be refused");
 	assert_eq!(manifest_version(&unmarked), MANIFEST_FORMAT_VERSION_V2);
+}
+
+/// A sync within a bound makes the segment durable, but the mark that follows claims no more of it
+/// than the bound took: the records appended after the bound may point to values that the caller
+/// did not sync. A bound taken of another segment claims nothing of the one that is synced, past
+/// what its leading mark claims.
+#[test]
+fn a_sync_within_a_bound_marks_no_more_than_the_bound() {
+	let dir = TempDir::new().unwrap();
+	let first = segment_path(dir.path(), 1);
+	let wal = WalManager::new(
+		Wal::open_with_min_log_number(dir.path(), 1, tfs::wal_options_for(dir.path())).unwrap(),
+	);
+
+	let (a, a_ends) = records(&[100], b'a');
+	wal.write().append_group(&a, &a_ends).unwrap();
+	let bound = wal.sync_bound();
+	let len_a = len(&first);
+	let (b, b_ends) = records(&[200], b'b');
+	wal.write().append_group(&b, &b_ends).unwrap();
+	wal.sync_within(&bound).unwrap();
+	wal.write().append_group(&a, &a_ends).unwrap();
+	assert_eq!(scan(&first, 0).highest_mark, Some(len_a), "the mark stops at the bound");
+
+	// A plain sync claims every append that reached the file whole.
+	wal.sync().unwrap();
+	let synced = len(&first);
+	wal.write().append_group(&a, &a_ends).unwrap();
+	assert_eq!(scan(&first, 0).highest_mark, Some(synced));
+
+	let bound = wal.sync_bound();
+	let second = segment_path(dir.path(), wal.write().rotate().unwrap());
+	wal.write().append_group(&a, &a_ends).unwrap();
+	wal.sync_within(&bound).unwrap();
+	wal.write().append_group(&a, &a_ends).unwrap();
+	// The leading mark of the new segment claims nothing, and the sync adds no claim to it.
+	assert_eq!(scan(&second, 0).highest_mark, Some(0), "a bound of another segment claims nothing");
+	wal.write().close().unwrap();
 }

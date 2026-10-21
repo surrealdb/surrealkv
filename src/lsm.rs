@@ -2759,18 +2759,26 @@ impl Core {
 		if sync && self.wal.read().is_held() {
 			return Err(wal::segment_held().into());
 		}
-		if let Some(ref vlog) = self.vlog {
+		let Some(ref vlog) = self.vlog else {
 			if sync {
-				vlog.sync()?;
+				self.wal.sync()?;
 			} else {
-				vlog.flush()?;
+				self.wal.flush()?;
 			}
-		}
-		if sync {
-			self.wal.sync()?;
-		} else {
+			return Ok(());
+		};
+		if !sync {
+			vlog.flush()?;
 			self.wal.flush()?;
+			return Ok(());
 		}
+		// A record reaches the WAL after its values reach the value log, so the sync of the value
+		// log covers the values of every record that the WAL holds before it. The commits that
+		// land in between have values it may not cover: the fsync of the WAL makes their records
+		// durable too, but the marks of the segment claim only what it held before.
+		let bound = self.wal.sync_bound();
+		vlog.sync()?;
+		self.wal.sync_within(&bound)?;
 		Ok(())
 	}
 

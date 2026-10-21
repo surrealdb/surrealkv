@@ -1,11 +1,13 @@
 //! What the open does with a record of the last segment of the log whose value is not in the value
 //! log, in each recovery mode, on the disk and over the memory file system.
 //!
-//! Every state is made by hand: Eventual commits with the value log, a tree that is abandoned (the
-//! process is gone and the files are as it left them), and then only the value log is damaged. The
-//! cases are the ways a value log can fail to hold what the log points to: it lost its tail, a file
-//! is gone, a page of a value is zeros, a stored checksum changed. In each, the entries before the
-//! first failure are whole and the ones after it are, or are not.
+//! Every state is made by hand: commits with the value log, a tree that is abandoned (the process
+//! is gone and the files are as it left them), and then only the value log is damaged. The cases
+//! are the ways a value log can fail to hold what the log points to: it lost its tail, a file is
+//! gone, a page of a value is zeros, a stored checksum changed. In each, the entries before the
+//! first failure are whole and the ones after it are, or are not. The commits are Eventual, so
+//! nothing says that a value was synced, unless a test makes them Immediate: then the sync marks of
+//! the segment say that every record but the last was.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -93,8 +95,14 @@ impl World {
 	/// The state that a process that is gone leaves behind after `COMMITS` Eventual commits: every
 	/// byte that was written is in the files.
 	async fn after_a_crash(self, vlog_file_size: u64) -> World {
+		self.after_commits(vlog_file_size, Durability::Eventual).await
+	}
+
+	/// The state that a process that is gone leaves behind after `COMMITS` commits of
+	/// `durability`: every byte that was written is in the files.
+	async fn after_commits(self, vlog_file_size: u64, durability: Durability) -> World {
 		let tree = self.open(WalRecoveryMode::TolerateTornTail, vlog_file_size).await.unwrap();
-		commit_range(&tree, 0..COMMITS, VALUE, Durability::Eventual).await;
+		commit_range(&tree, 0..COMMITS, VALUE, durability).await;
 		tree.abandon();
 		self.fs.abandon();
 		drop(tree);
@@ -423,14 +431,16 @@ async fn absolute_consistency_refuses_the_open_and_names_the_segment_and_the_rec
 	.await;
 }
 
+/// Immediate commits: a sync mark of the segment says that the record whose value is missing was
+/// synced, and so was its value.
 #[test(tokio::test)]
-async fn the_default_mode_ends_the_log_before_a_value_that_is_missing_when_none_after_it_is_there()
-{
-	within("tolerate torn tail", async {
+async fn the_default_mode_ends_the_log_before_a_synced_value_that_is_missing_when_none_after_it_is_there(
+) {
+	within("tolerate torn tail, synced", async {
 		for case in cases() {
 			for world in World::all() {
 				let what = format!("{}: {}", world.name, case.what);
-				let world = world.after_a_crash(case.vlog_file_size).await;
+				let world = world.after_commits(case.vlog_file_size, Durability::Immediate).await;
 				let entries = world.entries();
 				let (segment_id, segment) = world.segment();
 				let ends = world.record_ends(&segment, segment_id);
@@ -441,14 +451,15 @@ async fn the_default_mode_ends_the_log_before_a_value_that_is_missing_when_none_
 				let (copy, opened) =
 					opened_in(&world, WalRecoveryMode::TolerateTornTail, case.vlog_file_size).await;
 				if !case.lost_its_tail {
-					// A value that is missing with values after it that are there is a hole in
-					// the log and not its end: the open says so and does not cut.
+					// A synced value that is missing with values after it that are there is a
+					// hole in the log and not its end: the open says so and does not cut.
 					let Err(error) = opened else {
 						panic!("{what}: the open succeeded");
 					};
 					let text = error.to_string();
 					assert!(matches!(error, Error::Other(_)), "{what}: {text}");
 					assert!(text.contains("SalvageValidPrefix"), "{what}: {text}");
+					assert!(text.contains("sync mark"), "{what}: {text}");
 					assert!(text.contains(&format!("{segment_id:020}.wal")), "{what}: {text}");
 					assert_eq!(
 						copy.snapshot(),
@@ -461,6 +472,146 @@ async fn the_default_mode_ends_the_log_before_a_value_that_is_missing_when_none_
 				assert_cut(&copy, &tree, &case, &segment, &original, &ends, &what);
 				tree.close().await.unwrap();
 			}
+		}
+	})
+	.await;
+}
+
+/// Eventual commits, whose segment was never synced: no mark says that a value was synced, and a
+/// value that is missing ends the log whatever follows it, a hole as a power cut leaves it in
+/// pages of the value log that were not written back as much as a lost tail.
+#[test(tokio::test)]
+async fn the_default_mode_ends_the_log_before_a_value_that_was_never_synced_whatever_follows_it() {
+	within("tolerate torn tail, never synced", async {
+		for case in cases() {
+			for world in World::all() {
+				let what = format!("{}: {}", world.name, case.what);
+				let world = world.after_a_crash(case.vlog_file_size).await;
+				let entries = world.entries();
+				let (segment_id, segment) = world.segment();
+				let ends = world.record_ends(&segment, segment_id);
+				let original = world.read(&segment);
+				(case.damage)(&world, &entries);
+
+				let (copy, opened) =
+					opened_in(&world, WalRecoveryMode::TolerateTornTail, case.vlog_file_size).await;
+				let tree = opened.unwrap_or_else(|e| panic!("{what}: {e}"));
+				assert_cut(&copy, &tree, &case, &segment, &original, &ends, &what);
+				tree.close().await.unwrap();
+			}
+		}
+	})
+	.await;
+}
+
+/// The marks say how far the segment was synced, and a hole below that is refused: here the
+/// commits up to `SYNCED` were synced, each as it was made or all of them by a sync of the WAL
+/// after them, as a database that syncs at an interval does, and the ones after it were not. A
+/// value that is missing in the first is refused, and one in the second is cut, with the values
+/// after it there in both.
+#[test(tokio::test)]
+async fn the_default_mode_refuses_a_hole_below_the_last_sync_and_cuts_one_after_it() {
+	within("tolerate torn tail, synced then not", async {
+		const SYNCED: usize = 6;
+		let cases = [(2, true), (SYNCED - 2, true), (SYNCED, false), (9, false)];
+		for ((missing, refused), interval) in
+			cases.into_iter().flat_map(|case| [(case, false), (case, true)])
+		{
+			for world in World::all() {
+				let what = format!(
+					"{}: value {missing} is missing, {}",
+					world.name,
+					if interval {
+						"synced by flush_wal"
+					} else {
+						"Immediate commits"
+					}
+				);
+				let tree = world.open(WalRecoveryMode::TolerateTornTail, BIG_FILES).await.unwrap();
+				if interval {
+					commit_range(&tree, 0..SYNCED, VALUE, Durability::Eventual).await;
+					tree.flush_wal(true).unwrap();
+				} else {
+					commit_range(&tree, 0..SYNCED, VALUE, Durability::Immediate).await;
+				}
+				commit_range(&tree, SYNCED..COMMITS, VALUE, Durability::Eventual).await;
+				tree.abandon();
+				world.fs.abandon();
+				drop(tree);
+				let world = match world.dir {
+					Some(_) => world,
+					None => World {
+						fs: world.fs.simulate_crash(CrashMode::Prefix(usize::MAX)).unwrap(),
+						..world
+					},
+				};
+				let entries = world.entries();
+				assert_eq!(entries.len(), COMMITS, "{what}");
+				let (segment_id, segment) = world.segment();
+				let ends = world.record_ends(&segment, segment_id);
+				let original = world.read(&segment);
+				lose_the_middle_of(&world, &entries[missing]);
+				let before = world.snapshot();
+
+				let (copy, opened) =
+					opened_in(&world, WalRecoveryMode::TolerateTornTail, BIG_FILES).await;
+				if refused {
+					let error =
+						opened.err().unwrap_or_else(|| panic!("{what}: the open succeeded"));
+					assert!(error.to_string().contains("sync mark"), "{what}: {error}");
+					assert_eq!(
+						copy.snapshot(),
+						before,
+						"{what}: the open left every file as it was"
+					);
+					continue;
+				}
+				let tree = opened.unwrap_or_else(|e| panic!("{what}: {e}"));
+				let report = tree.recovery_report();
+				assert_eq!(report.records_dropped, COMMITS - missing, "{what}: {report:?}");
+				assert_eq!(report.bytes_trimmed as usize, original.len() - ends[missing - 1]);
+				assert_keys(&tree, missing, &what);
+				tree.close().await.unwrap();
+			}
+		}
+	})
+	.await;
+}
+
+/// A segment without marks, of a binary that writes none, says nothing of how far it was synced,
+/// so the default mode refuses a hole in its values as it did before marks: the values may have
+/// been synced, as nothing records that they were not, here although none was.
+#[test(tokio::test)]
+async fn the_default_mode_refuses_a_hole_in_a_segment_without_marks() {
+	within("tolerate torn tail, no marks", async {
+		for world in World::all() {
+			let what = format!("{}: a segment without marks", world.name);
+			let options = Options {
+				wal_sync_marks: false,
+				..world.options(WalRecoveryMode::TolerateTornTail, BIG_FILES)
+			};
+			let tree = TreeBuilder::with_options(options).build_async().await.unwrap();
+			commit_range(&tree, 0..COMMITS, VALUE, Durability::Eventual).await;
+			tree.abandon();
+			world.fs.abandon();
+			drop(tree);
+			let world = match world.dir {
+				Some(_) => world,
+				None => World {
+					fs: world.fs.simulate_crash(CrashMode::Prefix(usize::MAX)).unwrap(),
+					..world
+				},
+			};
+			let entries = world.entries();
+			assert_eq!(entries.len(), COMMITS, "{what}");
+			lose_the_middle_of(&world, &entries[2]);
+			let before = world.snapshot();
+
+			let (copy, opened) =
+				opened_in(&world, WalRecoveryMode::TolerateTornTail, BIG_FILES).await;
+			let error = opened.err().unwrap_or_else(|| panic!("{what}: the open succeeded"));
+			assert!(error.to_string().contains("SalvageValidPrefix"), "{what}: {error}");
+			assert_eq!(copy.snapshot(), before, "{what}: the open left every file as it was");
 		}
 	})
 	.await;
@@ -690,7 +841,8 @@ async fn a_value_log_file_that_lost_its_first_page_is_set_aside_and_the_log_ends
 /// A file of the value log that is followed by another, and whose first bytes are zeros with the
 /// entries after them: the first page of a file that was rolled over from was not written back. The
 /// open sets the file aside as it does the newest, the records that point into it are the first
-/// that the value log does not hold, and the log is held to that in each mode.
+/// that the value log does not hold, and the log is held to that in each mode: the commits were
+/// Eventual, so the default mode ends it there although later values are whole.
 #[test(tokio::test)]
 async fn an_older_value_log_file_that_lost_its_first_page_is_set_aside_and_the_log_ends_there() {
 	within("older zeroed header", async {
@@ -727,51 +879,52 @@ async fn an_older_value_log_file_that_lost_its_first_page_is_set_aside_and_the_l
 				);
 				assert_eq!(copy.read(&segment), original, "{what}: the log was left as it was");
 
-				// Later records point to files that are whole: a hole in the log and not its end,
-				// which the default mode leaves to the person who opens the database.
-				let (copy, opened) =
-					opened_in(&world, WalRecoveryMode::TolerateTornTail, SMALL_FILES).await;
-				let error = opened.err().unwrap_or_else(|| panic!("{what}: the open succeeded"));
-				assert!(error.to_string().contains("SalvageValidPrefix"), "{what}: {error}");
-				assert_eq!(copy.read(&segment), original, "{what}: the log was left as it was");
-
-				let (copy, opened) =
-					opened_in(&world, WalRecoveryMode::SalvageValidPrefix, SMALL_FILES).await;
-				let tree = opened.unwrap_or_else(|e| panic!("{what}: {e}"));
-				let report = tree.recovery_report();
-				assert_eq!(report.records_dropped, COMMITS - first_failed, "{what}: {report:?}");
-				assert_keys(&tree, first_failed, &what);
-				let files = copy.list("vlog");
-				assert!(
-					files.iter().any(|name| name.ends_with(".vlog.torn")),
-					"{what}: the file was set aside: {files:?}"
-				);
-				// The log goes on, and what it takes now is there after a close.
-				commit_range(&tree, 100..110, VALUE, Durability::Immediate).await;
-				tree.close().await.unwrap();
-				drop(tree);
-				let again = copy
-					.open(WalRecoveryMode::AbsoluteConsistency, SMALL_FILES)
-					.await
-					.unwrap_or_else(|e| panic!("{what}: {e}"));
-				assert_keys(&again, first_failed, &what);
-				for (i, got) in read_range(&again, 100..110) {
-					assert_eq!(got, Some(value_of(i, VALUE)), "{what}: key {i}");
+				// Later records point to files that are whole, but no mark says that the file that
+				// lost its page was synced: the default mode ends the log there as salvage does.
+				for mode in [WalRecoveryMode::TolerateTornTail, WalRecoveryMode::SalvageValidPrefix]
+				{
+					let what = format!("{what}, {mode:?}");
+					let (copy, opened) = opened_in(&world, mode, SMALL_FILES).await;
+					let tree = opened.unwrap_or_else(|e| panic!("{what}: {e}"));
+					let report = tree.recovery_report();
+					assert_eq!(
+						report.records_dropped,
+						COMMITS - first_failed,
+						"{what}: {report:?}"
+					);
+					assert_keys(&tree, first_failed, &what);
+					let files = copy.list("vlog");
+					assert!(
+						files.iter().any(|name| name.ends_with(".vlog.torn")),
+						"{what}: the file was set aside: {files:?}"
+					);
+					// The log goes on, and what it takes now is there after a close.
+					commit_range(&tree, 100..110, VALUE, Durability::Immediate).await;
+					tree.close().await.unwrap();
+					drop(tree);
+					let again = copy
+						.open(WalRecoveryMode::AbsoluteConsistency, SMALL_FILES)
+						.await
+						.unwrap_or_else(|e| panic!("{what}: {e}"));
+					assert_keys(&again, first_failed, &what);
+					for (i, got) in read_range(&again, 100..110) {
+						assert_eq!(got, Some(value_of(i, VALUE)), "{what}: key {i}");
+					}
+					again.close().await.unwrap();
 				}
-				again.close().await.unwrap();
 			}
 		}
 	})
 	.await;
 }
 
-/// The state that a process that is gone leaves behind after Eventual commits of the given shapes,
-/// one transaction for each slice of keys: every byte that was written is in the files.
-async fn after_commits_of(world: World, shapes: &[&[usize]]) -> World {
+/// The state that a process that is gone leaves behind after commits of `durability` of the given
+/// shapes, one transaction for each slice of keys: every byte that was written is in the files.
+async fn after_commits_of(world: World, shapes: &[&[usize]], durability: Durability) -> World {
 	let tree = world.open(WalRecoveryMode::TolerateTornTail, BIG_FILES).await.unwrap();
 	for keys in shapes {
 		let mut txn = tree.begin().unwrap();
-		txn.set_durability(Durability::Eventual);
+		txn.set_durability(durability);
 		for &i in *keys {
 			txn.set(key_of(i), value_of(i, VALUE)).unwrap();
 		}
@@ -807,7 +960,8 @@ async fn a_record_of_several_values_ends_the_log_where_any_of_its_values_is_not_
 		for damaged in 1..=3 {
 			for world in World::all() {
 				let what = format!("{}, value {damaged} of the record", world.name);
-				let world = after_commits_of(world, &[&[0], &[1, 2, 3], &[4]]).await;
+				let world =
+					after_commits_of(world, &[&[0], &[1, 2, 3], &[4]], Durability::Eventual).await;
 				let entries = world.entries();
 				assert_eq!(entries.len(), 5, "{what}");
 				let (segment_id, segment) = world.segment();
@@ -836,40 +990,37 @@ async fn a_record_of_several_values_ends_the_log_where_any_of_its_values_is_not_
 				);
 				assert_eq!(copy.read(&segment), original, "{what}: the log was left as it was");
 
-				// The record after it has its value, so the default mode sees a hole.
-				let (copy, opened) =
-					opened_in(&world, WalRecoveryMode::TolerateTornTail, BIG_FILES).await;
-				let error = opened.err().unwrap_or_else(|| panic!("{what}: the open succeeded"));
-				assert!(error.to_string().contains("SalvageValidPrefix"), "{what}: {error}");
-				assert_eq!(copy.read(&segment), original, "{what}: the log was left as it was");
-
-				// The mode that salvages ends the log before the record, and none of its keys is
-				// there: the values of the record that are whole are not replayed either.
-				let (copy, opened) =
-					opened_in(&world, WalRecoveryMode::SalvageValidPrefix, BIG_FILES).await;
-				let tree = opened.unwrap_or_else(|e| panic!("{what}: {e}"));
-				let report = tree.recovery_report();
-				assert_eq!(report.records_dropped, 2, "{what}: {report:?}");
-				assert_eq!(report.records_replayed, 1, "{what}: {report:?}");
-				assert_eq!(report.bytes_trimmed as usize, original.len() - ends[0], "{what}");
-				keys(&tree, 1);
-				assert_eq!(
-					copy.read(&segment).len(),
-					ends[0],
-					"{what}: ends where the record began"
-				);
-				tree.close().await.unwrap();
+				// The other modes end the log before the record, and none of its keys is there: the
+				// values of the record that are whole are not replayed either. The record after it
+				// has its value, but nothing says that the one that is missing was synced.
+				for mode in [WalRecoveryMode::TolerateTornTail, WalRecoveryMode::SalvageValidPrefix]
+				{
+					let what = format!("{what}, {mode:?}");
+					let (copy, opened) = opened_in(&world, mode, BIG_FILES).await;
+					let tree = opened.unwrap_or_else(|e| panic!("{what}: {e}"));
+					let report = tree.recovery_report();
+					assert_eq!(report.records_dropped, 2, "{what}: {report:?}");
+					assert_eq!(report.records_replayed, 1, "{what}: {report:?}");
+					assert_eq!(report.bytes_trimmed as usize, original.len() - ends[0], "{what}");
+					keys(&tree, 1);
+					assert_eq!(
+						copy.read(&segment).len(),
+						ends[0],
+						"{what}: ends where the record began"
+					);
+					tree.close().await.unwrap();
+				}
 			}
 		}
 	})
 	.await;
 }
 
-/// What follows the first value that is missing decides what the default mode does, and a record
-/// of several values follows it as soon as one of them is there: the log is not the end of a value
-/// log that lost its tail, but has a hole, and is not cut. The log is three records: the value of
-/// the second is not in the value log, and the third is one transaction of two keys, of which only
-/// one value is.
+/// What follows the first value that is missing decides what the default mode does with a value
+/// that was synced, and a record of several values follows it as soon as one of them is there: the
+/// log is not the end of a value log that lost its tail, but has a hole, and is not cut. The log is
+/// three Immediate records: the value of the second is not in the value log, and the third is one
+/// transaction of two keys, of which only one value is.
 #[test(tokio::test)]
 async fn a_later_record_with_any_one_of_its_values_in_the_value_log_makes_a_hole_and_not_an_end() {
 	within("a record after the first that is missing", async {
@@ -877,7 +1028,8 @@ async fn a_later_record_with_any_one_of_its_values_in_the_value_log_makes_a_hole
 		for whole in [2, 3] {
 			for world in World::all() {
 				let what = format!("{}, value {whole} is there", world.name);
-				let world = after_commits_of(world, &[&[0], &[1], &[2, 3]]).await;
+				let world =
+					after_commits_of(world, &[&[0], &[1], &[2, 3]], Durability::Immediate).await;
 				let entries = world.entries();
 				assert_eq!(entries.len(), 4, "{what}");
 				let (segment_id, segment) = world.segment();

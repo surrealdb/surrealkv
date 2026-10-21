@@ -634,6 +634,17 @@ impl Wal {
 		}
 	}
 
+	/// What the active segment holds now, everything buffered included, as the bound of a later
+	/// sync, see [`WalManager::sync_within`].
+	pub(crate) fn sync_bound(&self) -> SyncBound {
+		SyncBound {
+			at: self
+				.active_writer
+				.as_ref()
+				.map(|writer| (writer.sync_gate(), writer.len().unwrap_or(0))),
+		}
+	}
+
 	/// Makes the write to the active segment after the next `ops` of them fail
 	/// once, as a full disk would.
 	#[cfg(test)]
@@ -911,6 +922,12 @@ impl Drop for Wal {
 	}
 }
 
+/// How much of a segment a sync may say is synced, see [`WalManager::sync_within`]: the segment,
+/// by its gate, and its length when the bound was taken. `None` when there was no segment.
+pub(crate) struct SyncBound {
+	at: Option<(Arc<SyncGate>, u64)>,
+}
+
 /// What `WalManager::sync` fsyncs through outside the WAL lock: the active segment's file, shared
 /// with its writer, and the segment's `SyncGate`.
 pub(crate) struct SyncHandle {
@@ -924,6 +941,22 @@ impl SyncHandle {
 	pub(crate) fn sync(&self) -> Result<()> {
 		match &self.target {
 			Some((file, gate)) => gate.sync(&**file),
+			None => Ok(()),
+		}
+	}
+
+	/// fsyncs the segment, with the synced length that its marks claim moving no further than
+	/// `bound` says, see [`SyncGate::sync_within`]: to the length that `bound` took if it was
+	/// taken of this segment, and nowhere if it was taken of another.
+	fn sync_within(&self, bound: &SyncBound) -> Result<()> {
+		match &self.target {
+			Some((file, gate)) => {
+				let limit = match &bound.at {
+					Some((bound_gate, len)) if Arc::ptr_eq(bound_gate, gate) => *len,
+					_ => 0,
+				};
+				gate.sync_within(&**file, limit)
+			}
 			None => Ok(()),
 		}
 	}
@@ -982,20 +1015,42 @@ impl WalManager {
 	/// this one and then fail), and a rotation that got there first has already synced the
 	/// segment and leaves the new one alone.
 	pub(crate) fn sync(&self) -> Result<()> {
-		let handle = {
-			let mut wal = self.inner.write();
-			// A held segment has nothing to sync, and a sync that finds nothing pending must
-			// not read as success for the segment it replaced.
-			if wal.is_held() {
-				return Err(super::segment_held());
-			}
-			wal.flush()?;
-			wal.sync_handle()
-		};
+		let handle = self.flushed_handle()?;
 		handle.sync()?;
 		#[cfg(test)]
 		self.fsyncs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 		Ok(())
+	}
+
+	/// What the active segment holds now, as the bound of a later [`sync_within`].
+	///
+	/// [`sync_within`]: Self::sync_within
+	pub(crate) fn sync_bound(&self) -> SyncBound {
+		self.inner.read().sync_bound()
+	}
+
+	/// [`sync`](Self::sync), for a caller that made the values of the records durable that the
+	/// segment held when it took `bound`, and of no record after: the marks of the segment claim
+	/// no more than that as synced. The records after it are made durable all the same, but a
+	/// mark that claimed them would say their values were too.
+	pub(crate) fn sync_within(&self, bound: &SyncBound) -> Result<()> {
+		let handle = self.flushed_handle()?;
+		handle.sync_within(bound)?;
+		#[cfg(test)]
+		self.fsyncs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		Ok(())
+	}
+
+	/// The first phase of a sync: the buffer flushed, under the write lock.
+	fn flushed_handle(&self) -> Result<SyncHandle> {
+		let mut wal = self.inner.write();
+		// A held segment has nothing to sync, and a sync that finds nothing pending must not
+		// read as success for the segment it replaced.
+		if wal.is_held() {
+			return Err(super::segment_held());
+		}
+		wal.flush()?;
+		Ok(wal.sync_handle())
 	}
 
 	/// Flushes WAL buffer to OS page cache (no fsync).
