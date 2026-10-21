@@ -1,13 +1,13 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crc32fast::Hasher;
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 
-use crate::error::{EncryptionError, Error, Result};
+use crate::error::{BackgroundErrorHandler, BackgroundErrorReason, EncryptionError, Error, Result};
 use crate::tde::{EncryptionContext, FileCipher};
 use crate::vfs::{CreateOpts, Fs, FsFile, FsKind};
 use crate::{vfs, CompressionType, Options, VLogChecksumLevel, Value};
@@ -1271,6 +1271,14 @@ pub(crate) struct VLog {
 	/// Options for VLog configuration
 	pub(crate) opts: Arc<Options>,
 
+	/// Set by the first fsync of a file of the log that fails, and never cleared: see
+	/// [`sync`](Self::sync).
+	sync_failed: AtomicBool,
+
+	/// Told of the first failed fsync, which stops the database. Set once the tree that owns the
+	/// log has its handler, see [`set_error_handler`](Self::set_error_handler).
+	error_handler: OnceLock<Arc<BackgroundErrorHandler>>,
+
 	/// Test-only: the next fsync of a file fails.
 	#[cfg(test)]
 	fail_next_sync: std::sync::atomic::AtomicBool,
@@ -1318,6 +1326,11 @@ struct Newest {
 	/// a plaintext file, whose writer takes it over, and to read for a sealed file. `None` for a
 	/// file that was set aside, which is no longer where it was.
 	file: Option<Arc<dyn FsFile>>,
+}
+
+/// What every sync of the value log fails with once an fsync of it has failed, see `VLog::sync`.
+fn sync_poisoned() -> Error {
+	Error::Io(Arc::new(io::Error::other("value log is poisoned by an earlier failed fsync")))
 }
 
 /// What a sealed value log is refused with where its files cannot be made: on a file system that
@@ -1416,6 +1429,8 @@ impl VLog {
 			file_handles: RwLock::new(HashMap::new()),
 			generation: AtomicU64::new(crate::cache::next_instance_id()),
 			opts,
+			sync_failed: AtomicBool::new(false),
+			error_handler: OnceLock::new(),
 			#[cfg(test)]
 			fail_next_sync: std::sync::atomic::AtomicBool::new(false),
 			#[cfg(test)]
@@ -1472,7 +1487,7 @@ impl VLog {
 					CompressionType::None as u8,
 					context,
 				)?;
-				self.fs.sync_dir(&self.path)?;
+				self.sync_dir()?;
 				writer
 			}
 			None => VLogWriter::new_in(
@@ -2285,7 +2300,7 @@ impl VLog {
 			self.fsync(file_id, &*handle.file)?;
 		}
 		self.sync()?;
-		self.fs.sync_dir(&self.path)?;
+		self.sync_dir()?;
 		Ok(())
 	}
 
@@ -2426,6 +2441,13 @@ impl VLog {
 	/// Syncs all data to disk: the active file and every file the writer rolled over from
 	/// that is not synced yet, then the directory if a file was created since it was last synced.
 	///
+	/// The first fsync of a file that fails ends the log: it and every later sync fail, until the
+	/// log is opened again. An fsync that fails has lost the pages it could not write, and the
+	/// kernel no longer counts them as dirty, so a later fsync of the same file reports success
+	/// without them; a value written before the failure can then never be made durable, and
+	/// nothing that points at one may be told it is. The failure stops the database (see
+	/// [`set_error_handler`](Self::set_error_handler)), and recovery decides what survived.
+	///
 	/// The write lock is held only for the BufWriter flush (draining the internal buffer to
 	/// OS page cache, ~microseconds). The expensive fsync is performed outside the lock using
 	/// pre-cloned file descriptors, allowing concurrent VLog appends to proceed.
@@ -2452,11 +2474,10 @@ impl VLog {
 		}
 
 		// Phase 2: Outside lock — fsync to disk (slow, doesn't block appends). A rolled-over
-		// file leaves the queue only once its fsync has succeeded, so a failed sync is retried,
-		// and a sync that overlaps another fsyncs the file itself, as the other's fsync may
-		// still be in flight. Only a file that was queued when the fds were taken may leave it:
-		// the active file is queued again by a rollover after that, for bytes this fsync may
-		// not cover.
+		// file leaves the queue only once its fsync has succeeded, and a sync that overlaps
+		// another fsyncs the file itself, as the other's fsync may still be in flight. Only a file
+		// that was queued when the fds were taken may leave it: the active file is queued
+		// again by a rollover after that, for bytes this fsync may not cover.
 		//
 		// An entry is the descriptor that was queued, not its id: a sync that outlasts a reload
 		// fsyncs a file that is gone, and the log may have queued a file of the same id since,
@@ -2474,11 +2495,50 @@ impl VLog {
 		// once for the files created since it last was, and not by the commit that rolled the
 		// log over, which fsyncs nothing.
 		if !self.created.covers(created) {
-			self.fs.sync_dir(&self.path)?;
+			self.sync_dir()?;
 			self.created.settle(created);
 		}
 		self.appended.settle(appended);
 		Ok(())
+	}
+
+	/// Hands the log the handler of the tree that owns it: the first failed fsync records a fatal
+	/// error there, so that every commit fails until the database is opened again.
+	pub(crate) fn set_error_handler(&self, handler: Arc<BackgroundErrorHandler>) {
+		let _ = self.error_handler.set(handler);
+	}
+
+	/// Whether an fsync of the log has failed, after which every sync fails.
+	pub(crate) fn sync_failed(&self) -> bool {
+		self.sync_failed.load(Ordering::Acquire)
+	}
+
+	/// Runs one fsync of a file of the log: refused once one has failed, and the end of the log if
+	/// it fails.
+	fn guarded_sync(&self, fsync: impl FnOnce() -> Result<()>) -> Result<()> {
+		if self.sync_failed() {
+			return Err(sync_poisoned());
+		}
+		let result = fsync();
+		if let Err(error) = &result {
+			if !self.sync_failed.swap(true, Ordering::AcqRel) {
+				if let Some(handler) = self.error_handler.get() {
+					handler.set_error(
+						Error::DatabaseStopped(format!(
+							"an fsync of the value log failed, so the values it was to make 							 durable may be lost, and recovery decides what survived when the 							 database is opened again: {error}"
+						)),
+						BackgroundErrorReason::ValueLogSync,
+					);
+				}
+			}
+		}
+		result
+	}
+
+	/// fsyncs the log's directory. A failure leaves the log as it was, and the next sync fsyncs
+	/// the directory again: it loses no value, as only a file's own fsync drops its pages.
+	fn sync_dir(&self) -> Result<()> {
+		Ok(self.fs.sync_dir(&self.path)?)
 	}
 
 	/// [`sync`](Self::sync), unless every entry appended is covered by an fsync that has
@@ -2496,12 +2556,15 @@ impl VLog {
 
 	fn fsync(&self, file_id: u32, fd: &dyn FsFile) -> Result<()> {
 		#[cfg(test)]
-		if self.fail_next_sync.swap(false, Ordering::SeqCst) {
-			return Err(Error::Io(Arc::new(io::Error::other("injected fsync failure"))));
-		}
-		#[cfg(test)]
 		let len = fd.len().unwrap_or(0);
-		fd.sync()?;
+		self.guarded_sync(|| {
+			#[cfg(test)]
+			if self.fail_next_sync.swap(false, Ordering::SeqCst) {
+				return Err(Error::Io(Arc::new(io::Error::other("injected fsync failure"))));
+			}
+			fd.sync()?;
+			Ok(())
+		})?;
 		tracing::trace!("Synced VLog file {file_id}");
 		#[cfg(test)]
 		{

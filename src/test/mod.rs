@@ -213,6 +213,8 @@ pub mod vlog_sealed_tests;
 #[cfg(test)]
 pub mod vlog_sealed_tree_tests;
 #[cfg(test)]
+pub mod vlog_sync_poison_tests;
+#[cfg(test)]
 pub mod vlog_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod wal_context_tests;

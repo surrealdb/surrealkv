@@ -48,7 +48,7 @@ use crate::wal::{
 	BLOCK_SIZE,
 	HEADER_SIZE,
 };
-use crate::{Durability, InternalKeyKind, Mode, Options, Tree};
+use crate::{Durability, Error, InternalKeyKind, Mode, Options, Tree};
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -222,6 +222,19 @@ async fn put(tree: &Tree, key: &str, value: &[u8], durability: Durability) {
 	txn.set_durability(durability);
 	txn.set(key.as_bytes(), value).unwrap();
 	txn.commit().await.unwrap();
+}
+
+/// A commit after a failed fsync of the value log, which is refused: the database is stopped.
+async fn assert_refused(tree: &Tree, key: &str, value: &[u8], durability: Durability) {
+	let mut txn = tree.begin().unwrap();
+	txn.set_durability(durability);
+	txn.set(key.as_bytes(), value).unwrap();
+	match txn.commit().await {
+		Err(Error::DatabaseStopped(message)) => {
+			assert!(message.contains("value log"), "the cause is the value log: {message}")
+		}
+		other => panic!("{key}: expected the database to be stopped, got {other:?}"),
+	}
 }
 
 /// One single-key transaction per entry, all spawned before the flusher is polled: on the
@@ -1980,7 +1993,8 @@ async fn a_vlog_write_failure_in_the_middle_of_a_group_fails_it_and_logs_nothing
 
 /// A vlog that fails to fsync fails an Immediate group before it writes to the WAL, so a
 /// record that was reported failed cannot be replayed after a crash, and a record that is in
-/// the WAL never points at a value that is not on disk.
+/// the WAL never points at a value that is not on disk. The failed fsync ends the value log, so
+/// the commit after it is refused too.
 #[test(tokio::test)]
 async fn a_failed_vlog_fsync_fails_the_group_before_the_wal_is_written() {
 	let dir = TempDir::new("wal_group_crash").unwrap();
@@ -1999,10 +2013,11 @@ async fn a_failed_vlog_fsync_fails_the_group_before_the_wal_is_written() {
 	}
 	assert_eq!(fs::read(&segment).unwrap(), logged, "a group that failed logged nothing");
 
-	let later = ("later".to_string(), payload(99, 10_000));
-	put(&tree, &later.0, &later.1, Durability::Immediate).await;
-	let absent: Vec<String> = group.iter().map(|(key, _)| key.clone()).collect();
-	assert_crash_image(vlog_opts, &live, &dir.path().join("image"), &[first, later], &absent);
+	assert_refused(&tree, "later", &payload(99, 10_000), Durability::Immediate).await;
+	assert_eq!(fs::read(&segment).unwrap(), logged, "a refused commit logged something");
+	let absent: Vec<String> =
+		group.iter().map(|(key, _)| key.clone()).chain(["later".to_string()]).collect();
+	assert_crash_image(vlog_opts, &live, &dir.path().join("image"), &[first], &absent);
 	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
 }
 
@@ -2251,10 +2266,10 @@ async fn a_failed_flush_of_a_buffered_vlog_value_fails_the_commit_and_the_next_o
 }
 
 /// The first fsync of a sync is the one of the file the writer rolled over from. When it fails,
-/// the Immediate group fails before it logs anything, and the commit after it fsyncs that file
-/// again.
+/// the Immediate group fails before it logs anything. The fsync lost the pages it could not
+/// write, so it is not tried again: the commit after it is refused, and nothing fsyncs the file.
 #[test(tokio::test)]
-async fn a_failed_fsync_of_the_vlog_file_rolled_over_from_is_retried_by_the_next_commit() {
+async fn a_failed_fsync_of_the_vlog_file_rolled_over_from_is_not_retried() {
 	let dir = TempDir::new("wal_group_crash").unwrap();
 	let live = dir.path().join("live");
 	let tree = eventual_commits_across_a_rollover(&live).await;
@@ -2269,16 +2284,15 @@ async fn a_failed_fsync_of_the_vlog_file_rolled_over_from_is_retried_by_the_next
 	assert_eq!(fs::read(&segment).unwrap(), logged, "a failed fsync logs nothing");
 	assert!(!fsynced_vlog_files(&live).contains(&files[0]), "the old file's fsync failed");
 
-	put(&tree, "later", &payload(61, 10_000), Durability::Immediate).await;
-	assert_both_vlog_files_fsynced(&live, "by the commit after the failed one");
-	let present: Vec<_> =
-		present.into_iter().chain([("later".to_string(), payload(61, 10_000))]).collect();
+	assert_refused(&tree, "later", &payload(61, 10_000), Durability::Immediate).await;
+	assert!(fsynced_vlog_files(&live).is_empty(), "a vlog file was fsynced after the failure");
+	assert_eq!(fs::read(&segment).unwrap(), logged, "a refused commit logged something");
 	assert_crash_image(
 		vlog_opts,
 		&live,
 		&dir.path().join("image"),
 		&present,
-		&["failed".to_string()],
+		&["failed".to_string(), "later".to_string()],
 	);
 	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
 }
@@ -2513,10 +2527,11 @@ async fn a_power_loss_after_an_eventual_commit_and_a_rotation_leaves_no_dangling
 	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
 }
 
-/// A vlog fsync that fails during a rotation fails the rotation and nothing else: the WAL has the
-/// same segment, the same bytes, nothing fsynced and no poison, the memtable has the same
-/// segment and its commits, and nothing was created. The rotation after it fsyncs the vlog
-/// again, fsyncs the segment, and succeeds, and the commits in between survive a power loss.
+/// A vlog fsync that fails during a rotation fails the rotation: the WAL has the same segment,
+/// the same bytes, nothing fsynced and no poison, the memtable has the same segment and its
+/// commits, and nothing was created. The failed fsync ends the value log, so the commits and
+/// the rotation after it are refused, and the segment is never sealed over values that a crash
+/// may have lost.
 #[test(tokio::test)]
 async fn a_failed_vlog_fsync_fails_the_rotation_and_leaves_the_wal_as_it_was() {
 	let dir = TempDir::new("wal_group_crash").unwrap();
@@ -2544,20 +2559,21 @@ async fn a_failed_vlog_fsync_fails_the_rotation_and_leaves_the_wal_as_it_was() {
 	}
 	assert!(inner.immutable_memtables.read().unwrap().is_empty());
 
-	// Commits go on in the same segment, and the next rotation succeeds.
-	put(&tree, "after", &payload(11, 40_000), Durability::Eventual).await;
-	inner.rotate_memtable().unwrap();
-	assert_vlog_fsynced_before_wal(&seen, "the rotation after the failed one");
-	assert_eq!(inner.wal.read().get_active_log_number(), first + 1);
-	let mut sealed_and_new = segments.clone();
-	sealed_and_new.push(first + 1);
-	assert_eq!(segment_ids(&live), sealed_and_new);
+	assert_refused(&tree, "after", &payload(11, 40_000), Durability::Eventual).await;
+	assert!(inner.rotate_memtable().is_err(), "a rotation after the failed fsync");
+	assert!(seen.lock().unwrap().is_empty(), "the segment was fsynced after the vlog failed");
+	assert_eq!(inner.wal.read().get_active_log_number(), first);
+	assert_eq!(segment_ids(&live), segments, "a segment was created after the failure");
+	assert_eq!(fs::read(&segment).unwrap(), logged, "a refused commit logged something");
 
-	let present: Vec<_> = (0..3)
-		.map(|i| (format!("e{i}"), payload(i, 40_000)))
-		.chain([("after".to_string(), payload(11, 40_000))])
-		.collect();
-	assert_power_loss_image(&live, &dir.path().join("image"), &present);
+	let present: Vec<_> = (0..3).map(|i| (format!("e{i}"), payload(i, 40_000))).collect();
+	assert_crash_image(
+		vlog_opts,
+		&live,
+		&dir.path().join("image"),
+		&present,
+		&["after".to_string()],
+	);
 	drop(inner);
 	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
 }

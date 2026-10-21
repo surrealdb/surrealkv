@@ -565,15 +565,18 @@ async fn an_sst_write_failure_is_retried_too() {
 	reopened.close().await.unwrap();
 }
 
-/// A flush whose value-log fsync fails is retried, and what it wrote is there after a reopen.
+/// A flush whose value-log fsync fails stops the database: the fsync lost the pages it could not
+/// write, and a table of a flush that tried again would point at values that are not on disk.
+/// The memtable stays queued, commits fail from then on, and a reopen recovers what was
+/// acknowledged.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-async fn a_value_log_sync_failure_in_the_flush_is_retried() {
+async fn a_value_log_sync_failure_in_the_flush_stops_the_database() {
 	let dir = TempDir::new("manifest_retry_vlog_sync").unwrap();
 	let mut opts = options(dir.path());
 	opts.enable_vlog = true;
 	opts.vlog_value_threshold = 64;
 	let tree = open_with(opts);
-	let mut expected = put(&tree, 0..200).await;
+	let expected = put(&tree, 0..200).await;
 
 	rotate(&tree);
 	let errors_before = tree.core.inner.error_handler.error_count();
@@ -583,11 +586,23 @@ async fn a_value_log_sync_failure_in_the_flush_is_retried() {
 		tree.core.inner.error_handler.error_count() > errors_before
 	})
 	.await;
-	wait_until("the error to clear", || error_is_clear(&tree)).await;
-	wait_until("the queue to drain", || immutables(&tree) == 0).await;
-	expected.extend(put(&tree, 200..250).await);
+	let error = tree.core.inner.error_handler.get_error().expect("the failure is recorded");
+	assert_eq!(error.severity, ErrorSeverity::FatalError, "{error:?}");
+	assert!(tree.core.inner.vlog.as_ref().unwrap().sync_failed());
+	assert_eq!(immutables(&tree), 1, "the memtable was flushed after the failure");
+	let mut txn = tree.begin().unwrap();
+	txn.set_durability(Durability::Immediate);
+	txn.set(key_of(300), val_of(300, 0)).unwrap();
+	assert!(
+		matches!(txn.commit().await, Err(Error::DatabaseStopped(_))),
+		"a commit after the failure"
+	);
 	assert_contents(&tree, &expected, "the live tree");
-	tree.close().await.unwrap();
+	// A stopped database cannot close: it is let go the way a crash lets it go.
+	let _ = tree.close().await;
+	tree.core.inner.lockfile.lock().unwrap().release().unwrap();
+	tree.core.abort_background_tasks();
+	drop(tree);
 	let reopened = {
 		let mut opts = options(dir.path());
 		opts.enable_vlog = true;

@@ -202,6 +202,7 @@ struct Faults {
 	dead: bool,
 	fail_write_after: Option<usize>,
 	fail_flush_after: Option<usize>,
+	writeback_error_after: Option<usize>,
 	fail_truncate_after: Option<usize>,
 	short_write: Option<usize>,
 	write_then_fail: Option<usize>,
@@ -305,6 +306,22 @@ impl MemState {
 			creates: AtomicU64::new(0),
 			open_handles: AtomicUsize::new(0),
 			leaked: AtomicUsize::new(0),
+		}
+	}
+
+	/// Whether this flush meets the writeback error of `MemRaw::writeback_error_after`.
+	fn writeback_fails(&self) -> bool {
+		let mut faults = self.faults.lock();
+		match faults.writeback_error_after {
+			Some(0) => {
+				faults.writeback_error_after = None;
+				true
+			}
+			Some(ref mut n) => {
+				*n -= 1;
+				false
+			}
+			None => false,
 		}
 	}
 
@@ -662,6 +679,13 @@ impl MemRaw {
 		self.state.faults.lock().fail_flush_after = Some(n);
 	}
 
+	/// Fails the flush that comes after `n` more flushes, once, as a failed writeback does on
+	/// Linux: what the file was to flush is never flushed, though the file reads the same, and the
+	/// next flush succeeds without it. A crash then loses it.
+	pub(crate) fn writeback_error_after(&self, n: usize) {
+		self.state.faults.lock().writeback_error_after = Some(n);
+	}
+
 	/// Fails the truncation that comes after `n` more, once.
 	pub(crate) fn fail_truncate_after(&self, n: usize) {
 		self.state.faults.lock().fail_truncate_after = Some(n);
@@ -974,6 +998,12 @@ impl RawFile for MemRawFile {
 		self.open_or_err()?;
 		self.state.begin(Kind::Flush)?;
 		let mut inner = self.file.inner.lock();
+		if self.state.writeback_fails() {
+			// The pages that could not be written are dropped and no longer dirty: the file
+			// reads as it did, a crash loses them, and the next flush does not write them.
+			inner.pending.clear();
+			return Err(injected("a writeback"));
+		}
 		let pending = std::mem::take(&mut inner.pending);
 		for (_, op) in &pending {
 			apply(&mut inner.durable, op)?;
