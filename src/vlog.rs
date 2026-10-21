@@ -1271,9 +1271,13 @@ pub(crate) struct VLog {
 	/// Options for VLog configuration
 	pub(crate) opts: Arc<Options>,
 
-	/// Set by the first fsync of a file of the log that fails, and never cleared: see
-	/// [`sync`](Self::sync).
+	/// Set by the first fsync of a file of the log that fails, and cleared only by a
+	/// [`reload`](Self::reload), which replaces every file: see [`sync`](Self::sync).
 	sync_failed: AtomicBool,
+
+	/// Held across each fsync of a file of the log, with the check of `sync_failed` before it and
+	/// the setting of it after: see [`guarded_sync`](Self::guarded_sync).
+	sync_serial: Mutex<()>,
 
 	/// Told of the first failed fsync, which stops the database. Set once the tree that owns the
 	/// log has its handler, see [`set_error_handler`](Self::set_error_handler).
@@ -1282,6 +1286,15 @@ pub(crate) struct VLog {
 	/// Test-only: the next fsync of a file fails.
 	#[cfg(test)]
 	fail_next_sync: std::sync::atomic::AtomicBool,
+
+	/// Test-only: the calls that reached [`guarded_sync`](Self::guarded_sync), the ones waiting
+	/// for `sync_serial` included.
+	#[cfg(test)]
+	sync_arrivals: AtomicUsize,
+
+	/// Test-only: runs inside every fsync of a file, with `sync_serial` held, before the fsync.
+	#[cfg(test)]
+	sync_observer: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 
 	/// Test-only: runs in `sync` between taking the fds and fsyncing them.
 	#[cfg(test)]
@@ -1430,9 +1443,14 @@ impl VLog {
 			generation: AtomicU64::new(crate::cache::next_instance_id()),
 			opts,
 			sync_failed: AtomicBool::new(false),
+			sync_serial: Mutex::new(()),
 			error_handler: OnceLock::new(),
 			#[cfg(test)]
 			fail_next_sync: std::sync::atomic::AtomicBool::new(false),
+			#[cfg(test)]
+			sync_arrivals: AtomicUsize::new(0),
+			#[cfg(test)]
+			sync_observer: Mutex::new(None),
 			#[cfg(test)]
 			sync_gap: Mutex::new(None),
 			pins: AtomicUsize::new(0),
@@ -1821,6 +1839,12 @@ impl VLog {
 		// What the old writer still buffers goes to a file that was removed.
 		*writer = None;
 		self.unsynced.lock().clear();
+		// A failed fsync lost pages of files that are gone: the files that replace them have had
+		// no fsync, and the first sync covers them, as below.
+		{
+			let _serial = self.sync_serial.lock();
+			self.sync_failed.store(false, Ordering::Release);
+		}
 		{
 			let mut files_map = self.files_map.write();
 			let mut file_handles = self.file_handles.write();
@@ -2442,11 +2466,12 @@ impl VLog {
 	/// that is not synced yet, then the directory if a file was created since it was last synced.
 	///
 	/// The first fsync of a file that fails ends the log: it and every later sync fail, until the
-	/// log is opened again. An fsync that fails has lost the pages it could not write, and the
-	/// kernel no longer counts them as dirty, so a later fsync of the same file reports success
-	/// without them; a value written before the failure can then never be made durable, and
-	/// nothing that points at one may be told it is. The failure stops the database (see
-	/// [`set_error_handler`](Self::set_error_handler)), and recovery decides what survived.
+	/// log is opened again or [reloaded](Self::reload). An fsync that fails has lost the pages it
+	/// could not write, and the kernel no longer counts them as dirty, so a later fsync of the
+	/// same file reports success without them; a value written before the failure can then never
+	/// be made durable, and nothing that points at one may be told it is. The failure stops the
+	/// database (see [`set_error_handler`](Self::set_error_handler)), and recovery decides what
+	/// survived.
 	///
 	/// The write lock is held only for the BufWriter flush (draining the internal buffer to
 	/// OS page cache, ~microseconds). The expensive fsync is performed outside the lock using
@@ -2515,21 +2540,41 @@ impl VLog {
 
 	/// Runs one fsync of a file of the log: refused once one has failed, and the end of the log if
 	/// it fails.
+	///
+	/// The fsyncs of the log never overlap. The kernel reports a writeback error to a single
+	/// fsync of a file description, so an fsync that overlaps the failing one, or that starts after
+	/// it failed and before the failure is recorded, can report success for pages that never
+	/// reached the disk. `sync_serial` is held from the check of `sync_failed` to the setting of
+	/// it, so every fsync either completes before the failing one starts or is refused.
+	///
+	/// A leaf lock: nothing is taken under it but the handler's, so it is safe to take under the
+	/// WAL lock, as a rotation does.
 	fn guarded_sync(&self, fsync: impl FnOnce() -> Result<()>) -> Result<()> {
+		#[cfg(test)]
+		self.sync_arrivals.fetch_add(1, Ordering::SeqCst);
+		let _serial = self.sync_serial.lock();
 		if self.sync_failed() {
 			return Err(sync_poisoned());
 		}
+		#[cfg(test)]
+		{
+			let observer = self.sync_observer.lock().clone();
+			if let Some(observer) = observer {
+				observer();
+			}
+		}
 		let result = fsync();
 		if let Err(error) = &result {
-			if !self.sync_failed.swap(true, Ordering::AcqRel) {
-				if let Some(handler) = self.error_handler.get() {
-					handler.set_error(
-						Error::DatabaseStopped(format!(
-							"an fsync of the value log failed, so the values it was to make 							 durable may be lost, and recovery decides what survived when the 							 database is opened again: {error}"
-						)),
-						BackgroundErrorReason::ValueLogSync,
-					);
-				}
+			self.sync_failed.store(true, Ordering::Release);
+			if let Some(handler) = self.error_handler.get() {
+				handler.set_error(
+					Error::DatabaseStopped(format!(
+						"an fsync of the value log failed, so the values it was to make durable \
+						 may be lost, and recovery decides what survived when the database is \
+						 opened again: {error}"
+					)),
+					BackgroundErrorReason::ValueLogSync,
+				);
 			}
 		}
 		result
@@ -2547,7 +2592,13 @@ impl VLog {
 	/// A sync still in flight does not count, so a caller that arrives while one runs fsyncs
 	/// itself. What counts is what this process appended, and what the active file held when the
 	/// log was opened.
+	///
+	/// A log whose fsync failed is refused even when nothing is unsynced, as every sync of it is:
+	/// a rotation syncs it through here before it seals a segment whose records point into it.
 	pub(crate) fn sync_dirty(&self) -> Result<()> {
+		if self.sync_failed() {
+			return Err(sync_poisoned());
+		}
 		if self.appended.is_clean() {
 			return Ok(());
 		}
@@ -2592,6 +2643,20 @@ impl VLog {
 	#[cfg(test)]
 	pub(crate) fn fail_next_sync(&self) {
 		self.fail_next_sync.store(true, Ordering::SeqCst);
+	}
+
+	/// Test-only: how many calls reached the fsync of a file, the ones waiting for another
+	/// included.
+	#[cfg(test)]
+	pub(crate) fn sync_arrivals(&self) -> usize {
+		self.sync_arrivals.load(Ordering::SeqCst)
+	}
+
+	/// Test-only: sets what runs inside every fsync of a file, with the lock that keeps fsyncs
+	/// from overlapping held, before the fsync (and before an injected failure).
+	#[cfg(test)]
+	pub(crate) fn set_sync_observer(&self, observer: Option<Arc<dyn Fn() + Send + Sync>>) {
+		*self.sync_observer.lock() = observer;
 	}
 
 	/// Test-only: sets what runs in [`sync`](Self::sync) between taking the fds and fsyncing

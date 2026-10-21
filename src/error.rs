@@ -531,8 +531,9 @@ impl BackgroundErrorHandler {
 			(BackgroundErrorReason::CommitGroup, _) => ErrorSeverity::Unrecoverable,
 
 			// The value log refuses every sync after a failed one, so no write can be made
-			// durable until the database is opened again. Above the arms of a pool and of a
-			// full disk: a full disk that fails an fsync has lost its pages all the same.
+			// durable until the database is opened again. Whatever the fsync failed with (a full
+			// disk included, which has lost the pages all the same), the error recorded under this
+			// reason is fatal.
 			(BackgroundErrorReason::ValueLogSync, _) => ErrorSeverity::FatalError,
 
 			// A pool of files that has none free for now: a flush, a compaction or a manifest write

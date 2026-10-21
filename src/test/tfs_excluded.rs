@@ -382,6 +382,7 @@ pub(crate) static EXCLUDED: &[Rule] = &[
 	rule("test::rocksdb_migration_tests::a_database_a_rocksdb_process_has_open_is_not_migrated", Why::Migrator),
 	rule("test::rocksdb_migration_tests::a_versioned_database_keeps_every_version_with_its_converted_timestamp", Why::Migrator),
 	rule("test::rocksdb_migration_tests::an_unversioned_database_keeps_the_newest_value_of_each_key_and_no_timestamps", Why::Migrator),
+	rule("test::vlog_sync_poison_tests::a_restore_ends_the_failure_of_the_value_log_it_replaces", Why::Checkpoint),
 	rule("test::vlog_tests::a_plaintext_file_is_set_aside_only_for_the_start_of_its_own_header", Why::StdFiles),
 	rule("test::vlog_tests::a_plaintext_file_that_a_crash_left_without_its_header_is_set_aside", Why::StdFiles),
 	rule("test::vlog_tests::a_random_sequence_of_appends_failures_rollovers_and_syncs_matches_the_model", Why::StdFiles),

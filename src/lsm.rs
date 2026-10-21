@@ -2856,10 +2856,20 @@ impl Core {
 			tracing::debug!("Background task manager stopped");
 		}
 
-		// Close the VLog if present
+		// Close the VLog if present. A log that cannot be synced (one whose fsync failed refuses
+		// every sync) ends the shutdown here, the way a crash ends the tree: nothing after it may
+		// be made durable, as the WAL's records and the tables of a flush would point at values
+		// that may be lost. The tree is closed already, so a second `close` does nothing: the
+		// lock is released now, so that the database can be opened again and recovery decide what
+		// survived.
 		if let Some(ref vlog) = self.inner.vlog {
 			tracing::debug!("Closing VLog...");
-			vlog.close()?;
+			if let Err(error) = vlog.close() {
+				if let Ok(mut lockfile) = self.inner.lockfile.lock() {
+					let _ = lockfile.release();
+				}
+				return Err(error);
+			}
 			tracing::debug!("VLog closed");
 		}
 
