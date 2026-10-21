@@ -457,7 +457,12 @@ fn each_batch_is_sealed_at_its_index_counted_from_one_with_the_segment_and_the_d
 #[test]
 fn a_plaintext_segment_is_framed_as_it_always_was() {
 	let dir = TempDir::new().unwrap();
-	let mut wal = Wal::open(dir.path(), WalOptions::default()).unwrap();
+	// Without sync marks, which are records of their own around the batches.
+	let options = WalOptions {
+		sync_marks: false,
+		..WalOptions::default()
+	};
+	let mut wal = Wal::open(dir.path(), options).unwrap();
 	wal.append(b"abc").unwrap();
 	wal.append(b"hello world").unwrap();
 	wal.close().unwrap();
@@ -721,14 +726,15 @@ fn a_plaintext_segment_is_refused_by_a_sealed_reader_whatever_it_starts_with() {
 		wal.close().unwrap();
 		let before = snapshot(dir.path());
 
-		// The first record is a batch, or the record that says how the batches are compressed.
+		// The first record is the leading sync mark, or the record that says how the batches are
+		// compressed.
 		let first_type = fs::read(segment_path(dir.path(), 0)).unwrap()[6];
 		assert_eq!(
 			first_type,
 			if compression == CompressionType::None {
-				1
+				RecordType::SyncMark as u8
 			} else {
-				9
+				RecordType::SetCompressionType as u8
 			}
 		);
 

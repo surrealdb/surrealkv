@@ -6,6 +6,7 @@ use crate::tde::{FileCipher, HEADER_MAGIC};
 use crate::vfs::{File as VfsFile, FsCursor, IntoFsFile};
 use crate::wal::{
 	calculate_crc32,
+	parse_sync_mark,
 	sealed,
 	validate_record_type,
 	CompressionType,
@@ -436,13 +437,11 @@ impl Reader {
 						"bad record length - exceeds block boundary",
 					)));
 				}
-				let mark = &self.buffer[self.buffer_offset..self.buffer_offset + length as usize];
-				if usize::from(length) != SYNC_MARK_LEN
-					|| calculate_crc32(&[type_byte], mark) != crc
-				{
+				let rest = &self.buffer[self.buffer_offset..self.buffer_end];
+				if parse_sync_mark(crc, length, type_byte, rest).is_none() {
 					return Err(Error::IO(IOError::new(io::ErrorKind::Other, "checksum mismatch")));
 				}
-				self.buffer_offset += length as usize;
+				self.buffer_offset += SYNC_MARK_LEN;
 				continue;
 			}
 
@@ -969,7 +968,11 @@ mod tests {
 	#[test]
 	fn reader_offset_from_first_read() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
-		let opts = Options::default();
+		// Without sync marks, which are records of their own between the ones read here.
+		let opts = Options {
+			sync_marks: false,
+			..Options::default()
+		};
 		let mut wal = Wal::open(temp_dir.path(), opts).expect("should create WAL");
 
 		// Write a small record (7 byte header + 3 bytes data = 10 bytes)
@@ -998,7 +1001,11 @@ mod tests {
 	#[test]
 	fn reader_offsets_increasing() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
-		let opts = Options::default();
+		// Without sync marks, which are records of their own between the ones read here.
+		let opts = Options {
+			sync_marks: false,
+			..Options::default()
+		};
 		let mut wal = Wal::open(temp_dir.path(), opts).expect("should create WAL");
 
 		// Write multiple records
@@ -1031,7 +1038,11 @@ mod tests {
 	#[test]
 	fn reader_offset_partial_block() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
-		let opts = Options::default();
+		// Without sync marks, which are records of their own between the ones read here.
+		let opts = Options {
+			sync_marks: false,
+			..Options::default()
+		};
 		let mut wal = Wal::open(temp_dir.path(), opts).expect("should create WAL");
 
 		// Write records that don't fill a complete block
@@ -1830,7 +1841,7 @@ mod tests {
 		// fragment
 		let truncated_len = BLOCK_SIZE + BLOCK_SIZE / 2; // ~1.5 blocks
 		let truncated_len = truncated_len.min(file_data.len() - 100); // Ensure we're removing
-																	  // something
+																// something
 		std::fs::write(file_path, &file_data[..truncated_len]).expect("should write file");
 
 		let file = File::open(file_path).expect("should open file");

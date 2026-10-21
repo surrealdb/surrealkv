@@ -343,7 +343,7 @@ async fn wal_bytes_of_a_fixed_commit_sequence_do_not_change() {
 		segments.iter().flat_map(|(_, path)| super::sfs::read(path).unwrap()).collect();
 	assert_eq!(
 		(segments.len(), bytes.len(), xxh3_64(&bytes)),
-		(1, 404_566, 3_592_398_691_795_961_225),
+		(1, 404_581, 12_412_829_256_836_249_924),
 		"WAL bytes of the fixed commit sequence"
 	);
 }

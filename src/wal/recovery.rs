@@ -10,6 +10,7 @@ use crate::wal::reader::{Reader, Reporter};
 use crate::wal::{
 	calculate_crc32,
 	directory_present,
+	parse_sync_mark,
 	sealed_needs_std,
 	CompressionType,
 	Error as WalError,
@@ -533,23 +534,77 @@ fn try_validate_record(
 
 /// The synced length of the [`RecordType::SyncMark`] whose header is at `data[pos..]`, `data`
 /// starting at offset `start_offset` of the segment: `None` unless a whole mark is there, within
-/// its block, and its checksum holds.
+/// its block, its checksum holds, and it claims no more of the segment than lies before it, which
+/// is all that a writer can have synced when it wrote the mark.
 pub(crate) fn sync_mark_in(data: &[u8], start_offset: u64, pos: usize) -> Option<u64> {
 	let end = pos.checked_add(HEADER_SIZE + SYNC_MARK_LEN)?;
 	let record = data.get(pos..end)?;
-	let offset_in_block = ((start_offset + pos as u64) % BLOCK_SIZE as u64) as usize;
-	if offset_in_block + HEADER_SIZE + SYNC_MARK_LEN > BLOCK_SIZE
-		|| record[6] != RecordType::SyncMark as u8
-		|| u16::from_be_bytes([record[4], record[5]]) as usize != SYNC_MARK_LEN
-	{
+	let at = start_offset + pos as u64;
+	let offset_in_block = (at % BLOCK_SIZE as u64) as usize;
+	if offset_in_block + HEADER_SIZE + SYNC_MARK_LEN > BLOCK_SIZE {
 		return None;
 	}
 	let crc = u32::from_be_bytes([record[0], record[1], record[2], record[3]]);
-	let payload = &record[HEADER_SIZE..];
-	if calculate_crc32(&[record[6]], payload) != crc {
-		return None;
+	let length = u16::from_be_bytes([record[4], record[5]]);
+	let mark = parse_sync_mark(crc, length, record[6], &record[HEADER_SIZE..])?;
+	(mark <= at).then_some(mark)
+}
+
+/// Whether the mark at `data[pos..]` (see [`sync_mark_in`]) stands where a writer puts one:
+/// followed by the start of a record (a full one or its first fragment) whose checksum holds, as
+/// every mark but the trailing one is, or at the end of the segment, as the trailing one is.
+///
+/// The scan steps through bytes it cannot read as records one at a time, the payload of a damaged
+/// record or of a fragment whose start was lost included, and bytes of a value can form a mark.
+/// Such a mark is followed by more of the value, not by a record, and is not taken for one.
+fn mark_is_framed(data: &[u8], start_offset: u64, pos: usize) -> bool {
+	let mut next = pos + HEADER_SIZE + SYNC_MARK_LEN;
+	if next == data.len() {
+		return true;
 	}
-	Some(u64::from_be_bytes(payload.try_into().ok()?))
+	// A record that does not fit a header in what is left of the block starts the next one.
+	let offset_in_block = ((start_offset + next as u64) % BLOCK_SIZE as u64) as usize;
+	if BLOCK_SIZE - offset_in_block < HEADER_SIZE {
+		next += BLOCK_SIZE - offset_in_block;
+	}
+	record_starts_at(data, start_offset, next)
+}
+
+/// Whether a full record, or the first fragment of one, whose checksum holds starts at
+/// `data[pos..]`, within its block.
+fn record_starts_at(data: &[u8], start_offset: u64, pos: usize) -> bool {
+	let Some(header) = data.get(pos..pos + HEADER_SIZE) else {
+		return false;
+	};
+	let length = usize::from(u16::from_be_bytes([header[4], header[5]]));
+	let type_byte = header[6];
+	let offset_in_block = ((start_offset + pos as u64) % BLOCK_SIZE as u64) as usize;
+	let starts_a_record =
+		type_byte == RecordType::Full as u8 || type_byte == RecordType::First as u8;
+	if !starts_a_record || offset_in_block + HEADER_SIZE + length > BLOCK_SIZE {
+		return false;
+	}
+	let crc = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+	data.get(pos + HEADER_SIZE..pos + HEADER_SIZE + length)
+		.is_some_and(|payload| calculate_crc32(&[type_byte], payload) == crc)
+}
+
+/// Whether the segment at `path` holds sync marks: whether it starts with a leading mark, after
+/// the record of its compression if it has one, see [`RecordType::SyncMark`]. A segment written
+/// by a binary that writes no marks has none, and neither has one whose first bytes were lost:
+/// both are read as segments without marks. Reads only the head of the segment.
+pub(crate) fn segment_holds_marks_in(fs: &dyn Fs, path: &Path) -> Result<bool> {
+	/// The record of the compression of a segment: a header and the byte of the compression.
+	const COMPRESSION_RECORD_LEN: usize = HEADER_SIZE + 1;
+	let head = fs
+		.read_prefix(path, COMPRESSION_RECORD_LEN + HEADER_SIZE + SYNC_MARK_LEN)?
+		.unwrap_or_default();
+	let leading = if head.get(6) == Some(&(RecordType::SetCompressionType as u8)) {
+		COMPRESSION_RECORD_LEN
+	} else {
+		0
+	};
+	Ok(sync_mark_in(&head, 0, leading).is_some())
 }
 
 /// What [`scan_after_in`] found after an offset of a segment.
@@ -557,24 +612,9 @@ pub(crate) fn sync_mark_in(data: &[u8], start_offset: u64, pos: usize) -> Option
 pub(crate) struct AfterDamage {
 	/// The intact records, sync marks not counted.
 	pub(crate) intact_records: usize,
-	/// The highest synced length of the intact sync marks.
+	/// The highest synced length of the intact sync marks that stand where a writer puts one,
+	/// see [`mark_is_framed`].
 	pub(crate) highest_mark: Option<u64>,
-}
-
-/// Scans the WAL segment file starting at `start_offset` for valid records.
-/// Returns the number of intact records found after `start_offset`.
-#[allow(dead_code, reason = "kept for callers that have not moved to the _in form")]
-pub(crate) fn scan_valid_records_after(file_path: &Path, start_offset: u64) -> Result<usize> {
-	scan_valid_records_after_in(&*crate::vfs::default_fs(), file_path, start_offset)
-}
-
-/// [`scan_valid_records_after`] in the file system `fs`.
-pub(crate) fn scan_valid_records_after_in(
-	fs: &dyn Fs,
-	file_path: &Path,
-	start_offset: u64,
-) -> Result<usize> {
-	Ok(scan_after_in(fs, file_path, start_offset)?.intact_records)
 }
 
 /// The intact records of the WAL segment file from `start_offset` on, and the highest synced
@@ -619,7 +659,9 @@ pub(crate) fn scan_after_in(
 			continue;
 		}
 
-		if let Some(mark) = sync_mark_in(&data, start_offset, pos) {
+		if let Some(mark) = sync_mark_in(&data, start_offset, pos)
+			.filter(|_| mark_is_framed(&data, start_offset, pos))
+		{
 			highest_mark = Some(highest_mark.map_or(mark, |h| h.max(mark)));
 			pos += HEADER_SIZE + SYNC_MARK_LEN;
 			continue;
@@ -655,19 +697,25 @@ pub(crate) fn classify_wal_damage(
 
 /// [`classify_wal_damage`] in the file system `fs`.
 ///
-/// Damage at the end of the last segment, with no intact record after it, is a torn tail. Damage
-/// in the last segment that intact records follow is an unsynced tail if the segment holds a sync
-/// mark and no intact mark after the damage claims a synced length above its offset: the
-/// last fsync to complete before any of those records was written ended at or below the damage,
-/// so nothing at or after it was synced when they were, and a record acknowledged as durable
-/// after them would have had to wait for an fsync that covered the damage too, which a power cut
-/// does not undo. Everything else is interior corruption, which a segment without marks, an older
-/// segment, or damage that a mark says was synced always is.
+/// Damage that an intact sync mark after it says was synced, by claiming a synced length past
+/// `last_valid_offset`, is interior corruption: a power cut does not undo an fsync. Otherwise,
+/// damage at the end of the last segment, with no intact record after it, is a torn tail. Damage
+/// in the last segment that intact records follow is an unsynced tail if the segment holds marks
+/// (it starts with a leading mark): the last fsync to complete before any of those records was
+/// written ended at or below the damage, so nothing at or after it was synced when they were, and
+/// a record acknowledged as durable after them would have had to wait for an fsync that covered
+/// the damage too. Everything else is interior corruption, which a segment without marks and an
+/// older segment always are.
 ///
-/// What the marks cannot see is an fsync that completed after the last mark was written: damage
-/// below the length it covered, followed by records of the same stretch, is cut as an unsynced
-/// tail although it was synced. A power cut cannot leave such damage; only a disk that loses
-/// synced bytes can.
+/// What the marks cannot see is an fsync that completed after the last mark was written, and
+/// was not followed by an append or a close: damage below the length it covered, followed by
+/// records of the same stretch, is cut as an unsynced tail although it was synced. A power cut
+/// cannot leave such damage; only a disk that loses synced bytes can.
+///
+/// The marks are checksummed, not authenticated: a value that holds the bytes of a mark followed
+/// by those of a record, inside a record that is damaged, can still pass for a mark, and so make
+/// damage that a power cut left be refused. It cannot make a segment without marks read as one
+/// with them, which is decided by the head of the segment alone.
 pub(crate) fn classify_wal_damage_in(
 	fs: &dyn Fs,
 	file_path: &Path,
@@ -678,18 +726,15 @@ pub(crate) fn classify_wal_damage_in(
 
 	let after = scan_after_in(fs, file_path, last_valid_offset as u64)?;
 	let intact_records_after = after.intact_records;
+	let synced = after.highest_mark.is_some_and(|mark| mark > last_valid_offset as u64);
 
-	if is_last_segment && intact_records_after == 0 {
+	if is_last_segment && !synced && intact_records_after == 0 {
 		return Ok(WalDamage::TornTail {
 			last_valid_offset,
 			file_size,
 		});
 	}
-	// A segment holds marks from the first append after its first fsync on, see
-	// `Writer::write_sync_marks`. One with none at all was written by a binary that writes none,
-	// or was never synced, and is read as before.
-	let marked = is_last_segment && scan_after_in(fs, file_path, 0)?.highest_mark.is_some();
-	if marked && after.highest_mark.is_none_or(|mark| mark <= last_valid_offset as u64) {
+	if is_last_segment && !synced && segment_holds_marks_in(fs, file_path)? {
 		Ok(WalDamage::UnsyncedTail {
 			last_valid_offset,
 			intact_records_after,
@@ -1001,8 +1046,8 @@ mod tests {
 		batch1.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap(); // seq_num 100
 		batch1.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap(); // seq_num 101
 		batch1.set(b"key3".to_vec(), b"value3".to_vec(), 0).unwrap(); // seq_num 102
-																	  // Highest sequence number
-																	  // should be 102
+																// Highest sequence number
+																// should be 102
 
 		// Batch 2: Starting at 200, with 4 entries (200, 201, 202, 203)
 		let mut batch2 = Batch::new(200);
@@ -1010,8 +1055,8 @@ mod tests {
 		batch2.set(b"key5".to_vec(), b"value5".to_vec(), 0).unwrap(); // seq_num 201
 		batch2.delete(b"key6".to_vec(), 0).unwrap(); // seq_num 202
 		batch2.set(b"key7".to_vec(), b"value7".to_vec(), 0).unwrap(); // seq_num 203
-																	  // Highest sequence number
-																	  // should be 203
+																// Highest sequence number
+																// should be 203
 
 		// Create WAL and rotate to create 2 segments
 		let opts = Options::default();
@@ -1133,14 +1178,14 @@ mod tests {
 		let mut batch1 = Batch::new(200); // Starting sequence number 200
 		batch1.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap(); // seq_num 200
 		batch1.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap(); // seq_num 201
-																	  // Highest sequence number
-																	  // should be 201
+																// Highest sequence number
+																// should be 201
 
 		let mut batch2 = Batch::new(300); // Starting sequence number 300
 		batch2.set(b"key3".to_vec(), b"value3".to_vec(), 0).unwrap(); // seq_num 300
 		batch2.set(b"key4".to_vec(), b"value4".to_vec(), 0).unwrap(); // seq_num 301
-																	  // Highest sequence number
-																	  // should be 301
+																// Highest sequence number
+																// should be 301
 
 		// Create WAL and rotate to create 2 segments
 		let opts = Options::default();
@@ -1256,8 +1301,11 @@ mod tests {
 		let wal_dir = temp_dir.path();
 		fs::create_dir_all(wal_dir).unwrap();
 
-		// Create a valid WAL with three batches
-		let opts = Options::default();
+		// Create a valid WAL with three batches, and no sync marks, which would move them
+		let opts = Options {
+			sync_marks: false,
+			..Options::default()
+		};
 		let mut wal = Wal::open(wal_dir, opts).unwrap();
 
 		// Create three batches with different sequence numbers

@@ -248,10 +248,8 @@ impl Wal {
 
 			let mut writer =
 				Writer::new(buffered_writer, false, detected_compression, block_offset);
-			// Marks only from the next fsync on, which covers everything in the file: the writer
-			// knows nothing of what the segment had synced before.
 			if opts.sync_marks {
-				writer.write_sync_marks();
+				writer.write_sync_marks(false);
 			}
 			Ok((writer, file))
 		} else {
@@ -266,7 +264,7 @@ impl Wal {
 				writer.add_compression_type_record()?;
 			}
 			if opts.sync_marks {
-				writer.write_sync_marks();
+				writer.write_sync_marks(true);
 			}
 			Ok((writer, file))
 		}
@@ -758,7 +756,15 @@ impl Wal {
 		}
 	}
 
+	/// Syncs and closes the active segment. A plaintext segment that holds sync marks ends in a
+	/// trailing mark, see [`Writer::close_with_trailing_mark`].
 	pub(crate) fn close(&mut self) -> Result<()> {
+		self.close_with(true)
+	}
+
+	/// [`close`](Self::close), with or without the trailing mark. A drop closes without one: it is
+	/// a last effort, and leaves the segment as a crash that came after its fsync would.
+	pub(crate) fn close_with(&mut self, trailing_mark: bool) -> Result<()> {
 		if self.closed {
 			return Ok(());
 		}
@@ -773,7 +779,11 @@ impl Wal {
 			// A sealed WAL that never made a segment has written nothing.
 			return Ok(());
 		};
-		writer.close()?;
+		if trailing_mark {
+			writer.close_with_trailing_mark()?;
+		} else {
+			writer.close()?;
+		}
 
 		// Fsync the directory to persist metadata changes
 		self.opts
@@ -896,7 +906,7 @@ impl Drop for Wal {
 	/// Attempt to fsync data on drop, in case we're running without sync.
 	fn drop(&mut self) {
 		if !self.closed {
-			self.close().ok();
+			self.close_with(false).ok();
 		}
 	}
 }

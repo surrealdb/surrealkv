@@ -121,6 +121,7 @@ fn a_first_record_in_the_clear_is_refused_and_a_record_of_no_kind_is_not() {
 		RecordType::Middle,
 		RecordType::Last,
 		RecordType::SetCompressionType,
+		RecordType::SyncMark,
 	] {
 		// Short and long: the first record of a segment in the clear is often longer than the
 		// header of a sealed segment is.
@@ -141,7 +142,7 @@ fn a_first_record_in_the_clear_is_refused_and_a_record_of_no_kind_is_not() {
 	}
 
 	// A kind that no segment starts with, with a checksum that holds.
-	for kind in [0u8, 5, 7, 11, 200] {
+	for kind in [0u8, 5, 7, 12, 200] {
 		assert_eq!(verdict(&framed(kind, b"abc")), None, "kind {kind}");
 	}
 }
