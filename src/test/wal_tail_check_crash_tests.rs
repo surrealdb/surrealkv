@@ -214,16 +214,16 @@ async fn crashed_with_acknowledged_commits() -> MemRaw {
 }
 
 /// Whichever file of a value log of many files lost its first page, and whatever else a crash took
-/// of what was not synced, every image opens in the mode that salvages, and every commit that was
-/// acknowledged is there. The default mode opens the image or refuses it for a hole, and what it
-/// opens holds every commit that was acknowledged too.
+/// of what was not synced, every image opens in the mode that salvages and in the default mode, and
+/// every commit that was acknowledged is there. A crash loses only what was not synced, so the
+/// default mode finds no hole that a sync mark says was synced, and refuses none.
 #[test(tokio::test)]
 async fn every_image_of_a_value_log_of_many_files_keeps_every_acknowledged_commit() {
 	within("many files", async {
 		let raw = crashed_with_acknowledged_commits().await;
 		let images = images(&raw);
 		let total = images.len();
-		let (mut cut, mut refused) = (0, 0);
+		let mut cut = 0;
 		for (what, image) in images {
 			for mode in [WalRecoveryMode::SalvageValidPrefix, WalRecoveryMode::TolerateTornTail] {
 				let what = format!("{what}, {mode:?}");
@@ -231,20 +231,7 @@ async fn every_image_of_a_value_log_of_many_files_keeps_every_acknowledged_commi
 				let (fs, _pool) = pool_over(&image.crash(CrashMode::Prefix(usize::MAX)));
 				let opened =
 					TreeBuilder::with_options(options(&fs, mode, Some(4_096))).build_async().await;
-				let tree = match opened {
-					Ok(tree) => tree,
-					Err(error) => {
-						// Only the default mode refuses, and only for a hole.
-						assert_eq!(mode, WalRecoveryMode::TolerateTornTail, "{what}: {error}");
-						assert!(
-							matches!(error, Error::Other(_))
-								&& error.to_string().contains("SalvageValidPrefix"),
-							"{what}: {error}"
-						);
-						refused += 1;
-						continue;
-					}
-				};
+				let tree = opened.unwrap_or_else(|e| panic!("{what}: {e}"));
 				let (present, damage) = read(&tree, 0..MIXED);
 				assert_eq!(damage, None, "{what}");
 				assert!(
@@ -268,7 +255,6 @@ async fn every_image_of_a_value_log_of_many_files_keeps_every_acknowledged_commi
 			cut > total / 4,
 			"{cut} of {total} images were cut: the check is not what is tested"
 		);
-		assert!(refused > 0, "no image was a hole");
 	})
 	.await;
 }

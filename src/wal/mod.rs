@@ -882,14 +882,25 @@ impl SyncGate {
 	/// the end of the last of them is what [`SyncGate::synced`] moves to. An append that is still
 	/// being written, by the writer of the segment while this runs outside the WAL lock, is not
 	/// counted, even where part of it is covered.
+	///
+	/// The synced length is what the marks of the segment claim, and recovery takes a record that
+	/// a mark covers for one whose values in the value log were durable, see `wal::tail`. A caller
+	/// makes the values of every record in the file durable before it calls this; one that cannot
+	/// say that of every record uses [`SyncGate::sync_within`].
 	pub(crate) fn sync(&self, file: &dyn FsFile) -> Result<()> {
+		self.sync_within(file, u64::MAX)
+	}
+
+	/// [`SyncGate::sync`], with [`SyncGate::synced`] moving to no more than `bound`: the records
+	/// past `bound` are made durable as well, but no mark claims them.
+	pub(crate) fn sync_within(&self, file: &dyn FsFile, bound: u64) -> Result<()> {
 		#[cfg(test)]
 		self.arrivals.fetch_add(1, Ordering::SeqCst);
 		let _serial = self.serial.lock();
 		if self.failed() {
 			return Err(sync_poisoned());
 		}
-		let covered = self.boundary.load(Ordering::Acquire);
+		let covered = self.boundary.load(Ordering::Acquire).min(bound);
 		let result = self.fsync(file);
 		if result.is_err() {
 			self.failed.store(true, Ordering::Release);

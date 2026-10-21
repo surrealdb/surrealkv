@@ -253,6 +253,11 @@ impl Writer {
 		self.dest.gate()
 	}
 
+	/// The length of the segment once everything appended is written, if known.
+	pub(crate) fn len(&self) -> Option<u64> {
+		self.dest.len()
+	}
+
 	/// Adds a record to the WAL.
 	///
 	/// The record is automatically fragmented if it doesn't fit in the current
