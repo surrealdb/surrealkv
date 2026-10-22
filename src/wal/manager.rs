@@ -905,7 +905,8 @@ impl Wal {
 	/// sync marks and the zeros that pad a block, see [`tail_is_marks_and_padding`]: the replay
 	/// reads them as the end of the log. A tail with any other byte is not moved, and `None` is
 	/// returned with nothing changed, so that the caller starts a segment of its own. The cut is
-	/// synced before the rename.
+	/// synced before the rename. A torn record at the end of the segment is trimmed by the replay's
+	/// repair before this runs, so it is not part of such a tail.
 	///
 	/// The move is one rename, which the file system makes at one commit point, followed by a sync
 	/// of the directory that names it. The file is not copied, so no state holds the records of a

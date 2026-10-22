@@ -2634,7 +2634,9 @@ impl Core {
 				_ => None,
 			};
 			// A tail that the rewrite does not take is left as it is, and a segment starts after
-			// it.
+			// it. A torn record at the end of the segment is not such a tail: the replay has
+			// trimmed it already, with a copy of it kept, so the segment ends at the records it
+			// read. What the rewrite accepts past them is sync marks and padding.
 			let rewritten = match recovered_in_newest {
 				Some(valid_end) => inner.rewrite_wal(&mut wal_guard, valid_end)?.is_some(),
 				None => false,
