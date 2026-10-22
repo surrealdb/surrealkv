@@ -1,8 +1,8 @@
 //! The rewrite of the newest segment at open: the segment is moved to the number that follows it,
 //! and the commits go on in it.
 //!
-//! The move is one rename, so no state holds the records of a segment under two names. Each commit
-//! is replayed once, in whichever open it is replayed, and the counts of the replay say so.
+//! The move is one rename, so no state holds the records of a segment under two names. Each batch
+//! that an open replays is counted once by the replay, and the count is checked in these tests.
 
 use std::path::{Path, PathBuf};
 

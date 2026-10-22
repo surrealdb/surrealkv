@@ -8,9 +8,9 @@
 //! constants below say and why. Every key that was committed `Immediate` is there at the end.
 //!
 //! A session may also end on a partial record, or with its last value missing from the value log.
-//! The next open repairs the newest segment, and then moves the records it recovered into the
-//! segment after it, so these endings leave the same counts as a session that ends at a record
-//! boundary. The tests of each ending are below.
+//! The next open repairs the newest segment, and then moves it to the number that follows, so these
+//! endings leave the same counts as a session that ends at a record boundary. The tests of each
+//! ending are below.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,8 +27,8 @@ use crate::{Durability, FileSystem, Options, Tree, TreeBuilder};
 /// Sessions per run.
 const SESSIONS: usize = 300;
 
-/// The longest a run may take. It allows for a file system that syncs each commit, on a machine that
-/// runs other suites as well.
+/// The longest a run may take. It allows for a file system that syncs each commit, on a machine
+/// that runs other suites as well.
 const WATCHDOG: Duration = Duration::from_secs(900);
 
 /// Runs `scenario` under [`WATCHDOG`].
