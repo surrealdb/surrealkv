@@ -71,10 +71,10 @@ enum Ending {
 	/// The last byte of the newest value-log file is cut, so that the last value of the log is not
 	/// in the value log.
 	ValueLogCut,
-	/// The newest segment of the log is cut to the end of the sync mark of its last commit, so that
-	/// the record of that commit is not in it: the state of a session that ended while the commit
-	/// was being written. The commit is `Eventual`, so no commit that was acknowledged `Immediate`
-	/// is cut.
+	/// The newest segment of the log is cut to the end of the sync mark of its last commit, so
+	/// that the record of that commit is not in it: the state of a session that ended while
+	/// the commit was being written. The commit is `Eventual`, so no commit that was
+	/// acknowledged `Immediate` is cut.
 	MarkWithoutRecord,
 }
 

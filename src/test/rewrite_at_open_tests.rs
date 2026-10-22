@@ -12,7 +12,7 @@ use test_log::test;
 use super::fs_engine_tests::tables_per_level;
 use crate::wal::manager::tail_is_marks_and_padding;
 use crate::wal::recovery::sync_mark_in;
-use crate::wal::{BLOCK_SIZE, HEADER_SIZE, RecordType, SYNC_MARK_LEN};
+use crate::wal::{RecordType, BLOCK_SIZE, HEADER_SIZE, SYNC_MARK_LEN};
 use crate::{Durability, FileSystem, LSMIterator, Mode, Options, Tree, TreeBuilder};
 
 /// Commits in the session that is abandoned: one batch each, so that the replay counts them.
