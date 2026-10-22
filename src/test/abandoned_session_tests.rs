@@ -3,14 +3,15 @@
 //! A session opens the database, commits a few keys (three `Immediate` and three `Eventual`, with
 //! and without the value log), and ends without a close, as the tab of a browser does. The next
 //! session follows it. After every session the tables of the tree, the files of the database, the
-//! segments of the write-ahead log and the files of the value log are counted. Over the whole run
-//! none of them grows with the number of sessions: each stays within a small constant, which the
-//! constants below say and why. Every key that was committed `Immediate` is there at the end.
+//! segments of the write-ahead log and the files of the value log are counted. After every session
+//! the tree holds no table and the log holds one segment, and the files of the database and of the
+//! value log stay within a small constant over the whole run, as the constants below say and why.
+//! Every key that was committed `Immediate` is there at the end.
 //!
-//! A session may also end on a partial record, or with its last value missing from the value log.
-//! The next open repairs the newest segment, and then moves it to the number that follows, so these
-//! endings leave the same counts as a session that ends at a record boundary. The tests of each
-//! ending are below.
+//! A session may also end on a partial record, on the sync mark of its last commit without the
+//! record, or with its last value missing from the value log. The next open moves the newest
+//! segment to the number that follows, so these endings leave the same counts as a session that
+//! ends at a record boundary. The tests of each ending are below.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,13 +43,15 @@ async fn within<F: std::future::Future>(what: &str, scenario: F) -> F::Output {
 /// Commits per session: the even ones are `Immediate`, the odd ones `Eventual`.
 const COMMITS: usize = 6;
 
-/// Tables at the end of a run. The level-0 file limit of these options is 4: a database that
-/// abandoned sessions leave behind holds no more tables than that.
-const TABLE_BOUND: usize = 4;
+/// Tables of the tree after each session, once its commits are in: none. The open keeps the records
+/// of the log in the memtable that it makes active, and the commits go on in the segment they are
+/// in, so no session that ends without a close leaves a table behind it.
+const TABLES: usize = 0;
 
-/// Segments of the write-ahead log: the one that the commits go to, and one that a
-/// recovery has not yet made obsolete.
-const WAL_BOUND: usize = 2;
+/// Segments of the write-ahead log after each session: the one that the commits go to, and no
+/// other. The open moves the newest segment to the number that follows it, and does not start a
+/// segment beside it.
+const WAL_SEGMENTS: usize = 1;
 
 /// Files of the value log: the one that the values go to, and one that a roll has left.
 const VLOG_BOUND: usize = 2;
@@ -68,6 +71,11 @@ enum Ending {
 	/// The last byte of the newest value-log file is cut, so that the last value of the log is not
 	/// in the value log.
 	ValueLogCut,
+	/// The newest segment of the log is cut to the end of the sync mark of its last commit, so that
+	/// the record of that commit is not in it: the state of a session that ended while the commit
+	/// was being written. The commit is `Eventual`, so no commit that was acknowledged `Immediate`
+	/// is cut.
+	MarkWithoutRecord,
 }
 
 /// What the database holds after one session.
@@ -213,6 +221,25 @@ fn end_session(fs: &FileSystem, options: &Options, ending: Ending) {
 			file.set_len(len - 1).expect("the last byte is cut");
 			file.sync().expect("the cut is synced");
 		}
+		Ending::MarkWithoutRecord => {
+			let path = newest_file(fs, &options.wal_dir(), ".wal").expect("a segment of the log");
+			let read = fs.0.open_read(&path).expect("the segment opens for reading");
+			let len = usize::try_from(read.len().expect("its length")).expect("a small segment");
+			let mut data = vec![0u8; len];
+			let got = read.read_at(0, &mut data).expect("the segment reads");
+			assert_eq!(got, len, "the segment is read whole");
+			// The last sync mark of the segment is the one before the record of the last commit,
+			// which the session wrote `Eventual` and so never synced.
+			let mark = (0..len)
+				.rev()
+				.find(|pos| crate::wal::recovery::sync_mark_in(&data, 0, *pos).is_some())
+				.expect("the segment holds a sync mark");
+			let end = mark + crate::wal::HEADER_SIZE + crate::wal::SYNC_MARK_LEN;
+			assert!(end < len, "a record follows the last sync mark");
+			let file = fs.0.open_append_existing(&path).expect("the segment opens");
+			file.set_len(end as u64).expect("the record is cut");
+			file.sync().expect("the cut is synced");
+		}
 	}
 }
 
@@ -262,20 +289,22 @@ async fn sessions_without_a_close(
 	}
 
 	let worst = |f: fn(&Census) -> usize| censuses.iter().map(f).max().unwrap_or(0);
-	assert!(
-		worst(|c| c.tables) <= TABLE_BOUND,
-		"tables grew with the sessions: {} tables at the last session, at most {TABLE_BOUND} allowed",
-		censuses[SESSIONS - 1].tables
-	);
+	if let Some(c) = censuses.iter().find(|c| c.tables != TABLES) {
+		panic!(
+			"session {} leaves {} tables after its commits, expected {TABLES}",
+			c.session, c.tables
+		);
+	}
+	if let Some(c) = censuses.iter().find(|c| c.wal != WAL_SEGMENTS) {
+		panic!(
+			"session {} leaves {} WAL segments after its commits, expected {WAL_SEGMENTS}",
+			c.session, c.wal
+		);
+	}
 	assert!(
 		worst(|c| c.files) <= FILE_BOUND,
 		"files grew with the sessions: {} files at the last session, at most {FILE_BOUND} allowed",
 		censuses[SESSIONS - 1].files
-	);
-	assert!(
-		worst(|c| c.wal) <= WAL_BOUND,
-		"WAL segments grew with the sessions: {} at the last session, at most {WAL_BOUND} allowed",
-		censuses[SESSIONS - 1].wal
 	);
 	assert!(
 		worst(|c| c.vlog) <= VLOG_BOUND,
@@ -445,6 +474,58 @@ async fn sessions_ending_with_a_cut_value_log_stay_bounded_in_a_strict_pool() {
 	within("strict pool sessions ending with a cut value log", async {
 		let (fs, pool) = strict_fs(STRICT_INITIAL, STRICT_MAX);
 		sessions_without_a_close(fs, Some(pool), "db".into(), true, Ending::ValueLogCut).await;
+	})
+	.await;
+}
+
+#[test(tokio::test)]
+async fn sessions_ending_on_a_sync_mark_stay_bounded_on_std() {
+	within("std sessions ending on a sync mark", async {
+		let dir = TempDir::new().unwrap();
+		sessions_without_a_close(
+			FileSystem::std(),
+			None,
+			dir.path().join("db"),
+			false,
+			Ending::MarkWithoutRecord,
+		)
+		.await;
+	})
+	.await;
+}
+
+#[test(tokio::test)]
+async fn sessions_ending_on_a_sync_mark_stay_bounded_on_std_with_the_value_log() {
+	within("std sessions ending on a sync mark, with the value log", async {
+		let dir = TempDir::new().unwrap();
+		sessions_without_a_close(
+			FileSystem::std(),
+			None,
+			dir.path().join("db"),
+			true,
+			Ending::MarkWithoutRecord,
+		)
+		.await;
+	})
+	.await;
+}
+
+#[test(tokio::test)]
+async fn sessions_ending_on_a_sync_mark_stay_bounded_in_a_memory_pool() {
+	within("memory pool sessions ending on a sync mark", async {
+		let (fs, pool) = memory_with_pool();
+		sessions_without_a_close(fs, Some(pool), "db".into(), false, Ending::MarkWithoutRecord)
+			.await;
+	})
+	.await;
+}
+
+#[test(tokio::test)]
+async fn sessions_ending_on_a_sync_mark_stay_bounded_in_a_strict_pool() {
+	within("strict pool sessions ending on a sync mark", async {
+		let (fs, pool) = strict_fs(STRICT_INITIAL, STRICT_MAX);
+		sessions_without_a_close(fs, Some(pool), "db".into(), true, Ending::MarkWithoutRecord)
+			.await;
 	})
 	.await;
 }
