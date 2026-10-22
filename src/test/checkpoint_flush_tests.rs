@@ -1067,10 +1067,10 @@ async fn a_checkpoint_between_a_groups_wal_sync_and_its_apply_loses_nothing() {
 	tree.close().await.unwrap();
 }
 
-/// Recovery continues in a fresh WAL segment and tags the recovered memtable with it, although
-/// the memtable holds what the crashed segment held. A checkpoint flushes that memtable and
-/// removes the segments up to its tag, the crashed one included: the copy, and a crash image
-/// taken after the checkpoint, hold the recovered keys and the ones committed after recovery.
+/// Recovery moves the crashed segment to the number that follows it, and tags the recovered
+/// memtable with that number, so the memtable holds what the crashed segment held. A checkpoint
+/// flushes that memtable and removes the segments up to its tag: the copy, and a crash image taken
+/// after the checkpoint, hold the recovered keys and the ones committed after recovery.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_of_a_recovered_tree_holds_what_the_crashed_segment_held() {
 	if tfs::skip_listed() {
@@ -1094,7 +1094,10 @@ async fn a_checkpoint_of_a_recovered_tree_holds_what_the_crashed_segment_held() 
 		assert_eq!(tree.core.inner.wal.read().get_active_log_number(), crashed + 1);
 		assert_contents(&tree, &expected, "the recovered tree");
 		expected.extend(put(&tree, 100..150).await);
-		assert!(wal_segments(&live).contains(&crashed), "the crashed segment is still needed");
+		assert!(
+			wal_segments(&live).contains(&(crashed + 1)),
+			"the recovered rows are in the segment the crashed one was moved to"
+		);
 
 		let cp = out.path().join("cp");
 		let metadata = checkpoint(&tree, &cp).wait().unwrap();

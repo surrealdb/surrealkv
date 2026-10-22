@@ -1106,15 +1106,15 @@ fn non_empty_segments(dir: &Path) -> Vec<u64> {
 }
 
 /// The state a reopened database starts from. Its active memtable holds rows of the segments that
-/// were replayed, all older than the fresh segment it is tagged with and continues in, and no
-/// table holds them yet. Returns the number of the fresh segment.
+/// were replayed, in the segment that the open moved them to, which is the active one, and no
+/// table holds them yet. Returns the number of the active segment.
 fn assert_recovered_state(tree: &Tree, image: &Path, what: &str) -> u64 {
 	let replayed = non_empty_segments(image);
 	assert!(!replayed.is_empty(), "{what}: the image holds no record to replay");
 	let active = tree.core.inner.wal.read().get_active_log_number();
 	assert!(
-		replayed.iter().all(|&segment| segment < active),
-		"{what}: the database continues in segment {active}, the image holds {replayed:?}"
+		replayed.iter().all(|&segment| segment <= active),
+		"{what}: the database is in segment {active}, the image holds {replayed:?}"
 	);
 	assert_eq!(
 		tree.core.inner.active_memtable.read().unwrap().get_wal_number(),

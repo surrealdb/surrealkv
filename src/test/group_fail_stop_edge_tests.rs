@@ -2027,7 +2027,8 @@ fn non_empty_segments(dir: &Path) -> Vec<u64> {
 
 /// Opens a copy of the crash image `live` in `into`, and checks the state recovery leaves, which
 /// every scenario below starts from: the rows of the crashed segments are in the active memtable,
-/// which is tagged with the segment recovery continues in, and that segment is empty.
+/// which is tagged with the segment that recovery moved them to, and that segment holds nothing
+/// that a table does not hold but those rows.
 async fn recovered_tree(live: &Path, into: &Path, rows: &Entries) -> Arc<Tree> {
 	copy_dir(live, into);
 	let crashed = non_empty_segments(into);
@@ -2043,8 +2044,8 @@ async fn recovered_tree(live: &Path, into: &Path, rows: &Entries) -> Arc<Tree> {
 	);
 	assert!(crashed.iter().all(|segment| *segment < active), "{crashed:?} are older than {active}");
 	assert!(
-		non_empty_segments(into).iter().all(|segment| *segment < active),
-		"the segment recovery continues in is empty"
+		non_empty_segments(into).iter().all(|segment| *segment <= active),
+		"the segments that hold records are the active one, and the ones below it"
 	);
 	for (key, _) in rows {
 		assert!(

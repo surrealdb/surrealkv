@@ -119,7 +119,8 @@ fn read_records(path: &Path) -> Vec<Vec<u8>> {
 
 /// Every record of a segment with the offset it ends at, decoded as a batch.
 fn records_with_ends(path: &Path) -> Vec<(u64, Batch)> {
-	let mut reader = Reader::new(File::open(path).unwrap());
+	let path = sfs::after_open(path);
+	let mut reader = Reader::new(File::open(&path).unwrap());
 	let mut out = Vec::new();
 	loop {
 		match reader.read() {
@@ -1116,6 +1117,8 @@ async fn torn_group_sweep(left: usize, group_lens: &[usize], cuts: Cuts, damage:
 		// for another one, and recovery continues in a fresh segment.
 		let fresh = active_segment(&tree);
 		assert!(fresh > first, "{at}: commits must not go to the damaged segment");
+		// What the segment that recovery starts or moves to holds before the commits after it.
+		let fresh_before = records_with_ends(&seg_path(&work, fresh)).len();
 		assert_eq!(
 			records_with_ends(&seg_path(&work, first)).len(),
 			3 + 1 + whole.len(),
@@ -1140,14 +1143,17 @@ async fn torn_group_sweep(left: usize, group_lens: &[usize], cuts: Cuts, damage:
 
 		assert_eq!(
 			records_with_ends(&seg_path(&work, fresh)).len(),
-			3 + 3,
-			"{at}: the new commits are in the fresh segment"
+			fresh_before + 3 + 3,
+			"{at}: the new commits are in the segment that recovery starts or moves to"
 		);
-		assert_eq!(
-			records_with_ends(&seg_path(&work, first)).len(),
-			3 + 1 + whole.len(),
-			"{at}: the damaged segment was not appended to"
-		);
+		// A damaged segment that stays is not appended to.
+		if sfs::exists(seg_path(&work, first)) {
+			assert_eq!(
+				records_with_ends(&seg_path(&work, first)).len(),
+				3 + 1 + whole.len(),
+				"{at}: the damaged segment was not appended to"
+			);
+		}
 		let tree = Tree::new(opts(&work, BIG)).unwrap();
 		for (k, v) in whole.iter().map(|g| (&g.0, &g.1)).chain(more.iter().map(|g| (&g.0, &g.1))) {
 			assert_eq!(get(&tree, k).as_deref(), Some(v.as_slice()), "{at}: {k} after 2nd crash");

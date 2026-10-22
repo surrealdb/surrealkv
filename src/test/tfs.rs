@@ -535,7 +535,7 @@ pub(crate) fn replay_wal(
 	if let Some(fs) = ambient() {
 		context.fs = fs;
 	}
-	let (max_seq, memtables, _, _) =
+	let (max_seq, memtables, _, _, _) =
 		crate::wal::recovery::replay_wal_inner_with(&context, wal_dir, min_wal_number, arena_size)?;
 	Ok((max_seq, memtables))
 }

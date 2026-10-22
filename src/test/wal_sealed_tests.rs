@@ -780,3 +780,32 @@ fn a_segment_that_cannot_be_opened_with_the_key_at_hand_changes_nothing() {
 	}
 	assert_eq!(snapshot(dir.path()), before);
 }
+
+// ---------------------------------------------------------------------------
+// the rewrite at open
+// ---------------------------------------------------------------------------
+
+/// The rewrite at open moves the newest segment of a plaintext log. A sealed segment is not moved:
+/// the replay of a sealed log names no segment to rewrite, so the open starts a segment of its own.
+#[test]
+fn the_replay_of_a_sealed_log_names_no_segment_to_rewrite() {
+	let dir = TempDir::new().unwrap();
+	let enc = context(CipherSuite::Aes256Gcm);
+	let batch = encoded_batch(100, "alpha", 3, 40);
+	let segment = write_segment(dir.path(), &enc, CompressionType::Lz4, &[batch]);
+
+	let (max_seq, memtable, _, rewrite) = crate::lsm::Core::replay_wal_in(
+		&sealed_context(&enc),
+		dir.path(),
+		0,
+		"sealed replay",
+		crate::WalRecoveryMode::AbsoluteConsistency,
+		1 << 20,
+		None,
+		|_, _, _| Ok(()),
+	)
+	.unwrap();
+	assert!(max_seq.is_some(), "the batch was replayed");
+	assert!(memtable.is_some_and(|memtable| !memtable.is_empty()), "into the active memtable");
+	assert_eq!(rewrite, None, "segment {segment} is sealed, so it is not rewritten");
+}

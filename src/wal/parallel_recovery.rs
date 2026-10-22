@@ -27,13 +27,25 @@ pub(crate) fn decode_segment_batches(
 	decode_segment_batches_with(&WalContext::plaintext(), file_path, segment_id)
 }
 
-/// Decodes a single WAL segment file, read as `context` says, into batches and the segment's
-/// maximum sequence number.
+/// [`decode_segment_ending_with`] without the offset where the reader stopped.
+#[cfg(test)]
 pub(crate) fn decode_segment_batches_with(
 	context: &WalContext,
 	file_path: &Path,
 	segment_id: u64,
 ) -> Result<(u64, Vec<Batch>)> {
+	let (max_seq, batches, _) = decode_segment_ending_with(context, file_path, segment_id)?;
+	Ok((max_seq, batches))
+}
+
+/// Decodes a single WAL segment file, read as `context` says, into batches, the segment's maximum
+/// sequence number, and the offset where the last complete record ends. The reader stops at the
+/// end of the records, which is not the end of the file when the file holds zeros after them.
+pub(crate) fn decode_segment_ending_with(
+	context: &WalContext,
+	file_path: &Path,
+	segment_id: u64,
+) -> Result<(u64, Vec<Batch>, u64)> {
 	let file = context.fs.open_read(file_path)?;
 	let reporter = Box::new(DefaultReporter::new(segment_id));
 	let mut reader = Reader::with_context(file, Some(reporter), segment_id, context);
@@ -67,7 +79,7 @@ pub(crate) fn decode_segment_batches_with(
 		}
 	}
 
-	Ok((max_seq, batches))
+	Ok((max_seq, batches, last_valid_offset as u64))
 }
 
 /// Decodes the sealed segments of `segments`, in order: in parallel on the workers of the pool if
@@ -134,7 +146,10 @@ async fn decode_sealed_segments_parallel(
 	Ok(decoded)
 }
 
-pub(crate) type ParallelReplayResult = (Option<u64>, Vec<(Arc<MemTable>, bool, u64)>, usize, usize);
+/// The newest segment of the log, as the replay read it: its number, and the offset where its
+/// last complete record ends. See `ReplayInnerResult`.
+pub(crate) type ParallelReplayResult =
+	(Option<u64>, Vec<(Arc<MemTable>, bool, u64)>, usize, usize, Option<(u64, u64)>);
 
 /// Synchronous entry point for parallel segment replay.
 pub(crate) fn replay_segments_sync(
@@ -186,8 +201,11 @@ fn replay_segments_serial(
 	let mut max_seq: Option<u64> = None;
 	let mut total_batches = 0;
 	let mut segments_processed = 0;
+	let mut newest_end = None;
 	for seg in segments {
-		let (seg_max, batches) = decode_segment_batches_with(context, &seg.file_path, seg.id)?;
+		let (seg_max, batches, end) = decode_segment_ending_with(context, &seg.file_path, seg.id)?;
+		// The segments are in order, so the last one that is read is the newest.
+		newest_end = Some((seg.id, end));
 		if batches.is_empty() {
 			continue;
 		}
@@ -212,7 +230,7 @@ fn replay_segments_serial(
 			memtables.push((current_memtable, false, seg.id));
 		}
 	}
-	Ok((max_seq, memtables, total_batches, segments_processed))
+	Ok((max_seq, memtables, total_batches, segments_processed, newest_end))
 }
 
 /// Replays a slice of segments in parallel using affinitypool, applying batches
@@ -224,7 +242,7 @@ pub(crate) async fn replay_segments_parallel(
 	arena_size: usize,
 ) -> Result<ParallelReplayResult> {
 	if segments.is_empty() {
-		return Ok((None, Vec::new(), 0, 0));
+		return Ok((None, Vec::new(), 0, 0, None));
 	}
 
 	// 1. Concurrently decode all WAL segments in parallel on worker threads
@@ -233,7 +251,7 @@ pub(crate) async fn replay_segments_parallel(
 		let path = seg.file_path.clone();
 		let id = seg.id;
 		let context = context.clone();
-		let task = affinitypool::spawn(move || decode_segment_batches_with(&context, &path, id));
+		let task = affinitypool::spawn(move || decode_segment_ending_with(&context, &path, id));
 		decode_tasks.push(task);
 	}
 
@@ -249,8 +267,11 @@ pub(crate) async fn replay_segments_parallel(
 	let mut total_batches = 0;
 	let mut segments_processed = 0;
 
-	for (seg_idx, (seg_max_seq, batches)) in decoded_segments.into_iter().enumerate() {
+	let mut newest_end = None;
+	for (seg_idx, (seg_max_seq, batches, end)) in decoded_segments.into_iter().enumerate() {
 		let segment_id = segments[seg_idx].id;
+		// The segments are in order, so the last one that is read is the newest.
+		newest_end = Some((segment_id, end));
 		if batches.is_empty() {
 			continue;
 		}
@@ -282,7 +303,7 @@ pub(crate) async fn replay_segments_parallel(
 		None
 	};
 
-	Ok((res_seq, memtables, total_batches, segments_processed))
+	Ok((res_seq, memtables, total_batches, segments_processed, newest_end))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -323,7 +344,7 @@ mod tests {
 			file_path: wal_path,
 		};
 
-		let (max_seq, memtables, total_batches, segments_processed) =
+		let (max_seq, memtables, total_batches, segments_processed, _) =
 			replay_segments_parallel(&WalContext::plaintext(), &[seg], 1024 * 1024).await.unwrap();
 		assert_eq!(max_seq, Some(10));
 		assert_eq!(memtables.len(), 1);

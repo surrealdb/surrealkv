@@ -80,7 +80,7 @@ fn get(tree: &Tree, key: &str) -> Option<Vec<u8>> {
 }
 
 fn file_len(path: &Path) -> u64 {
-	fs::metadata(path).unwrap().len()
+	fs::metadata(fs::after_open(path)).unwrap().len()
 }
 
 fn copy_dir(src: &Path, dst: &Path) {
@@ -103,8 +103,9 @@ fn set_len(path: &Path, len: u64) {
 /// Decodes a segment the way recovery does and fails on any damage, so a
 /// misframed record cannot hide behind the repair that the next open performs.
 fn strict_decode(path: &Path) -> Vec<Batch> {
+	let path = fs::after_open(path);
 	let id: u64 = path.file_stem().unwrap().to_str().unwrap().parse().unwrap();
-	tfs::decode_segment_batches(path, id)
+	tfs::decode_segment_batches(&path, id)
 		.unwrap_or_else(|e| panic!("{} must parse end to end: {e}", path.display()))
 		.1
 }
@@ -197,15 +198,31 @@ async fn recover_and_commit(o: &Arc<Options>, when: &str, torn: &Torn) -> (u64, 
 	assert!(get(&tree, "torn").is_none(), "{when} exposed the torn commit");
 	// The damaged segment holds the acknowledged records and nothing after them.
 	assert_eq!(strict_decode(&torn.segment).len(), 10, "{when}: the damaged segment");
-	let damaged_len = file_len(&torn.segment);
 
+	// The open repaired the damaged segment, before it moved it to the next number, and the
+	// commits after recovery go to the moved segment: the damaged bytes are only in the quarantine.
 	let segment = active_segment(&tree);
 	let damaged: u64 = torn.segment.file_stem().unwrap().to_str().unwrap().parse().unwrap();
-	assert!(segment > damaged, "{when}: commits must not go to the damaged segment");
+	assert_eq!(segment, damaged + 1, "{when}: the commits go to the next number");
+	// A tail the reader takes for the end, with bytes after it that are not zeros, is left as it
+	// is: the segment stays, and the commits go to a segment of their own.
+	let moved = !sfs::exists(&torn.segment);
 	for i in 0..5 {
 		put(&tree, &format!("new{i}"), &NEW).await;
 	}
-	assert_eq!(file_len(&torn.segment), damaged_len, "{when}: the damaged segment was appended to");
+	if moved {
+		assert_eq!(
+			strict_decode(&torn.segment).len(),
+			15,
+			"{when}: the moved segment holds the ten records and the five commits after recovery"
+		);
+	} else {
+		assert_eq!(
+			strict_decode(&torn.segment).len(),
+			10,
+			"{when}: the segment that stays holds the ten records"
+		);
+	}
 	let len = file_len(&wal_path(o, segment));
 	assert!(len > 0, "{when}: the commits did not reach segment {segment}");
 	crash(tree);
@@ -221,8 +238,17 @@ async fn tolerate_scenario(shape: Shape) {
 	// Recovery 1: the torn commit was never acknowledged, the rest was.
 	let (segment, _) = recover_and_commit(&o, "recovery #1", &torn).await;
 
-	// The new commits are in the fresh segment, framed cleanly.
-	assert_eq!(strict_decode(&wal_path(&o, segment)).len(), 5);
+	// The new commits are framed cleanly in the segment they went to: with the records that were
+	// whole, when the damaged segment was moved, and alone when it stayed.
+	let moved = !sfs::exists(&torn.segment);
+	assert_eq!(
+		strict_decode(&wal_path(&o, segment)).len(),
+		if moved {
+			15
+		} else {
+			5
+		}
+	);
 
 	// Recovery 2: the damaged segment is no longer the last one.
 	let tree = Tree::new(Arc::clone(&o)).expect("recovery #2 must open");
@@ -290,7 +316,7 @@ async fn absolute_scenario(shape: Shape, class: Class) {
 			assert_eq!(
 				file_len(&torn.segment),
 				torn.cut_len,
-				"a tail the reader accepts is not repaired"
+				"a tail the reader accepts is kept as it is, and the commits go to a segment of their own"
 			);
 
 			// The unrepaired tail is in a segment that is no longer the last one.
@@ -365,10 +391,10 @@ async fn fill_value_len(target: u64) -> usize {
 }
 
 /// Control: a segment that ends exactly on a block boundary after a complete
-/// record is not torn. Nothing is repaired, and the commits after recovery go
-/// to the next segment.
+/// record is not torn. Nothing is repaired: the open moves the segment to the
+/// next number as it is, and the commits after recovery go to it.
 #[test_log::test(tokio::test)]
-async fn segment_ending_on_a_block_boundary_is_left_alone() {
+async fn segment_ending_on_a_block_boundary_is_kept_as_it_is() {
 	let dir = TempDir::new().unwrap();
 	let o = opts(dir.path(), WalRecoveryMode::TolerateCorruptedWithRepair);
 	let fill_len = fill_value_len(BLOCK).await;
@@ -381,14 +407,14 @@ async fn segment_ending_on_a_block_boundary_is_left_alone() {
 	crash(tree);
 
 	let tree = Tree::new(Arc::clone(&o)).unwrap();
-	assert_eq!(fs::read(&wal).unwrap(), before, "a clean segment must not be rewritten");
+	assert_eq!(fs::read(fs::after_open(&wal)).unwrap(), before, "a clean segment keeps its bytes");
 	assert!(!sfs::exists(o.wal_dir().join("repair_temp")));
 	for i in 0..5 {
 		put(&tree, &format!("new{i}"), &NEW).await;
 	}
 	crash(tree);
 
-	assert_eq!(strict_decode(&wal).len(), 1);
+	assert_eq!(strict_decode(&wal).len(), 6, "the fill, and the five commits after recovery");
 	let tree = Tree::new(Arc::clone(&o)).unwrap();
 	assert_eq!(get(&tree, "fill").map(|v| v.len()), Some(fill_len));
 	assert_keys(&tree, "new", 5, &NEW, "after restart");
@@ -438,7 +464,11 @@ async fn zero_filled_tail_does_not_hide_later_commits() {
 			}
 			crash(tree);
 
-			assert_eq!(strict_decode(&wal).len(), 10, "{zeros} zeros, {mode:?}");
+			assert_eq!(
+				strict_decode(&wal).len(),
+				15,
+				"{zeros} zeros, {mode:?}: the ten records, and the five after recovery"
+			);
 			assert!(file_len(&wal) >= record_len * 10, "{zeros} zeros, {mode:?}");
 			let tree = Tree::new(Arc::clone(&o)).unwrap();
 			assert_keys(&tree, "good", 10, &GOOD, "recovery #2");
@@ -667,13 +697,21 @@ async fn multi_segment_scenario(shape: Shape) {
 			"an earlier segment is in a table and is removed"
 		);
 	}
-	assert_eq!(active_segment(&tree), first + 3, "recovery continues in a fresh segment");
+	assert_eq!(
+		active_segment(&tree),
+		first + 3,
+		"recovery moves the last segment to the next number"
+	);
 	for i in 0..5 {
 		put(&tree, &format!("new{i}"), &NEW).await;
 	}
 	crash(tree);
 
-	assert_eq!(strict_decode(&wal_path(&o, first + 3)).len(), 5);
+	assert_eq!(
+		strict_decode(&wal_path(&o, first + 3)).len(),
+		15,
+		"the last segment holds its ten records and the five after recovery"
+	);
 	let tree = Tree::new(Arc::clone(&o)).expect("recovery #2 must open");
 	assert_keys(&tree, "a", 5, &GOOD, "recovery #2");
 	assert_keys(&tree, "b", 5, &GOOD, "recovery #2");
@@ -760,9 +798,9 @@ async fn multi_segment_corruption_in_an_earlier_segment() {
 		"the damaged segment was quarantined"
 	);
 	assert_eq!(
-		fs::read(wal_path(&tolerate, first_id + 1)).unwrap(),
+		fs::read(fs::after_open(&wal_path(&tolerate, first_id + 1))).unwrap(),
 		second,
-		"the last segment is untouched"
+		"the last segment keeps its bytes, moved to the next number"
 	);
 	for i in 0..5 {
 		put(&tree, &format!("new{i}"), &NEW).await;

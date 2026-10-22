@@ -2055,16 +2055,16 @@ async fn a_bottom_level_compaction_whose_points_are_all_covered_by_a_range_tombs
 }
 
 // ---------------------------------------------------------------------------
-// 3 again: a replay flush that takes the id of an orphan
+// 3 again: a replay flush next to the outputs of a compaction
 // ---------------------------------------------------------------------------
 
 /// An open that has to flush a memtable of the log takes its table id from the counter of the
-/// manifest, and after a crash before the manifest write that id is the one of an output the
-/// compaction left on disk. The flush writes its table over that file, and the orphans that are
-/// left are reclaimed after it. The log holds two segments because the tree was reopened once
-/// after its first tail was written, so that the replay flushes the first segment.
+/// manifest. After a crash before the manifest write, the outputs of the compaction are on disk
+/// and nothing lists them, and the flush must leave the database as it should be beside them: the
+/// orphans are reclaimed after it. The log holds two segments, the first tail in one and a rotation
+/// before the second, so that the replay flushes the first segment.
 #[test(tokio::test)]
-async fn a_table_flushed_by_the_replay_may_take_the_id_of_an_orphan_output_without_harm() {
+async fn a_table_flushed_by_the_replay_next_to_compaction_outputs_is_harmless() {
 	let dir = TempDir::new("cc-db").unwrap();
 	let images = TempDir::new("cc-images").unwrap();
 	let db = dir.path().join("db");
@@ -2083,13 +2083,16 @@ async fn a_table_flushed_by_the_replay_may_take_the_id_of_an_orphan_output_witho
 	];
 	commit(&tree, &mut model, tail, Durability::Immediate).await;
 	verify_data(&tree, &model, "after the reopen");
+	// A rotation starts a second segment, which takes the commit after it: the replay of the log
+	// then flushes the first one, as the scenario needs.
+	tree.core.inner.rotate_memtable().unwrap();
+	commit(&tree, &mut model, vec![Op::Set(22, val("tail3", 22, true))], Durability::Immediate)
+		.await;
 
-	let before = ids_by_level(&tree);
 	let probe = Probe::new(&db, images.path(), &[CompactionStage::OutputsDurable]);
 	probe.install(&tree);
 	compact(&tree, 0, 1).unwrap();
 	Probe::uninstall(&tree);
-	let plan = Plan::new(before, &ids_by_level(&tree), 0, 1);
 	let image = probe.image(CompactionStage::OutputsDurable);
 	kill(&tree);
 	drop(tree);
@@ -2104,12 +2107,6 @@ async fn a_table_flushed_by_the_replay_may_take_the_id_of_an_orphan_output_witho
 	let flushed: Vec<u64> =
 		live[0].iter().copied().filter(|id| !raw.levels[0].contains(id)).collect();
 	assert_eq!(flushed.len(), 1, "the replay flushed the first segment to a table: {live:?}");
-	assert!(
-		plan.outputs.contains(&flushed[0]),
-		"the replay's table {} took the id of an output the compaction left: {:?}",
-		flushed[0],
-		plan.outputs
-	);
 	kill(&tree);
 	drop(tree);
 	recover(&image.dir, &model, true, "after the replay flush, again").await;

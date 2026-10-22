@@ -25,6 +25,9 @@ use crate::error::EncryptionError;
 use crate::tde::EncryptionContext;
 use crate::vfs::{CreateOpts, Fs, FsFile, FsKind};
 
+/// The size of the reads that the check of a tail for zeros makes.
+const COPY_CHUNK: usize = 1024 * 1024;
+
 /// Write-Ahead Log (Wal) manager for coordinating WAL operations.
 pub struct Wal {
 	/// The currently active Writer for writing records. `None` only in a sealed WAL that was
@@ -890,6 +893,94 @@ impl Wal {
 	pub(crate) fn rotate(&mut self) -> Result<u64> {
 		self.rotate_with(|| Ok(()))
 	}
+
+	/// Moves the active segment, which the open has replayed, to the number that follows it, and
+	/// makes it the active one: the rewrite at open. It is for a log whose newest segment holds the
+	/// recovered memtable, so that the open starts no segment beside the one it replayed.
+	///
+	/// The writer appends after the end of the file, so the file is first cut to `valid_end`, the
+	/// offset where the replay stopped, when it is longer. The bytes past that offset must be
+	/// zeros, which the replay takes for the end of the log: a tail with any other byte is not
+	/// moved, and `None` is returned with nothing changed, so that the caller starts a segment
+	/// of its own. The cut is synced before the rename.
+	///
+	/// The move is one rename, which the file system makes at one commit point, followed by a sync
+	/// of the directory that names it. The file is not copied, so no state holds the records of a
+	/// segment under two names: a crash leaves the segment under its old name or under the new
+	/// one, and the next open replays it either way.
+	///
+	/// `before_sync` runs before the rename, as in [`rotate_with`](Self::rotate_with): it makes
+	/// durable what the records point to, so that none of them reaches the disk ahead of it.
+	pub(crate) fn rewrite_active_with(
+		&mut self,
+		valid_end: u64,
+		before_sync: impl FnOnce() -> Result<()>,
+	) -> Result<Option<u64>> {
+		let fs = &*self.opts.context.fs;
+		let extension = self.opts.file_extension.as_deref().unwrap_or("wal");
+		let old_log_number = self.active_log_number;
+		let new_log_number = old_log_number + 1;
+		let old_path = self.dir.join(segment_name(old_log_number, extension));
+		let new_path = self.dir.join(segment_name(new_log_number, extension));
+
+		if fs.exists(&new_path) {
+			return Err(Error::IO(IOError::new(
+				io::ErrorKind::AlreadyExists,
+				&format!(
+					"WAL segment {new_log_number:020}.{extension} exists, so {old_log_number:020}.{extension} cannot be moved to it"
+				),
+			)));
+		}
+
+		let old = fs.open_read(&old_path)?;
+		let len = old.len()?;
+		if len > valid_end && !all_zeros(&*old, valid_end, len)? {
+			return Ok(None);
+		}
+		drop(old);
+
+		// The writer of the old name is not used again: nothing is appended to it.
+		self.active_writer = None;
+		self.sync_fd = None;
+
+		if len > valid_end {
+			let file = fs.open_append_existing(&old_path)?;
+			file.set_len(valid_end)?;
+			file.sync()?;
+		}
+
+		before_sync()?;
+		fs.rename(&old_path, &new_path)?;
+		fs.sync_dir(&self.dir)?;
+
+		let (writer, sync_fd) = Self::create_writer(&self.dir, new_log_number, &self.opts)?;
+		self.active_writer = Some(writer);
+		self.sync_fd = Some(sync_fd);
+		self.active_log_number = new_log_number;
+
+		tracing::debug!("WAL moved {:020} to {:020}", old_log_number, new_log_number);
+		Ok(Some(new_log_number))
+	}
+}
+
+/// Whether the bytes of `file` from `from` to `to` are all zeros.
+fn all_zeros(file: &dyn FsFile, from: u64, to: u64) -> Result<bool> {
+	let mut buf = vec![0u8; COPY_CHUNK];
+	let mut offset = from;
+	while offset < to {
+		let want = usize::try_from((to - offset).min(COPY_CHUNK as u64)).unwrap_or(COPY_CHUNK);
+		let read = file
+			.read_at(offset, &mut buf[..want])
+			.map_err(|e| Error::IO(IOError::new(io::ErrorKind::Other, &e.to_string())))?;
+		if read == 0 {
+			break;
+		}
+		if buf[..read].iter().any(|byte| *byte != 0) {
+			return Ok(false);
+		}
+		offset += read as u64;
+	}
+	Ok(true)
 }
 
 impl Drop for Wal {

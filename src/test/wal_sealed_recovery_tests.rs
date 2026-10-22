@@ -71,7 +71,7 @@ impl Recovered {
 /// Replays the WAL in `dir` as a tree does, with the context and the mode, and keeps what it made.
 fn recover(context: &WalContext, dir: &Path, mode: WalRecoveryMode) -> crate::Result<Recovered> {
 	let mut memtables = Vec::new();
-	let (max_seq, active, _) =
+	let (max_seq, active, _, _) =
 		Core::replay_wal_in(context, dir, 0, "test", mode, ARENA, None, |memtable, _, _| {
 			memtables.push(memtable);
 			Ok(())
