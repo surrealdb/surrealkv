@@ -8,6 +8,8 @@ use crate::snapshot::SnapshotIterator;
 use crate::vlog::ValueLocation;
 use crate::{InternalKey, LSMIterator, Result};
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod abandoned_session_tests;
 #[cfg(test)]
 pub mod alloc_limits_tests;
 #[cfg(test)]

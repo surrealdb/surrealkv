@@ -881,6 +881,16 @@ impl FileSystem {
 		}
 	}
 
+	/// Appends `bytes` to a file that is there, and makes them durable: what a write that a crash
+	/// left half done looks like, for a test.
+	#[doc(hidden)]
+	pub fn append_for_test(&self, path: &str, bytes: &[u8]) -> Result<()> {
+		let file = self.0.open_append_existing(Path::new(path))?;
+		file.append(bytes)?;
+		file.sync()?;
+		Ok(())
+	}
+
 	/// What the mount of a pool found: for a pool, the files, the spares, the orphans.
 	#[doc(hidden)]
 	pub fn mount_report(&self) -> Option<MountReport> {
