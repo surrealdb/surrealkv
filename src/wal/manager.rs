@@ -2,6 +2,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::recovery::sync_mark_in;
 use super::writer::Writer;
 use super::{
 	directory_present,
@@ -20,6 +21,7 @@ use super::{
 	SyncGate,
 	BLOCK_SIZE,
 	HEADER_SIZE,
+	SYNC_MARK_LEN,
 };
 use crate::error::EncryptionError;
 use crate::tde::EncryptionContext;
@@ -899,10 +901,11 @@ impl Wal {
 	/// recovered memtable, so that the open starts no segment beside the one it replayed.
 	///
 	/// The writer appends after the end of the file, so the file is first cut to `valid_end`, the
-	/// offset where the replay stopped, when it is longer. The bytes past that offset must be
-	/// zeros, which the replay takes for the end of the log: a tail with any other byte is not
-	/// moved, and `None` is returned with nothing changed, so that the caller starts a segment
-	/// of its own. The cut is synced before the rename.
+	/// offset where the replay stopped, when it is longer. The bytes past that offset must be whole
+	/// sync marks and the zeros that pad a block, see [`tail_is_marks_and_padding`]: the replay
+	/// reads them as the end of the log. A tail with any other byte is not moved, and `None` is
+	/// returned with nothing changed, so that the caller starts a segment of its own. The cut is
+	/// synced before the rename.
 	///
 	/// The move is one rename, which the file system makes at one commit point, followed by a sync
 	/// of the directory that names it. The file is not copied, so no state holds the records of a
@@ -934,7 +937,7 @@ impl Wal {
 
 		let old = fs.open_read(&old_path)?;
 		let len = old.len()?;
-		if len > valid_end && !all_zeros(&*old, valid_end, len)? {
+		if len > valid_end && !tail_is_marks_and_padding(&*old, valid_end, len)? {
 			return Ok(None);
 		}
 		drop(old);
@@ -961,6 +964,44 @@ impl Wal {
 		tracing::debug!("WAL moved {:020} to {:020}", old_log_number, new_log_number);
 		Ok(Some(new_log_number))
 	}
+}
+
+/// Whether the bytes of `file` from `from` to `to` are what a writer leaves after the last record
+/// of a segment: whole sync marks, and the zeros that pad the end of a block with too little room
+/// for a mark (see `Writer::write_sync_mark_unflushed`). The replay reads these bytes as the end of
+/// the log, so a tail made of them holds no record.
+///
+/// A mark is checked as the reader checks one: its checksum, its length and its block. A tail that
+/// is shorter than a mark is accepted only if it is zeros, and a read that comes back short is
+/// not accepted.
+pub(crate) fn tail_is_marks_and_padding(file: &dyn FsFile, from: u64, to: u64) -> Result<bool> {
+	const MARK_LEN: usize = HEADER_SIZE + SYNC_MARK_LEN;
+	let mut pos = from;
+	while pos < to {
+		let mut head = [0u8; MARK_LEN];
+		let want = usize::try_from((to - pos).min(MARK_LEN as u64)).unwrap_or(MARK_LEN);
+		let read = file
+			.read_at(pos, &mut head[..want])
+			.map_err(|e| Error::IO(IOError::new(io::ErrorKind::Other, &e.to_string())))?;
+		if read != want {
+			return Ok(false);
+		}
+		let padding = want < MARK_LEN || head[HEADER_SIZE - 1] == RecordType::Empty as u8;
+		if padding {
+			let block_end = pos + (BLOCK_SIZE as u64 - pos % BLOCK_SIZE as u64);
+			let end = block_end.min(to);
+			if !all_zeros(file, pos, end)? {
+				return Ok(false);
+			}
+			pos = end;
+		} else {
+			if sync_mark_in(&head, pos, 0).is_none() {
+				return Ok(false);
+			}
+			pos += MARK_LEN as u64;
+		}
+	}
+	Ok(true)
 }
 
 /// Whether the bytes of `file` from `from` to `to` are all zeros.
