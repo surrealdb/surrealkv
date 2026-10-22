@@ -162,7 +162,7 @@ async fn abandoned_session_ending_in_an_unsynced_commit(path: &Path, vlog: bool)
 	let mut before_last = 0;
 	for i in 0..COMMITS {
 		if i == COMMITS - 1 {
-			before_last = std::fs::metadata(newest(path).1).expect("the segment").len();
+			before_last = super::sfs::metadata(newest(path).1).expect("the segment").len();
 		}
 		let durability = if i == COMMITS - 1 {
 			Durability::Eventual
@@ -185,14 +185,14 @@ async fn abandoned_session_ending_in_an_unsynced_commit(path: &Path, vlog: bool)
 /// of the mark.
 fn cut_to_last_mark(path: &Path) -> (u64, u64) {
 	let (id, file) = newest(path);
-	let data = std::fs::read(&file).expect("the segment reads");
+	let data = super::sfs::read(&file).expect("the segment reads");
 	let mark = (0..data.len())
 		.rev()
 		.find(|pos| sync_mark_in(&data, 0, *pos).is_some())
 		.expect("the segment holds a sync mark");
 	let end = mark + HEADER_SIZE + SYNC_MARK_LEN;
 	assert!(end < data.len(), "a record follows the last mark");
-	let cut = std::fs::OpenOptions::new().write(true).open(&file).expect("the segment opens");
+	let cut = super::sfs::OpenOptions::new().write(true).open(&file).expect("the segment opens");
 	cut.set_len(end as u64).expect("the segment is cut");
 	cut.sync_all().expect("the cut is synced");
 	(id, mark as u64)
