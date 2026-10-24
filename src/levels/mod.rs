@@ -265,8 +265,9 @@ pub const MANIFEST_FORMAT_VERSION_V2: u16 = 2;
 /// The manifest format written since the WAL segments of SurrealKV may hold sync marks
 /// (`RecordType::SyncMark`). The byte layout is the same as V2; the version exists so that a binary
 /// that only knows V2, which would take a mark for damage and cut or refuse the segment, refuses
-/// the directory instead. An open makes the manifest of this version before any segment is
-/// written, see [`LevelManifest::upgrade_format_in`].
+/// the directory instead. An open (and a restore) makes the manifest of this version once the WAL
+/// is replayed and before the first segment of its own is started, see
+/// [`LevelManifest::upgrade_format_in`].
 pub const MANIFEST_FORMAT_VERSION_V3: u16 = 3;
 
 /// The manifest format version this code writes.
@@ -612,7 +613,8 @@ impl LevelManifest {
 
 	/// Makes the manifest on disk of [`MANIFEST_FORMAT_VERSION`] if it is of an older one, so that
 	/// a binary that only knows the older one refuses the directory before anything of the newer
-	/// format is in it. Called by an open before it writes a WAL segment.
+	/// format is in it. Called by an open, and a restore, before it starts a WAL segment of its
+	/// own, which is the first one that can hold a mark.
 	pub(crate) fn upgrade_format_in(&mut self, fs: &dyn Fs) -> Result<()> {
 		if self.manifest_format_version >= MANIFEST_FORMAT_VERSION {
 			return Ok(());

@@ -453,7 +453,7 @@ impl CoreInner {
 		// Initialize level manifest FIRST to get log_number. Whether it exists must be read
 		// first, because `LevelManifest::new` creates one when it does not.
 		let manifest_loaded_from_disk = opts.fs.exists(&opts.manifest_file_path(0));
-		let mut manifest = LevelManifest::new_in(&*opts.fs, Arc::clone(&opts))?;
+		let manifest = LevelManifest::new_in(&*opts.fs, Arc::clone(&opts))?;
 		let manifest_log_number = manifest.get_log_number();
 
 		// Whether the table files that the manifest does not list are this database's is read
@@ -483,10 +483,6 @@ impl CoreInner {
 		} else {
 			None
 		};
-
-		// The WAL segments that the open writes may hold sync marks, which a binary that knows no
-		// marks must not read: the manifest is of the version that such a binary refuses first.
-		manifest.upgrade_format_in(&*opts.fs)?;
 
 		// Initialize WAL starting from manifest.log_number
 		let wal_path = opts.wal_dir();
@@ -2324,6 +2320,9 @@ impl Core {
 									format!(
 											"WAL segment {segment_id} is an older segment (newest is {max_segment_id}); older segments cannot have torn tails"
 										)
+								} else if intact_records_after == 0 {
+									"a sync mark after it says the damaged bytes had been synced"
+										.to_string()
 								} else {
 									format!(
 											"found {intact_records_after} intact record(s) after corruption offset {last_valid_offset}"
@@ -2614,6 +2613,12 @@ impl Core {
 		}
 		*inner.recovery_report.write() = startup_report;
 
+		// The segments that the open writes from here on hold sync marks, which a binary that
+		// knows no marks must not read: the manifest is of the version that such a binary refuses
+		// first. Not before: nothing up to here writes a mark, and an open that failed before
+		// this leaves the directory to the binary it came from.
+		inner.level_manifest.write()?.upgrade_format_in(&*opts.fs)?;
+
 		// The records of the newest segment, when they are the recovered memtable and nothing else,
 		// are rewritten into the segment after it, which then takes the commits: the open starts no
 		// segment beside the one it replayed, so a session that ends without a close adds no
@@ -2876,6 +2881,13 @@ impl Core {
 	/// Unlike `make_room_for_write`, this does NOT rotate the WAL before
 	/// flushing. This prevents creating an empty WAL file on clean shutdown.
 	pub async fn close(&self) -> Result<()> {
+		self.close_with(true).await
+	}
+
+	/// [`close`](Self::close), with or without the trailing sync mark of the active WAL segment
+	/// (see `Wal::close`). The close that a drop spawns writes none: it runs whenever the runtime
+	/// gets to it, and the segment may by then be another open's, which repaired or replayed it.
+	pub(crate) async fn close_with(&self, trailing_mark: bool) -> Result<()> {
 		let _closing = self.closing.lock().await;
 		if self.is_closed.load(Ordering::SeqCst) {
 			return Ok(());
@@ -2995,8 +3007,9 @@ impl Core {
 		// A WAL that cannot be closed (the fsync of its segment failed) does not keep the rest of
 		// the shutdown from running: its error is returned at the end.
 		let mut wal_guard = self.inner.wal.write();
-		let wal_closed =
-			wal_guard.close().map_err(|e| Error::Other(format!("Failed to close WAL: {}", e)));
+		let wal_closed = wal_guard
+			.close_with(trailing_mark)
+			.map_err(|e| Error::Other(format!("Failed to close WAL: {}", e)));
 		if wal_closed.is_ok() {
 			tracing::debug!("WAL #{:020} closed and synced", wal_log_number);
 		}
@@ -3097,7 +3110,7 @@ impl Drop for TreeHandle {
 		}
 		let core = Arc::clone(&self.core);
 		let spawned = rt::try_spawn(async move {
-			if let Err(err) = core.close().await {
+			if let Err(err) = core.close_with(false).await {
 				tracing::error!("Error closing store: {}", err);
 			}
 		});
@@ -3664,9 +3677,7 @@ impl Tree {
 		// Step 2: Reload in-memory state to match restored files
 
 		// Read from disk with none of the locks of the state held.
-		let mut new_levels = LevelManifest::new(Arc::clone(&self.core.inner.opts))?;
-		// The WAL is reopened on the restored directory below, see `CoreInner::new`.
-		new_levels.upgrade_format_in(&*self.core.inner.opts.fs)?;
+		let new_levels = LevelManifest::new(Arc::clone(&self.core.inner.opts))?;
 
 		// The files of the value log were replaced: the log's writer, its handles and its next
 		// file id belong to the ones that are gone. Before the swap below, so that a reader of the
@@ -3761,6 +3772,9 @@ impl Tree {
 		)?;
 
 		*self.core.inner.recovery_report.write() = restore_report;
+
+		// The restored directory gets segments with sync marks from here on, see `Core::new`.
+		self.core.inner.level_manifest.write()?.upgrade_format_in(&*self.core.inner.opts.fs)?;
 
 		// Always continue in a fresh segment: replay may have repaired (replaced) the
 		// segment the writer was opened on, or flushed it and moved the manifest's
@@ -4028,7 +4042,7 @@ impl Drop for Tree {
 				// Clone the Arc to move into the async task
 				let core = Arc::clone(&self.core);
 				let spawned = rt::try_spawn(async move {
-					if let Err(err) = core.close().await {
+					if let Err(err) = core.close_with(false).await {
 						tracing::error!("Error closing store: {}", err);
 					}
 				});

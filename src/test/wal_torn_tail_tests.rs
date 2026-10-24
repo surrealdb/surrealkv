@@ -30,6 +30,8 @@ use crate::wal::{CompressionType, BLOCK_SIZE};
 use crate::{Error, InternalKeyKind, Options, Tree, WalRecoveryMode};
 
 const BLOCK: u64 = BLOCK_SIZE as u64;
+/// The leading sync mark that a segment starts with, ahead of its first record.
+const LEADING_MARK: u64 = (crate::wal::HEADER_SIZE + crate::wal::SYNC_MARK_LEN) as u64;
 const GOOD: [u8; 64] = [b'x'; 64];
 const NEW: [u8; 64] = [b'z'; 64];
 
@@ -71,6 +73,14 @@ fn crash(tree: Tree) {
 
 async fn put(tree: &Tree, key: &str, value: &[u8]) {
 	let mut txn = tree.begin().unwrap();
+	txn.set(key.as_bytes(), value).unwrap();
+	txn.commit().await.unwrap();
+}
+
+/// [`put`], acknowledged only once the WAL is synced.
+async fn put_synced(tree: &Tree, key: &str, value: &[u8]) {
+	let mut txn = tree.begin().unwrap();
+	txn.set_durability(crate::Durability::Immediate);
 	txn.set(key.as_bytes(), value).unwrap();
 	txn.commit().await.unwrap();
 }
@@ -422,7 +432,7 @@ async fn segment_ending_on_a_block_boundary_is_kept_as_it_is() {
 }
 
 /// Writes 10 good commits (one record each), crashes, and returns the segment they are in and
-/// the length of one record.
+/// the length of one record. The records follow the leading mark of the segment.
 async fn write_ten_good(o: &Arc<Options>) -> (PathBuf, u64) {
 	let tree = Tree::new(Arc::clone(o)).unwrap();
 	let wal = wal_path(o, active_segment(&tree));
@@ -430,7 +440,7 @@ async fn write_ten_good(o: &Arc<Options>) -> (PathBuf, u64) {
 		put(&tree, &format!("good{i}"), &GOOD).await;
 	}
 	crash(tree);
-	let len = file_len(&wal);
+	let len = file_len(&wal) - LEADING_MARK;
 	assert_eq!(len % 10, 0, "records are not equal-sized");
 	(wal, len / 10)
 }
@@ -526,7 +536,7 @@ async fn partial_header_after_block_padding() {
 /// Flips a byte inside the payload of record `n`.
 fn flip_byte_in_record(path: &Path, record_len: u64, n: u64) {
 	let mut bytes = fs::read(path).unwrap();
-	bytes[(record_len * n + 20) as usize] ^= 0xff;
+	bytes[(LEADING_MARK + record_len * n + 20) as usize] ^= 0xff;
 	fs::write(path, bytes).unwrap();
 }
 
@@ -1019,11 +1029,11 @@ async fn test_tolerate_torn_tail_refuses_interior_corruption() {
 
 	let tree = Tree::new(Arc::clone(&o_default)).unwrap();
 	let wal = wal_path(&o_default, active_segment(&tree));
-	put(&tree, "batch1", &GOOD).await;
+	put_synced(&tree, "batch1", &GOOD).await;
 	let after_batch1 = file_len(&wal);
-	put(&tree, "batch2", &GOOD).await;
+	put_synced(&tree, "batch2", &GOOD).await;
 	let _after_batch2 = file_len(&wal);
-	put(&tree, "batch3", &GOOD).await;
+	put_synced(&tree, "batch3", &GOOD).await;
 	crash(tree);
 
 	// Corrupt batch2 in the middle of the file (interior corruption; batch3 remains intact after

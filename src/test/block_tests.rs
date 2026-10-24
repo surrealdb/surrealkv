@@ -831,3 +831,37 @@ fn test_seek_with_buf_corrupt_restart_offset_returns_err() {
 	let mut iter = block.iter().unwrap();
 	assert!(iter.seek(&target).is_err());
 }
+
+#[test]
+fn test_short_internal_key_is_rejected_as_malformed() {
+	use crate::error::Error;
+	use crate::sstable::error::SSTableError;
+
+	let o = make_opts(None);
+	let mut builder = BlockWriter::new(
+		o.block_size,
+		o.block_restart_interval,
+		Arc::clone(&o.internal_comparator),
+	);
+	// A corrupt or truncated block can decode to an internal key shorter than
+	// the mandatory 8-byte trailer. Encode a 3-byte key directly to stand in
+	// for such a block.
+	builder.add(b"abc", b"v").unwrap();
+	let block = Block::new(builder.finish().unwrap(), Arc::clone(&o.internal_comparator));
+	let mut iter = block.iter().unwrap();
+
+	// The decode rejects the short key instead of surfacing it to an accessor
+	// that would underflow `len - 8`.
+	let err = iter.seek_to_first().expect_err("a short internal key must be rejected");
+	assert!(
+		matches!(err, Error::SSTable(SSTableError::KeyTooShort { .. })),
+		"expected KeyTooShort, got {err:?}"
+	);
+	assert!(!iter.valid(), "a short key must never be reported as a valid position");
+
+	// seek() and advance() reach the same guard rather than panicking.
+	let target = InternalKey::new(b"abc".to_vec(), 0, InternalKeyKind::Set).encode();
+	assert!(iter.seek(&target).is_err());
+	iter.reset();
+	assert!(iter.advance().is_err());
+}

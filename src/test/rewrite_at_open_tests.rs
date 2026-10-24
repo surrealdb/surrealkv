@@ -284,7 +284,14 @@ fn a_tail_is_moved_only_past_sync_marks_and_block_padding() {
 	let cases: Vec<(&str, Vec<u8>, usize, bool)> = vec![
 		("no tail", vec![], 0, true),
 		("a mark", sync_mark(0), 0, true),
-		("two marks", [sync_mark(5), sync_mark(9)].concat(), 0, true),
+		// A mark claims a synced length no greater than its own position, as the writer makes
+		// them.
+		(
+			"two marks",
+			[sync_mark(0), sync_mark((HEADER_SIZE + SYNC_MARK_LEN) as u64)].concat(),
+			0,
+			true,
+		),
 		("fewer zeros than a mark", vec![0; 10], 0, true),
 		("zeros to the end of the tail", vec![0; 100], 0, true),
 		("padding of a block, then a mark in the next", padded, BLOCK_SIZE - 10, true),

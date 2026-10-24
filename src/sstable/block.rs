@@ -89,7 +89,7 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::sstable::error::SSTableError;
 use crate::varint::{decode_varint_usize, encode_varint_u64, put_varint_u64, varint_len_u64};
-use crate::{Comparator, InternalKey, InternalKeyRef, LSMIterator};
+use crate::{Comparator, InternalKey, InternalKeyRef, LSMIterator, INTERNAL_KEY_TRAILER_SIZE};
 
 /// Raw block data as a byte vector.
 pub(crate) type BlockData = Vec<u8>;
@@ -916,6 +916,17 @@ impl BlockIterator {
 		self.current_key.truncate(shared_prefix);
 		self.current_key.extend_from_slice(&self.block[self.offset + i..key_end]);
 
+		// Every internal key carries an 8-byte trailer, so a shorter key is a
+		// corrupt or truncated block. Reject it here, before any accessor computes
+		// the trailer: `trailer_from_encoded` would otherwise compute a
+		// `len - 8` offset that underflows.
+		if self.current_key.len() < INTERNAL_KEY_TRAILER_SIZE {
+			return Err(Error::from(SSTableError::KeyTooShort {
+				offset: self.offset,
+				len: self.current_key.len(),
+			}));
+		}
+
 		self.offset = key_end;
 
 		// Track value location
@@ -996,7 +1007,10 @@ impl LSMIterator for BlockIterator {
 impl BlockIterator {
 	/// Checks if the iterator is positioned on a valid entry.
 	pub(crate) fn is_valid(&self) -> bool {
-		!self.current_key.is_empty()
+		// A valid key carries at least the 8-byte trailer; a shorter one is
+		// never surfaced as valid, so no accessor reads a trailer that is not
+		// there.
+		self.current_key.len() >= INTERNAL_KEY_TRAILER_SIZE
 			&& self.current_value_offset_start != 0
 			&& self.current_value_offset_end != 0
 			&& self.offset <= self.restart_offset

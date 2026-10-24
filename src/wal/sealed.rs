@@ -123,6 +123,7 @@ pub(crate) fn check_first_record(
 		RecordType::Middle,
 		RecordType::Last,
 		RecordType::SetCompressionType,
+		RecordType::SyncMark,
 	]
 	.iter()
 	.any(|&plain| plain as u8 == kind);

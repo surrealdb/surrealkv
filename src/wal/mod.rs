@@ -105,9 +105,16 @@ pub enum RecordType {
 
 	/// How far the segment was synced when the record was written: the payload is a big-endian
 	/// `u64` of [`SYNC_MARK_LEN`] bytes, the length of the segment that the last fsync to complete
-	/// before it covered. Every byte below it was on disk when the mark was written. A plaintext
-	/// segment holds one before every append that finds the synced length moved on since the
-	/// last, so a segment that was never synced holds none.
+	/// before it covered. That length is always the end of an append that had reached the file
+	/// whole, never a point inside one, and every byte below it was on disk when the mark was
+	/// written.
+	///
+	/// A plaintext segment that holds marks starts with one, its leading mark, which its first
+	/// append writes (after the record of its compression, if it has one). It holds another before
+	/// every later append that finds the synced length moved on since the last, and a trailing one
+	/// when the log is closed, after its last fsync. A mark is always followed by a record, except
+	/// the trailing one, which ends the segment.
+	///
 	/// Recovery reads them to tell damage that only a power cut to unsynced bytes can leave from
 	/// damage to bytes that were synced, see `classify_wal_damage_in`. Never in a sealed segment.
 	///
@@ -118,6 +125,18 @@ pub enum RecordType {
 
 /// The length of the payload of a [`RecordType::SyncMark`] record.
 pub(crate) const SYNC_MARK_LEN: usize = 8;
+
+/// The synced length that a [`RecordType::SyncMark`] record claims, given its header (`crc`,
+/// `length`, `type_byte`) and the bytes after it: `None` unless it is a mark whose length is
+/// [`SYNC_MARK_LEN`] and whose checksum holds. Where the record lies, and whether it fits its
+/// block, is for the caller to check.
+pub(crate) fn parse_sync_mark(crc: u32, length: u16, type_byte: u8, rest: &[u8]) -> Option<u64> {
+	if type_byte != RecordType::SyncMark as u8 || usize::from(length) != SYNC_MARK_LEN {
+		return None;
+	}
+	let payload: [u8; SYNC_MARK_LEN] = rest.get(..SYNC_MARK_LEN)?.try_into().ok()?;
+	(calculate_crc32(&[type_byte], &payload) == crc).then(|| u64::from_be_bytes(payload))
+}
 
 impl RecordType {
 	/// Converts a u8 value to a RecordType.
@@ -815,8 +834,12 @@ pub(crate) struct SyncGate {
 	serial: parking_lot::Mutex<()>,
 	/// Set by the first fsync that fails, never cleared.
 	failed: AtomicBool,
-	/// The length of the file that the last fsync to complete covered: the length it had when
-	/// that fsync began. Only grows, and is never more than what is on disk.
+	/// The length of the file at the end of the last append that reached it whole, see
+	/// `BufferedFileWriter::flush_buffer`. An fsync covers at least this much of the file.
+	boundary: AtomicU64,
+	/// The length of the file that the last fsync to complete covered: `boundary` when that fsync
+	/// began, so never a point inside an append. Only grows while the file does, and is cut back
+	/// with the file, so it is never more than what is on disk.
 	synced: AtomicU64,
 	/// Fault injection for tests: how many more fsyncs succeed before one fails.
 	#[cfg(test)]
@@ -841,11 +864,24 @@ impl SyncGate {
 		self.synced.load(Ordering::Acquire)
 	}
 
+	/// Records that the file holds every append up to `len` whole.
+	fn publish_boundary(&self, len: u64) {
+		self.boundary.store(len, Ordering::Release);
+	}
+
+	/// Records that the file was cut back to `len`: nothing at or past it is on disk any more.
+	fn cut_to(&self, len: u64) {
+		self.boundary.store(len, Ordering::Release);
+		self.synced.fetch_min(len, Ordering::AcqRel);
+	}
+
 	/// fsyncs `file`, unless an earlier fsync of the segment failed. The first failure is
 	/// returned as it happened, and every later call fails with [`sync_poisoned`].
 	///
-	/// A successful fsync covers what the file held when it began, so that length is what
-	/// [`SyncGate::synced`] moves to. A length that cannot be read moves it nowhere.
+	/// A successful fsync covers every append that had reached the file whole when it began, so
+	/// the end of the last of them is what [`SyncGate::synced`] moves to. An append that is still
+	/// being written, by the writer of the segment while this runs outside the WAL lock, is not
+	/// counted, even where part of it is covered.
 	pub(crate) fn sync(&self, file: &dyn FsFile) -> Result<()> {
 		#[cfg(test)]
 		self.arrivals.fetch_add(1, Ordering::SeqCst);
@@ -853,14 +889,12 @@ impl SyncGate {
 		if self.failed() {
 			return Err(sync_poisoned());
 		}
-		let covered = file.len().ok();
+		let covered = self.boundary.load(Ordering::Acquire);
 		let result = self.fsync(file);
-		match (&result, covered) {
-			(Err(_), _) => self.failed.store(true, Ordering::Release),
-			(Ok(()), Some(covered)) => {
-				self.synced.fetch_max(covered, Ordering::AcqRel);
-			}
-			(Ok(()), None) => {}
+		if result.is_err() {
+			self.failed.store(true, Ordering::Release);
+		} else {
+			self.synced.fetch_max(covered, Ordering::AcqRel);
 		}
 		result
 	}
@@ -948,11 +982,13 @@ impl BufferedFileWriter {
 	pub fn new(file: impl IntoFsFile, buffer_size: usize) -> Self {
 		let file = file.into_fs_file();
 		let len = file.len().ok();
+		let gate = Arc::new(SyncGate::default());
+		gate.publish_boundary(len.unwrap_or(0));
 		Self {
 			writer: BufWriter::with_capacity(buffer_size, FsWriter(file)),
 			failed: false,
 			pending_sync: false,
-			gate: Arc::default(),
+			gate,
 			len,
 			#[cfg(test)]
 			fail_after_ops: None,
@@ -974,8 +1010,15 @@ impl BufferedFileWriter {
 	}
 
 	/// Writes the buffer out, and remembers that it could not be.
+	///
+	/// The writer of a segment flushes only at the end of an append (or between appends), never
+	/// inside one, so once the buffer is out the file holds every append up to its end whole, and
+	/// that is published to the gate as what an fsync from then on covers.
 	fn flush_buffer(&mut self) -> Result<()> {
 		self.writer.flush().inspect_err(|_| self.failed = true)?;
+		if let Some(len) = self.len.or_else(|| self.file().len().ok()) {
+			self.gate.publish_boundary(len);
+		}
 		Ok(())
 	}
 
@@ -987,6 +1030,11 @@ impl BufferedFileWriter {
 	/// The gate every fsync of this file goes through.
 	pub(crate) fn gate(&self) -> Arc<SyncGate> {
 		Arc::clone(&self.gate)
+	}
+
+	/// How far the file is synced, see [`SyncGate::synced`].
+	pub(crate) fn synced(&self) -> u64 {
+		self.gate.synced()
 	}
 
 	/// Whether an fsync of the file failed, which ends its use for appends and syncs.
@@ -1028,6 +1076,7 @@ impl BufferedFileWriter {
 			)));
 		}
 		file.set_len(len)?;
+		self.gate.cut_to(len);
 		self.gate.sync(&*file)?;
 		self.len = Some(len);
 		self.pending_sync = false;
