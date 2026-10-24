@@ -8,6 +8,8 @@ use crate::snapshot::SnapshotIterator;
 use crate::vlog::ValueLocation;
 use crate::{InternalKey, LSMIterator, Result};
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod abandoned_session_tests;
 #[cfg(test)]
 pub mod alloc_limits_tests;
 #[cfg(test)]
@@ -166,6 +168,8 @@ pub mod restore_concurrency_tests;
 pub mod retire_free_tests;
 #[cfg(test)]
 pub mod retire_isolation_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod rewrite_at_open_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod rocksdb_migration_tests;
 #[cfg(test)]

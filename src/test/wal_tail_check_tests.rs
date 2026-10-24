@@ -142,7 +142,9 @@ impl World {
 	}
 
 	fn read(&self, relative: &str) -> Vec<u8> {
-		self.fs.0.read(&self.path(relative)).unwrap()
+		// A segment that an open moved to the next number is read there.
+		let path = super::sfs::after_open_with(&self.path(relative), |p| self.fs.0.exists(p));
+		self.fs.0.read(&path).unwrap()
 	}
 
 	fn write(&self, relative: &str, bytes: &[u8]) {

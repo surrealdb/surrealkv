@@ -87,7 +87,7 @@ impl Replayed {
 fn replay(dir: &Path, vlog: Option<&VLog>, mode: WalRecoveryMode) -> crate::Result<Replayed> {
 	let mut memtables = Vec::new();
 	let mut tail = vlog.map(TailCheck::new);
-	let (max_seq, active, report) = Core::replay_wal_in(
+	let (max_seq, active, report, _) = Core::replay_wal_in(
 		&WalContext::plaintext(),
 		&dir.join("wal"),
 		0,

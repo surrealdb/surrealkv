@@ -171,7 +171,12 @@ fn oversized_arena_size(batch: &Batch) -> Result<usize> {
 /// * `Ok((None, vec![]))` - No data recovered
 /// * `Err(...)` - Error during replay
 pub(crate) type ReplayResult = (Option<u64>, Vec<(Arc<MemTable>, bool, u64)>);
-pub(crate) type ReplayInnerResult = (Option<u64>, Vec<(Arc<MemTable>, bool, u64)>, usize, usize);
+/// The newest segment of the log, as the replay read it: its number, and the offset where its last
+/// complete record ends. The reader stops at that offset, which is the end of the file unless the
+/// file holds bytes after the records that the reader takes for the end of the log, such as zeros.
+/// `None` for a sealed log and for a log that holds no segment.
+pub(crate) type ReplayInnerResult =
+	(Option<u64>, Vec<(Arc<MemTable>, bool, u64)>, usize, usize, Option<(u64, u64)>);
 
 /// Replays the WAL whose segments are as `context` says, and counts what it replayed.
 pub(crate) fn replay_wal_inner_with(
@@ -198,7 +203,7 @@ pub(crate) fn replay_wal_inner_with(
 			crate::wal::sealed_recovery::replay(context, wal_dir, min_wal_number, arena_size)?;
 		let segments =
 			memtables.iter().map(|(_, _, id)| *id).collect::<std::collections::HashSet<_>>();
-		return Ok((max_seq, memtables, 0, segments.len()));
+		return Ok((max_seq, memtables, 0, segments.len(), None));
 	}
 
 	let fs = &*context.fs;
@@ -207,7 +212,7 @@ pub(crate) fn replay_wal_inner_with(
 	// absent: see `directory_present`.
 	if !directory_present(fs, wal_dir)? {
 		tracing::debug!("WAL directory does not exist, skipping recovery");
-		return Ok((None, vec![], 0, 0));
+		return Ok((None, vec![], 0, 0, None));
 	}
 
 	// Every segment in the directory (looking for .wal files), in order, from one listing. A
@@ -217,7 +222,7 @@ pub(crate) fn replay_wal_inner_with(
 	let (Some(first_segment), Some(last_segment)) = (all_segments.first(), all_segments.last())
 	else {
 		tracing::debug!("No WAL segments found, skipping recovery");
-		return Ok((None, vec![], 0, 0));
+		return Ok((None, vec![], 0, 0, None));
 	};
 	let (first, last) = (first_segment.id, last_segment.id);
 
@@ -230,7 +235,7 @@ pub(crate) fn replay_wal_inner_with(
 			last,
 			min_wal_number
 		);
-		return Ok((None, vec![], 0, 0));
+		return Ok((None, vec![], 0, 0, None));
 	}
 
 	tracing::debug!("Replaying WAL segments #{:020} to #{:020}", start_segment, last);
@@ -239,6 +244,7 @@ pub(crate) fn replay_wal_inner_with(
 	let mut max_seq_num: u64 = 0;
 	let mut total_batches_replayed = 0;
 	let mut segments_processed = 0;
+	let mut newest_end: Option<(u64, u64)> = None;
 
 	// Collect memtables - one per WAL segment
 	let mut memtables: Vec<(Arc<MemTable>, bool, u64)> = Vec::new();
@@ -346,6 +352,9 @@ pub(crate) fn replay_wal_inner_with(
 			memtables.push((current_memtable, false, segment_id));
 		}
 
+		// The segments are read in order, so the last one that is read is the newest.
+		newest_end = Some((segment_id, last_valid_offset as u64));
+
 		if batches_in_segment > 0 {
 			tracing::debug!(
 				"Replayed {} batches from WAL segment #{:020}",
@@ -372,7 +381,7 @@ pub(crate) fn replay_wal_inner_with(
 		result
 	);
 
-	Ok((result, memtables, total_batches_replayed, segments_processed))
+	Ok((result, memtables, total_batches_replayed, segments_processed, newest_end))
 }
 
 /// Replays a plaintext WAL.
@@ -382,7 +391,7 @@ pub(crate) fn replay_wal(
 	min_wal_number: u64,
 	arena_size: usize,
 ) -> Result<ReplayResult> {
-	let (max_seq, memtables, _, _) =
+	let (max_seq, memtables, _, _, _) =
 		replay_wal_inner_with(&WalContext::plaintext(), wal_dir, min_wal_number, arena_size)?;
 	Ok((max_seq, memtables))
 }

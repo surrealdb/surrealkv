@@ -156,6 +156,27 @@ pub(crate) fn set_permissions<P: AsRef<Path>>(path: P, perm: Permissions) -> io:
 	std::fs::set_permissions(path, perm)
 }
 
+/// The path that a segment of a log has once the tree that replayed it is open. An open moves the
+/// newest segment that it recovers to the number that follows it (see `Wal::rewrite_active_with`),
+/// so a path that is gone is looked up at that number. A path that is there is returned as it is.
+pub(crate) fn after_open(path: &Path) -> PathBuf {
+	after_open_with(path, |p| exists(p))
+}
+
+/// [`after_open`] over the existence check `exists_in`, for a file system that is not the one of
+/// [`exists`].
+pub(crate) fn after_open_with(path: &Path, exists_in: impl Fn(&Path) -> bool) -> PathBuf {
+	if exists_in(path) {
+		return path.to_path_buf();
+	}
+	let next = path
+		.file_stem()
+		.and_then(|stem| stem.to_str())
+		.and_then(|stem| stem.parse::<u64>().ok())
+		.map(|id| path.with_file_name(format!("{:020}.wal", id + 1)));
+	next.unwrap_or_else(|| path.to_path_buf())
+}
+
 pub(crate) fn exists<P: AsRef<Path>>(path: P) -> bool {
 	match pool() {
 		None => path.as_ref().exists(),

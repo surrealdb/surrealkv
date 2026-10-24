@@ -2,6 +2,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::recovery::sync_mark_in;
 use super::writer::Writer;
 use super::{
 	directory_present,
@@ -20,10 +21,14 @@ use super::{
 	SyncGate,
 	BLOCK_SIZE,
 	HEADER_SIZE,
+	SYNC_MARK_LEN,
 };
 use crate::error::EncryptionError;
 use crate::tde::EncryptionContext;
 use crate::vfs::{CreateOpts, Fs, FsFile, FsKind};
+
+/// The size of the reads that the check of a tail for zeros makes.
+const COPY_CHUNK: usize = 1024 * 1024;
 
 /// Write-Ahead Log (Wal) manager for coordinating WAL operations.
 pub struct Wal {
@@ -911,6 +916,134 @@ impl Wal {
 	pub(crate) fn rotate(&mut self) -> Result<u64> {
 		self.rotate_with(|| Ok(()))
 	}
+
+	/// Moves the active segment, which the open has replayed, to the number that follows it, and
+	/// makes it the active one: the rewrite at open. It is for a log whose newest segment holds the
+	/// recovered memtable, so that the open starts no segment beside the one it replayed.
+	///
+	/// The writer appends after the end of the file, so the file is first cut to `valid_end`, the
+	/// offset where the replay stopped, when it is longer. The bytes past that offset must be whole
+	/// sync marks and the zeros that pad a block, see [`tail_is_marks_and_padding`]: the replay
+	/// reads them as the end of the log. A tail with any other byte is not moved, and `None` is
+	/// returned with nothing changed, so that the caller starts a segment of its own. The cut is
+	/// synced before the rename. A torn record at the end of the segment is trimmed by the replay's
+	/// repair before this runs, so it is not part of such a tail.
+	///
+	/// The move is one rename, which the file system makes at one commit point, followed by a sync
+	/// of the directory that names it. The file is not copied, so no state holds the records of a
+	/// segment under two names: a crash leaves the segment under its old name or under the new
+	/// one, and the next open replays it either way.
+	///
+	/// `before_sync` runs before the rename, as in [`rotate_with`](Self::rotate_with): it makes
+	/// durable what the records point to, so that none of them reaches the disk ahead of it.
+	pub(crate) fn rewrite_active_with(
+		&mut self,
+		valid_end: u64,
+		before_sync: impl FnOnce() -> Result<()>,
+	) -> Result<Option<u64>> {
+		let fs = &*self.opts.context.fs;
+		let extension = self.opts.file_extension.as_deref().unwrap_or("wal");
+		let old_log_number = self.active_log_number;
+		let new_log_number = old_log_number + 1;
+		let old_path = self.dir.join(segment_name(old_log_number, extension));
+		let new_path = self.dir.join(segment_name(new_log_number, extension));
+
+		if fs.exists(&new_path) {
+			return Err(Error::IO(IOError::new(
+				io::ErrorKind::AlreadyExists,
+				&format!(
+					"WAL segment {new_log_number:020}.{extension} exists, so {old_log_number:020}.{extension} cannot be moved to it"
+				),
+			)));
+		}
+
+		let old = fs.open_read(&old_path)?;
+		let len = old.len()?;
+		if len > valid_end && !tail_is_marks_and_padding(&*old, valid_end, len)? {
+			return Ok(None);
+		}
+		drop(old);
+
+		// The writer of the old name is not used again: nothing is appended to it.
+		self.active_writer = None;
+		self.sync_fd = None;
+
+		if len > valid_end {
+			let file = fs.open_append_existing(&old_path)?;
+			file.set_len(valid_end)?;
+			file.sync()?;
+		}
+
+		before_sync()?;
+		fs.rename(&old_path, &new_path)?;
+		fs.sync_dir(&self.dir)?;
+
+		let (writer, sync_fd) = Self::create_writer(&self.dir, new_log_number, &self.opts)?;
+		self.active_writer = Some(writer);
+		self.sync_fd = Some(sync_fd);
+		self.active_log_number = new_log_number;
+
+		tracing::debug!("WAL moved {:020} to {:020}", old_log_number, new_log_number);
+		Ok(Some(new_log_number))
+	}
+}
+
+/// Whether the bytes of `file` from `from` to `to` are what a writer leaves after the last record
+/// of a segment: whole sync marks, and the zeros that pad the end of a block with too little room
+/// for a mark (see `Writer::write_sync_mark_unflushed`). The replay reads these bytes as the end of
+/// the log, so a tail made of them holds no record.
+///
+/// A mark is checked as the reader checks one: its checksum, its length and its block. A tail that
+/// is shorter than a mark is accepted only if it is zeros, and a read that comes back short is
+/// not accepted.
+pub(crate) fn tail_is_marks_and_padding(file: &dyn FsFile, from: u64, to: u64) -> Result<bool> {
+	const MARK_LEN: usize = HEADER_SIZE + SYNC_MARK_LEN;
+	let mut pos = from;
+	while pos < to {
+		let mut head = [0u8; MARK_LEN];
+		let want = usize::try_from((to - pos).min(MARK_LEN as u64)).unwrap_or(MARK_LEN);
+		let read = file
+			.read_at(pos, &mut head[..want])
+			.map_err(|e| Error::IO(IOError::new(io::ErrorKind::Other, &e.to_string())))?;
+		if read != want {
+			return Ok(false);
+		}
+		let padding = want < MARK_LEN || head[HEADER_SIZE - 1] == RecordType::Empty as u8;
+		if padding {
+			let block_end = pos + (BLOCK_SIZE as u64 - pos % BLOCK_SIZE as u64);
+			let end = block_end.min(to);
+			if !all_zeros(file, pos, end)? {
+				return Ok(false);
+			}
+			pos = end;
+		} else {
+			if sync_mark_in(&head, pos, 0).is_none() {
+				return Ok(false);
+			}
+			pos += MARK_LEN as u64;
+		}
+	}
+	Ok(true)
+}
+
+/// Whether the bytes of `file` from `from` to `to` are all zeros.
+fn all_zeros(file: &dyn FsFile, from: u64, to: u64) -> Result<bool> {
+	let mut buf = vec![0u8; COPY_CHUNK];
+	let mut offset = from;
+	while offset < to {
+		let want = usize::try_from((to - offset).min(COPY_CHUNK as u64)).unwrap_or(COPY_CHUNK);
+		let read = file
+			.read_at(offset, &mut buf[..want])
+			.map_err(|e| Error::IO(IOError::new(io::ErrorKind::Other, &e.to_string())))?;
+		if read == 0 {
+			break;
+		}
+		if buf[..read].iter().any(|byte| *byte != 0) {
+			return Ok(false);
+		}
+		offset += read as u64;
+	}
+	Ok(true)
 }
 
 impl Drop for Wal {

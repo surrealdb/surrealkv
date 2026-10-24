@@ -1264,6 +1264,17 @@ impl CoreInner {
 		})
 	}
 
+	/// The rewrite at open: see `Wal::rewrite_active_with`. Like `rotate_wal`, the value log is
+	/// synced first, before the records that point to it are made durable.
+	fn rewrite_wal(&self, wal: &mut Wal, valid_end: u64) -> wal::Result<Option<u64>> {
+		wal.rewrite_active_with(valid_end, || match self.vlog {
+			Some(ref vlog) => {
+				vlog.sync_dirty().map_err(|e| std::io::Error::other(e.to_string()).into())
+			}
+			None => Ok(()),
+		})
+	}
+
 	/// Ensures the WAL segment currently backing the active memtable can never receive
 	/// another write, and returns that WAL number.
 	///
@@ -2120,6 +2131,12 @@ impl std::ops::Deref for Core {
 	}
 }
 
+/// What the replay of the log leaves for the open: the highest sequence number, the memtable of
+/// the records that are in no table, the report, and the newest segment with the offset where its
+/// last complete record ends, when the open may rewrite it (see [`Core::replay_wal_in`]).
+pub(crate) type ReplayedLog =
+	(Option<u64>, Option<Arc<MemTable>>, WalRecoveryReport, Option<(u64, u64)>);
+
 impl Core {
 	/// Replays a plaintext WAL, see [`replay_wal_in`](Self::replay_wal_in).
 	#[cfg(test)]
@@ -2134,7 +2151,7 @@ impl Core {
 	where
 		F: FnMut(Arc<MemTable>, u64, bool) -> Result<()>,
 	{
-		Self::replay_wal_in(
+		let (max_seq, memtable, report, _) = Self::replay_wal_in(
 			&wal::WalContext::plaintext(),
 			wal_path,
 			min_wal_number,
@@ -2143,7 +2160,8 @@ impl Core {
 			arena_size,
 			None,
 			flush_memtable,
-		)
+		)?;
+		Ok((max_seq, memtable, report))
 	}
 
 	/// Replays WAL with configurable corruption handling.
@@ -2176,7 +2194,7 @@ impl Core {
 		arena_size: usize,
 		mut tail: Option<&mut TailCheck<'_>>,
 		mut flush_memtable: F,
-	) -> Result<(Option<u64>, Option<Arc<MemTable>>, WalRecoveryReport)>
+	) -> Result<ReplayedLog>
 	where
 		F: FnMut(Arc<MemTable>, u64, bool) -> Result<()>,
 	{
@@ -2196,12 +2214,12 @@ impl Core {
 			)?;
 		}
 
-		let (wal_seq_num_opt, memtables) = loop {
+		let (wal_seq_num_opt, memtables, newest_end) = loop {
 			match replay_wal_inner_with(wal_context, wal_path, min_wal_number, arena_size) {
-				Ok((seq, memtables, total_batches, segments_processed)) => {
+				Ok((seq, memtables, total_batches, segments_processed, newest_end)) => {
 					report.records_replayed = total_batches;
 					report.segments_replayed = segments_processed;
-					break (seq, memtables);
+					break (seq, memtables, newest_end);
 				}
 				Err(Error::WalCorruption {
 					segment_id,
@@ -2404,7 +2422,7 @@ impl Core {
 
 		// If no memtables, nothing was recovered
 		if memtables.is_empty() {
-			return Ok((None, None, report));
+			return Ok((None, None, report, None));
 		}
 
 		// Flush all memtables except the last to SST
@@ -2433,6 +2451,17 @@ impl Core {
 		// nothing to do with `opts.max_memtable_size`, so it would silently blow
 		// through the configured memory bound for however long it stays active. Flush
 		// it immediately like the other recovered memtables instead.
+		// The records of the newest segment are moved at the open into the segment after it, when
+		// they are one memtable that is kept active: the segment is then all of its records. The
+		// result names the segment and where its records end, see `Wal::rewrite_active_with`. Never
+		// for a sealed log, which is not rewritten.
+		let rewrite = memtables
+			.last()
+			.filter(|(_, oversized, wal_number)| {
+				!*oversized && memtables.iter().filter(|(_, _, w)| w == wal_number).count() == 1
+			})
+			.and(newest_end)
+			.filter(|_| !wal_context.is_sealed());
 		let (last_memtable, oversized, last_wal_number) = memtables.into_iter().last().unwrap();
 		if oversized {
 			tracing::debug!(
@@ -2445,7 +2474,7 @@ impl Core {
 			if !last_memtable.is_empty() {
 				flush_memtable(last_memtable, last_wal_number, false)?;
 			}
-			return Ok((wal_seq_num_opt, None, report));
+			return Ok((wal_seq_num_opt, None, report, None));
 		}
 		let entry_count = {
 			let mut iter = last_memtable.iter();
@@ -2469,7 +2498,8 @@ impl Core {
 		// nothing that is not in a table.
 		last_memtable.set_wal_number(last_wal_number);
 
-		Ok((wal_seq_num_opt, Some(last_memtable), report))
+		let rewrite = rewrite.filter(|(newest, _)| *newest == last_wal_number);
+		Ok((wal_seq_num_opt, Some(last_memtable), report, rewrite))
 	}
 
 	/// Holds the records of the last segment of the log to the value log, and cuts the segment
@@ -2541,7 +2571,7 @@ impl Core {
 
 		// Replay WAL with configurable recovery mode (returns None if skipped/empty)
 		let mut tail = inner.vlog.as_deref().map(TailCheck::new);
-		let (wal_seq_num_opt, recovered_memtable, startup_report) = Self::replay_wal_in(
+		let (wal_seq_num_opt, recovered_memtable, startup_report, rewrite) = Self::replay_wal_in(
 			&wal::WalContext::for_options(&opts)?,
 			&wal_path,
 			min_wal_number,
@@ -2589,18 +2619,43 @@ impl Core {
 		// this leaves the directory to the binary it came from.
 		inner.level_manifest.write()?.upgrade_format_in(&*opts.fs)?;
 
-		// Always continue in a fresh segment: replay may have repaired (replaced) the
-		// segment the writer was opened on, or flushed it and moved the manifest's
-		// log number past it. Like every rotation it goes through `rotate_wal()`, which
-		// syncs the value log first if it holds unsynced values.
+		// The records of the newest segment, when they are the recovered memtable and nothing else,
+		// are rewritten into the segment after it, which then takes the commits: the open starts no
+		// segment beside the one it replayed, so a session that ends without a close adds no
+		// segment and no table (see `Wal::rewrite_active_with`). Otherwise a fresh segment is
+		// started, as every open did: replay may have flushed the newest segment, or moved the
+		// manifest's log number past it. A rotation goes through `rotate_wal()`, which syncs the
+		// value log first if it holds unsynced values, and a rewrite does the same before its
+		// rename.
 		{
 			let mut wal_guard = inner.wal.write();
-			inner.rotate_wal(&mut wal_guard)?;
+			let recovered_in_newest = match (rewrite, recovered_memtable.as_ref()) {
+				(Some((newest, valid_end)), Some(memtable))
+					if memtable.get_wal_number() == newest
+						&& wal_guard.get_active_log_number() == newest =>
+				{
+					Some(valid_end)
+				}
+				_ => None,
+			};
+			// A tail that the rewrite does not take is left as it is, and a segment starts after
+			// it. A torn record at the end of the segment is not such a tail: the replay has
+			// trimmed it already, with a copy of it kept, so the segment ends at the records it
+			// read. What the rewrite accepts past them is sync marks and padding.
+			let rewritten = match recovered_in_newest {
+				Some(valid_end) => inner.rewrite_wal(&mut wal_guard, valid_end)?.is_some(),
+				None => false,
+			};
+			if !rewritten {
+				inner.rotate_wal(&mut wal_guard)?;
+			}
 		}
 
 		// The segment that holds the records of the recovered memtable, which no table has: the
 		// only one below the new segment that a later open still has to read. Every other one
-		// holds records that are in tables, or none.
+		// holds records that are in tables, or none. Its number is kept when the segment is
+		// rewritten, so that the quarantine copies of the segments below it stay under the
+		// retention rule of the quarantine.
 		let data_segment = recovered_memtable
 			.as_ref()
 			.filter(|memtable| !memtable.is_empty())
@@ -3703,7 +3758,7 @@ impl Tree {
 
 		// Replay any WAL entries that were restored
 		let mut tail = self.core.inner.vlog.as_deref().map(TailCheck::new);
-		let (wal_seq_num_opt, recovered_memtable, restore_report) = Core::replay_wal_in(
+		let (wal_seq_num_opt, recovered_memtable, restore_report, _) = Core::replay_wal_in(
 			&wal::WalContext::for_options(&self.core.inner.opts)?,
 			&wal_path,
 			manifest_log_number,

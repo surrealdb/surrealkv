@@ -11,7 +11,7 @@
 //! compaction (its outputs, its manifest, the removal of its inputs) and the roll of the value log.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,9 +39,16 @@ struct Findings {
 	kinds: Mutex<std::collections::BTreeMap<String, usize>>,
 }
 
+/// The keys of the commits that a check makes in an image, after the commits that the image holds.
+fn later_key(i: usize) -> Vec<u8> {
+	format!("later-{i:03}").into_bytes()
+}
+
 /// Opens the database in `image` and checks it: the acknowledged commits are there, and the ones
-/// that are there are a prefix of the commits that were made, each once, with its value.
-fn check(image: Image, options: &Options, made: usize) -> Result<(), String> {
+/// that are there are a prefix of the commits that were made, each once, with its value. With
+/// `then_commit`, the database then takes three more commits, which are there after the next open
+/// together with the prefix.
+fn check(image: Image, options: &Options, made: usize, then_commit: bool) -> Result<(), String> {
 	let runtime = tokio::runtime::Builder::new_current_thread()
 		.enable_all()
 		.build()
@@ -51,7 +58,7 @@ fn check(image: Image, options: &Options, made: usize) -> Result<(), String> {
 			fs: Arc::clone(&image.fs.0),
 			..options.clone()
 		};
-		let tree = TreeBuilder::with_options(options)
+		let tree = TreeBuilder::with_options(options.clone())
 			.build_async()
 			.await
 			.map_err(|e| format!("{}: the database does not open: {e}", image.what))?;
@@ -83,6 +90,38 @@ fn check(image: Image, options: &Options, made: usize) -> Result<(), String> {
 				found.len()
 			));
 		}
+		if then_commit {
+			let mut txn = tree.begin().map_err(|e| e.to_string())?;
+			txn.set_durability(Durability::Immediate);
+			for k in 0..3 {
+				txn.set(later_key(k), value_of(k, 150)).map_err(|e| e.to_string())?;
+			}
+			txn.commit()
+				.await
+				.map_err(|e| format!("{}: the commits after the crash: {e}", image.what))?;
+			tree.close().await.map_err(|e| format!("{}: close: {e}", image.what))?;
+			let tree = TreeBuilder::with_options(options.clone())
+				.build_async()
+				.await
+				.map_err(|e| format!("{}: the database does not open again: {e}", image.what))?;
+			let txn = tree.begin_with_mode(crate::Mode::ReadOnly).map_err(|e| e.to_string())?;
+			for k in 0..3 {
+				if txn.get(later_key(k)).map_err(|e| e.to_string())? != Some(value_of(k, 150)) {
+					return Err(format!("{}: commit {k} after the crash is not there", image.what));
+				}
+			}
+			for (at, (key, value)) in found.iter().enumerate() {
+				if txn.get(key.clone()).map_err(|e| e.to_string())? != Some(value.clone()) {
+					return Err(format!(
+						"{}: commit {at} is not there after the commits",
+						image.what
+					));
+				}
+			}
+			drop(txn);
+			tree.close().await.map_err(|e| format!("{}: close: {e}", image.what))?;
+			return Ok(());
+		}
 		tree.close().await.map_err(|e| format!("{}: close: {e}", image.what))?;
 		Ok(())
 	})
@@ -93,12 +132,13 @@ fn checker(
 	options: Options,
 	made: usize,
 	findings: Arc<Findings>,
+	then_commit: bool,
 ) -> std::thread::JoinHandle<()> {
 	std::thread::spawn(move || {
 		for image in rx {
 			let what = image.what.clone();
 			let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-				check(image, &options, made)
+				check(image, &options, made, then_commit)
 			}));
 			findings.checked.fetch_add(1, Ordering::SeqCst);
 			let failure = match outcome {
@@ -129,22 +169,18 @@ fn kind_of(call: &Call) -> &'static str {
 	}
 }
 
-/// Runs a workload of `commits` synced commits over a pool, takes an image before each step that
-/// changes a file and in each of `modes`, and has them all checked.
-async fn every_step(vlog: bool, commits: usize, modes: &'static [CrashMode]) -> Arc<Findings> {
-	let (probe, fs) = ProbeFs::wrap(&FileSystem::memory());
-	let mut options = options_in(&fs, 8 * 1024);
-	options.enable_vlog = vlog;
-	options.vlog_value_threshold = 64;
-	options.vlog_max_file_size = 8 * 1024;
-	let findings = Arc::new(Findings::default());
-	let (tx, rx) = sync_channel::<Image>(2);
-	let verifier = checker(rx, options.clone(), commits, Arc::clone(&findings));
-	let acked = Arc::new(AtomicUsize::new(0));
-
+/// Takes an image before and after each call of the probe that changes a file, in each of `modes`,
+/// and sends it to the thread that checks: the commits acknowledged at that moment are those of
+/// `acked`.
+fn image_every_step(
+	probe: &Arc<ProbeFs>,
+	tx: SyncSender<Image>,
+	acked: Arc<AtomicUsize>,
+	findings: Arc<Findings>,
+	modes: &'static [CrashMode],
+) {
 	let capture = {
-		let probe = Arc::downgrade(&probe);
-		let tx = tx.clone();
+		let probe = Arc::downgrade(probe);
 		let acked = Arc::clone(&acked);
 		let findings = Arc::clone(&findings);
 		move |call: &Call, when: &str| {
@@ -178,6 +214,21 @@ async fn every_step(vlog: bool, commits: usize, modes: &'static [CrashMode]) -> 
 		Verdict::Go
 	});
 	probe.after(move |call| capture(call, "after"));
+}
+
+/// Runs a workload of `commits` synced commits over a pool, takes an image before each step that
+/// changes a file and in each of `modes`, and has them all checked.
+async fn every_step(vlog: bool, commits: usize, modes: &'static [CrashMode]) -> Arc<Findings> {
+	let (probe, fs) = ProbeFs::wrap(&FileSystem::memory());
+	let mut options = options_in(&fs, 8 * 1024);
+	options.enable_vlog = vlog;
+	options.vlog_value_threshold = 64;
+	options.vlog_max_file_size = 8 * 1024;
+	let findings = Arc::new(Findings::default());
+	let (tx, rx) = sync_channel::<Image>(2);
+	let verifier = checker(rx, options.clone(), commits, Arc::clone(&findings), false);
+	let acked = Arc::new(AtomicUsize::new(0));
+	image_every_step(&probe, tx.clone(), Arc::clone(&acked), Arc::clone(&findings), modes);
 
 	let tree = TreeBuilder::with_options(options).build_async().await.unwrap();
 	for i in 0..commits {
@@ -276,6 +327,109 @@ async fn a_crash_at_every_step_with_the_value_log_loses_nothing() {
 				"remove table",
 			],
 		);
+	})
+	.await;
+}
+
+/// Commits one transaction of the keys from `from` on, `keys` of them, in `durability`, and makes
+/// it again if the writers were stalled and let it go.
+async fn commit_keys(tree: &crate::Tree, from: usize, keys: usize, durability: Durability) {
+	loop {
+		let mut txn = tree.begin().unwrap();
+		txn.set_durability(durability);
+		for i in from..from + keys {
+			txn.set(key_of(i), value_of(i, 150)).unwrap();
+		}
+		match txn.commit().await {
+			Ok(()) => return,
+			Err(crate::Error::PipelineStall) => tokio::time::sleep(Duration::from_millis(2)).await,
+			Err(e) => panic!("commit of the keys from {from}: {e}"),
+		}
+	}
+}
+
+/// Runs `sessions` sessions over a database in a pool. Each session opens it, commits one
+/// `Immediate` transaction of many keys (a record that spans blocks of the log), one `Eventual`
+/// transaction and one more `Immediate` one, and ends without a close, as a browser tab does. Every
+/// step of the work that changes a file is imaged, and each image is checked, then commits to and
+/// is opened again: the sessions that the image holds are continued by the check.
+async fn sessions_at_every_step(
+	vlog: bool,
+	sessions: usize,
+	modes: &'static [CrashMode],
+) -> Arc<Findings> {
+	const WIDE: usize = 250;
+	const NARROW: usize = 3;
+	const PAIR: usize = 2;
+
+	let (probe, fs) = ProbeFs::wrap(&FileSystem::memory());
+	// Larger than the records of a whole run with their arena overhead, so that no replay splits
+	// a segment into memtables, and each open continues the segment the sessions write to.
+	let mut options = options_in(&fs, 4 * 1024 * 1024);
+	options.enable_vlog = vlog;
+	options.vlog_value_threshold = 64;
+	let made = sessions * (WIDE + NARROW + PAIR);
+	let findings = Arc::new(Findings::default());
+	let (tx, rx) = sync_channel::<Image>(2);
+	let verifier = checker(rx, options.clone(), made, Arc::clone(&findings), true);
+	let acked = Arc::new(AtomicUsize::new(0));
+	image_every_step(&probe, tx.clone(), Arc::clone(&acked), Arc::clone(&findings), modes);
+
+	let mut next = 0;
+	for _ in 0..sessions {
+		let tree = TreeBuilder::with_options(options.clone()).build_async().await.unwrap();
+		commit_keys(&tree, next, WIDE, Durability::Immediate).await;
+		next += WIDE;
+		acked.store(next, Ordering::SeqCst);
+		commit_keys(&tree, next, NARROW, Durability::Eventual).await;
+		next += NARROW;
+		commit_keys(&tree, next, PAIR, Durability::Immediate).await;
+		next += PAIR;
+		acked.store(next, Ordering::SeqCst);
+		tree.abandon();
+		drop(tree);
+	}
+
+	// The database as the last session left it, with nothing imaged. Its segments are counted
+	// before it is checked: a check closes what it opens.
+	probe.clear_hooks();
+	let wal = crate::wal::list_segment_ids_in(&*fs.0, &options.wal_dir(), Some("wal")).unwrap();
+	assert_eq!(wal.len(), 1, "the sessions leave one segment of the log: {wal:?}");
+	let live = Image {
+		fs: fs.clone(),
+		acked: next,
+		what: "the last session, as it was left".to_string(),
+	};
+	let checked = tokio::task::spawn_blocking({
+		let options = options.clone();
+		move || check(live, &options, made, false)
+	})
+	.await
+	.unwrap();
+	assert_eq!(checked, Ok(()));
+	drop(tx);
+	tokio::task::spawn_blocking(move || verifier.join().unwrap()).await.unwrap();
+	findings
+}
+
+#[test(tokio::test)]
+async fn a_crash_at_every_step_of_sessions_that_end_without_a_close_recovers_each_commit() {
+	within("sessions at every step", async {
+		const MODES: &[CrashMode] =
+			&[CrashMode::LoseUnsynced, CrashMode::ZeroTail, CrashMode::Prefix(usize::MAX)];
+		let findings = sessions_at_every_step(false, 6, MODES).await;
+		assert_covered(&findings, &["open segment", "sync_file"]);
+	})
+	.await;
+}
+
+#[test(tokio::test)]
+async fn a_crash_at_every_step_of_sessions_with_the_value_log_recovers_each_commit() {
+	within("sessions at every step, vlog", async {
+		const MODES: &[CrashMode] =
+			&[CrashMode::LoseUnsynced, CrashMode::ZeroTail, CrashMode::Prefix(usize::MAX)];
+		let findings = sessions_at_every_step(true, 6, MODES).await;
+		assert_covered(&findings, &["open segment", "sync_file"]);
 	})
 	.await;
 }

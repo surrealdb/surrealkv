@@ -200,7 +200,9 @@ impl<'a> TransactionEnd<'a> {
 	fn watch(transaction: &'a IdbTransaction) -> Self {
 		let mut closures = Vec::new();
 		let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-			for kind in ["complete", "abort", "error"] {
+			// The two ends of a transaction, and not `error`: the error of a request bubbles up to
+			// its transaction, and an error that was prevented (as a cursor's is) does not end it.
+			for kind in ["complete", "abort"] {
 				let resolve = resolve.clone();
 				let closure = Closure::<dyn FnMut(web_sys::Event)>::new(move |_event| {
 					let _ = resolve.call0(&JsValue::NULL);
@@ -477,66 +479,78 @@ impl IdbSource {
 			})?;
 		// Watched from the start, so that its end cannot go by before it is waited for.
 		let end = TransactionEnd::watch(&transaction);
-		let store = transaction.object_store(KV_STORE).map_err(|e| {
-			Error::Js(format!("Failed to get the object store kv: {}", describe(&e)))
-		})?;
-		check_shape(&store)?;
-		let request = match after {
-			Some(key) => {
-				let range = IdbKeyRange::lower_bound_with_open(key, true).map_err(|e| {
-					Error::Js(format!("Failed to make a key range after a key: {}", describe(&e)))
-				})?;
-				store.open_cursor_with_range(&range)
-			}
-			None => store.open_cursor(),
-		}
-		.map_err(|e| Error::Js(format!("Failed to open a cursor on kv: {}", describe(&e))))?;
-
-		let mut fill = ChunkFill::new(*limits);
-		let mut entries = Vec::new();
-		let mut last = None;
-		let mut done = false;
-		loop {
-			let result = wait_for_request(&request).await?;
-			if result.is_null() || result.is_undefined() {
-				done = true;
-				break;
-			}
-			let cursor: IdbCursorWithValue = result
-				.dyn_into()
-				.map_err(|_| Error::Js("Failed to cast the cursor to IdbCursorWithValue".into()))?;
-			let key = cursor
-				.key()
-				.map_err(|e| Error::Js(format!("Failed to get a key: {}", describe(&e))))?;
-			let value = cursor
-				.value()
-				.map_err(|e| Error::Js(format!("Failed to get a value: {}", describe(&e))))?;
-			let key_bytes = js_value_to_bytes(&key, "key")?;
-			let value_bytes = js_value_to_bytes(&value, "value")?;
-			let weight = key_bytes.len().saturating_add(value_bytes.len());
-			// An entry that does not fit is left for the next chunk, which begins with it.
-			if !fill.admits(weight) {
-				break;
-			}
-			fill.take(weight);
-			entries.push((key_bytes, value_bytes));
-			last = Some(key);
-			if fill.is_full() {
-				break;
-			}
-			cursor.continue_().map_err(|e| {
-				Error::Js(format!("Failed to advance the cursor: {}", describe(&e)))
+		// The read is a value, an error included, and nothing is returned before the transaction
+		// has ended: the connection is closed when it is dropped, and close() does not finish until
+		// its transactions have, so a deletion made straight after would be blocked. At every error
+		// below no request is pending (a request that failed has had its answer), so the
+		// transaction ends by itself, or is aborted by the browser.
+		let read: Result<Chunk<JsValue>> = async {
+			let store = transaction.object_store(KV_STORE).map_err(|e| {
+				Error::Js(format!("Failed to get the object store kv: {}", describe(&e)))
 			})?;
+			check_shape(&store)?;
+			let request = match after {
+				Some(key) => {
+					let range = IdbKeyRange::lower_bound_with_open(key, true).map_err(|e| {
+						Error::Js(format!(
+							"Failed to make a key range after a key: {}",
+							describe(&e)
+						))
+					})?;
+					store.open_cursor_with_range(&range)
+				}
+				None => store.open_cursor(),
+			}
+			.map_err(|e| Error::Js(format!("Failed to open a cursor on kv: {}", describe(&e))))?;
+
+			let mut fill = ChunkFill::new(*limits);
+			let mut entries = Vec::new();
+			let mut last = None;
+			let mut done = false;
+			loop {
+				let result = wait_for_request(&request).await?;
+				if result.is_null() || result.is_undefined() {
+					done = true;
+					break;
+				}
+				let cursor: IdbCursorWithValue = result.dyn_into().map_err(|_| {
+					Error::Js("Failed to cast the cursor to IdbCursorWithValue".into())
+				})?;
+				let key = cursor
+					.key()
+					.map_err(|e| Error::Js(format!("Failed to get a key: {}", describe(&e))))?;
+				let value = cursor
+					.value()
+					.map_err(|e| Error::Js(format!("Failed to get a value: {}", describe(&e))))?;
+				let key_bytes = js_value_to_bytes(&key, "key")?;
+				let value_bytes = js_value_to_bytes(&value, "value")?;
+				let weight = key_bytes.len().saturating_add(value_bytes.len());
+				// An entry that does not fit is left for the next chunk, which begins with it.
+				if !fill.admits(weight) {
+					break;
+				}
+				fill.take(weight);
+				entries.push((key_bytes, value_bytes));
+				last = Some(key);
+				if fill.is_full() {
+					break;
+				}
+				cursor.continue_().map_err(|e| {
+					Error::Js(format!("Failed to advance the cursor: {}", describe(&e)))
+				})?;
+			}
+			Ok(Chunk {
+				entries,
+				bytes: fill.bytes(),
+				last,
+				done,
+			})
 		}
+		.await;
 		// No request is pending now, so the transaction ends by itself. The connection is closed
 		// after that, which is what lets a deletion of the database that follows go through.
 		end.ended().await;
-		Ok(Some(Chunk {
-			entries,
-			bytes: fill.bytes(),
-			last,
-			done,
-		}))
+		read.map(Some)
 	}
 }
 

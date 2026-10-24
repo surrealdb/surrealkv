@@ -946,11 +946,9 @@ async fn recovered_tree(root: &Path, queued: usize) -> (Tree, std::path::PathBuf
 		let segment = inner.wal.read().get_active_log_number();
 		assert!(!active.is_empty(), "control: recovery put the crashed rows in the memtable");
 		assert_eq!(active.get_wal_number(), segment, "control: it is tagged with the new segment");
+		// The open moved the segment that held the rows to the number of the tag.
 		let held = non_empty_segments(&tree);
-		assert!(
-			!held.is_empty() && held.iter().all(|s| *s < segment),
-			"control: the rows are in segments older than the tag ({held:?}, tag {segment})"
-		);
+		assert_eq!(held, vec![segment], "control: the rows are in the segment of the tag");
 	}
 	assert_reads(&read_only(&tree), &model, &keys(), "recovered");
 
