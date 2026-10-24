@@ -598,10 +598,8 @@ async fn a_value_log_sync_failure_in_the_flush_stops_the_database() {
 		"a commit after the failure"
 	);
 	assert_contents(&tree, &expected, "the live tree");
-	// A stopped database cannot close: it is let go the way a crash lets it go.
-	let _ = tree.close().await;
-	tree.core.inner.lockfile.lock().unwrap().release().unwrap();
-	tree.core.abort_background_tasks();
+	// A stopped database cannot close: it ends the way a crash ends it, and lets go of its lock.
+	assert!(tree.close().await.is_err(), "a tree whose value log cannot sync closed");
 	drop(tree);
 	let reopened = {
 		let mut opts = options(dir.path());
