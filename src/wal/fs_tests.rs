@@ -218,7 +218,7 @@ use super::recovery::{
 	classify_wal_damage_in,
 	repair_corrupted_wal_segment_in,
 	replay_wal_inner_with,
-	scan_valid_records_after_in,
+	scan_after_in,
 	WalDamage,
 };
 use super::{
@@ -470,7 +470,7 @@ impl Fs for RecordingFs {
 }
 
 fn options_over(fs: Arc<dyn Fs>) -> Options {
-	let mut opts = unmarked();
+	let mut opts = Options::default();
 	opts.context.fs = fs;
 	opts
 }
@@ -489,7 +489,12 @@ fn the_log(log: &Log) -> Vec<Op> {
 fn a_commit_group_is_one_append_per_write_and_one_sync_after_them() {
 	let dir = TempDir::new().unwrap();
 	let (fs, log) = RecordingFs::recording(FsKind::Std);
-	let mut wal = Wal::open_with_min_log_number(dir.path(), 1, options_over(fs)).unwrap();
+	// The goldens are of a log without sync marks, which can take a group over a buffer.
+	let opts = Options {
+		sync_marks: false,
+		..options_over(fs)
+	};
+	let mut wal = Wal::open_with_min_log_number(dir.path(), 1, opts).unwrap();
 	the_log(&log);
 
 	let mut writes = Vec::new();
@@ -891,14 +896,14 @@ fn a_scan_finds_the_same_records_through_short_reads() {
 	bytes[super::HEADER_SIZE + 10] ^= 0xFF;
 	fs::write(&path, &bytes).unwrap();
 
-	let reference = scan_valid_records_after_in(&StdFs, &path, 0).unwrap();
+	let reference = scan_after_in(&StdFs, &path, 0).unwrap().intact_records;
 	assert_eq!(reference, 2);
 	for cap in [1, 7, 4097] {
 		let fs = Arc::new(RecordingFs {
 			cap,
 			..RecordingFs::plain(FsKind::Std)
 		});
-		assert_eq!(scan_valid_records_after_in(&*fs, &path, 0).unwrap(), reference, "cap {cap}");
+		assert_eq!(scan_after_in(&*fs, &path, 0).unwrap().intact_records, reference, "cap {cap}");
 		let damage = classify_wal_damage_in(&*fs, &path, 0, true).unwrap();
 		assert_eq!(
 			damage,

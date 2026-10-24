@@ -91,14 +91,14 @@ fn set_footer_format_byte(path: &Path, format: u8) {
 	file.sync_all().unwrap();
 }
 
-fn manifest_version(opts: &Options) -> u16 {
+pub(super) fn manifest_version(opts: &Options) -> u16 {
 	let bytes = fs::read(opts.manifest_file_path(0)).unwrap();
 	u16::from_be_bytes([bytes[0], bytes[1]])
 }
 
 /// Writes `version` into the manifest, and the checksum trailer again if it has one: the version
 /// is part of what the checksum covers.
-fn set_manifest_version(opts: &Options, version: u16) {
+pub(super) fn set_manifest_version(opts: &Options, version: u16) {
 	use crate::levels::{calculate_manifest_crc, MANIFEST_TRAILER_LEN, MANIFEST_TRAILER_MAGIC};
 
 	let path = opts.manifest_file_path(0);
