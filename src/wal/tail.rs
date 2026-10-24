@@ -7,14 +7,29 @@
 //! whose value is not in the value log ends the log there: it and the records after it were not
 //! acknowledged as durable.
 //!
+//! A value can be missing for two reasons. A power cut loses any of the pages of the value log
+//! that were written but not synced, in any order, so it can lose the value of one record and keep
+//! the value of a later one: a hole in values that were never synced, which nothing acknowledged
+//! as durable points to. Or bytes of the value log that were synced are gone, which a power cut
+//! does not do. The value log keeps no record of how far it was synced, but the segment does, in
+//! its sync marks (`RecordType::SyncMark`): an fsync of the segment that covered a record came
+//! after the values of that record were made durable, see `SyncGate::sync`, so a mark that claims
+//! a synced length at or past the end of a record says that its values were synced.
+//!
 //! The open reads the records of that segment before it replays them, and holds the entry that
 //! each pointer names to what the pointer says, see [`VLog::check_entry`]. The segment ends at the
 //! first record that fails, as far as the recovery mode lets it:
 //!
 //! * `AbsoluteConsistency` fails the open, and names the segment and the offset of the record.
 //! * `SalvageValidPrefix` ends the segment before that record.
-//! * `TolerateTornTail` does the same if no record after it points to a value that is in the log,
-//!   which is what a value log that lost its tail looks like, and refuses otherwise.
+//! * `TolerateTornTail` does the same, unless a record after it points to a value that is in the
+//!   log and the record that failed may have been synced: a hole in values that may have been
+//!   synced, which it refuses. A segment that holds marks says how far it was synced, so a hole in
+//!   what no mark covers is cut. One without marks says nothing, so a hole in it is refused as
+//!   before marks existed: a sealed segment, and one whose head holds no mark, of a binary that
+//!   writes none or whose first page a power cut lost. A sync that completed after the last mark
+//!   was written is not told either, so a value that it made durable and that is gone since is cut,
+//!   not refused: a power cut cannot leave that, only a disk that loses synced bytes can.
 //!
 //! An encrypted log is held to the same rule: the records of its segment are authenticated when
 //! they are read, and an entry of a sealed file is held to its length and to the checksum of what
@@ -28,6 +43,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use super::reader::Reader;
+use super::recovery::{scan_after_in, segment_holds_marks_in};
 use super::{directory_present, Error as WalError, SegmentRef, WalContext};
 use crate::batch::Batch;
 use crate::error::{Error, Result};
@@ -59,6 +75,9 @@ pub(crate) struct TailCheck<'a> {
 	files: BTreeSet<u32>,
 	/// The files that the pointers of the record that is looked at name.
 	record_files: Vec<u32>,
+	/// Whether the record that failed may have been synced, once it was asked: asked only when a
+	/// value is missing and a later one is there, and of one record per segment.
+	synced: Option<bool>,
 }
 
 /// The last segment of the log in `wal_dir`, if the replay reads it: one that is not below
@@ -82,7 +101,29 @@ impl<'a> TailCheck<'a> {
 			buf: Vec::new(),
 			files: BTreeSet::new(),
 			record_files: Vec::new(),
+			synced: None,
 		}
+	}
+
+	/// Whether `segment` may have been synced up to `end`: a mark of it says so, or it holds no
+	/// marks to say otherwise. A mark claims no more than its own offset, so one that claims `end`
+	/// lies at or past it.
+	fn synced_to(
+		&mut self,
+		context: &WalContext,
+		segment: &SegmentRef,
+		end: usize,
+	) -> Result<bool> {
+		if let Some(synced) = self.synced {
+			return Ok(synced);
+		}
+		let fs = &*context.fs;
+		let synced = context.is_sealed()
+			|| !segment_holds_marks_in(fs, &segment.file_path)?
+			|| scan_after_in(fs, &segment.file_path, end as u64)?
+				.highest_mark
+				.is_some_and(|synced| synced >= end as u64);
+		Ok(*self.synced.insert(synced))
 	}
 
 	/// The first pointer of `batch` whose entry is not in the value log, if there is one. The
@@ -120,6 +161,7 @@ impl<'a> TailCheck<'a> {
 		mode: WalRecoveryMode,
 	) -> Result<TailEnd> {
 		self.files.clear();
+		self.synced = None;
 
 		let file = context.fs.open_read(&segment.file_path)?;
 		let mut reader = Reader::with_context(file, None, segment.id, context);
@@ -128,7 +170,8 @@ impl<'a> TailCheck<'a> {
 		// Where the record that is read begins: the end of the one before it.
 		let mut start = 0;
 		let mut record = 0;
-		let mut failed: Option<(usize, usize)> = None;
+		// The record that failed, where it begins, and where it ends.
+		let mut failed: Option<(usize, usize, usize)> = None;
 		let mut dropped = 0;
 		loop {
 			let (data, end) = match reader.read() {
@@ -152,19 +195,23 @@ impl<'a> TailCheck<'a> {
 						if mode == WalRecoveryMode::AbsoluteConsistency {
 							return Err(Error::wal_corruption(segment_id, start, place));
 						}
-						failed = Some((record, start));
+						failed = Some((record, start, end));
 						dropped = 1;
 					} else {
 						self.files.extend(self.record_files.iter().copied());
 					}
 				}
-				Some((first, offset)) => {
+				Some((first, offset, first_end)) => {
 					dropped += 1;
-					if mode == WalRecoveryMode::TolerateTornTail && self.holds_a_value(&batch)? {
+					if mode == WalRecoveryMode::TolerateTornTail
+						&& self.holds_a_value(&batch)?
+						&& self.synced_to(context, segment, first_end)?
+					{
 						return Err(Error::Other(format!(
 							"WAL segment {:020}.wal at offset {offset}: the value that record {first} \
-							 points to is not in the value log, and a record after it points to one \
-							 that is. The log is not cut automatically: configure \
+							 points to is not in the value log, a record after it points to one \
+							 that is, and a sync mark says that the segment was synced past record \
+							 {first}. The log is not cut automatically: configure \
 							 WalRecoveryMode::SalvageValidPrefix to end it at that record.",
 							segment.id
 						)));
@@ -177,7 +224,7 @@ impl<'a> TailCheck<'a> {
 
 		Ok(match failed {
 			None => TailEnd::Whole,
-			Some((record, offset)) => TailEnd::Cut {
+			Some((record, offset, _)) => TailEnd::Cut {
 				record,
 				offset,
 				dropped,
