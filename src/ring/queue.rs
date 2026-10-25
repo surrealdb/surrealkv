@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use tokio::sync::{oneshot, OwnedSemaphorePermit};
 
-use super::bloom::BloomFilter;
+use super::bloom::{BloomFilter, BloomProbe};
 use super::commit_ring::RingEntry;
 use crate::batch::Batch;
 use crate::error::Result;
@@ -18,6 +18,10 @@ const ACCEPTED: u64 = u64::MAX - 1;
 const ABORTED: u64 = u64::MAX;
 // Any other state is the highest LSM sequence number of a commit that is
 // durable and visible (sequence numbers start at 1).
+
+/// Above this many write keys, a disjointness check first compares whole
+/// filters, which costs the same for any number of keys, before probing each.
+const PROBE_EACH_MAX_KEYS: usize = 8;
 
 /// Where a commit entry is in its lifecycle, as the flusher sees it.
 pub(crate) enum EntryState {
@@ -40,6 +44,9 @@ pub(crate) struct Payload {
 pub(crate) struct CommitEntry {
 	/// Sorted, deduplicated write keys for exact conflict checks.
 	keys: Box<[Key]>,
+	/// Each write key's bloom probe, hashed once here because every later
+	/// commit whose window holds this entry probes its filters with them.
+	probes: Box<[BloomProbe]>,
 	/// Bloom filter over the write keys for fast pre-checks.
 	bloom: BloomFilter,
 	/// `IN_FLIGHT`, `ACCEPTED`, `ABORTED`, or the visible commit's highest
@@ -71,12 +78,14 @@ impl CommitEntry {
 	pub(crate) fn new(mut keys: Vec<Key>, permit: OwnedSemaphorePermit) -> Self {
 		keys.sort();
 		keys.dedup();
+		let probes: Box<[BloomProbe]> = keys.iter().map(|k| BloomProbe::new(k)).collect();
 		let mut bloom = BloomFilter::new();
-		for k in &keys {
-			bloom.insert(k);
+		for p in &probes {
+			bloom.insert_probe(*p);
 		}
 		Self {
 			keys: keys.into_boxed_slice(),
+			probes,
 			bloom,
 			state: AtomicU64::new(IN_FLIGHT),
 			payload: Mutex::new(None),
@@ -182,15 +191,12 @@ impl CommitEntry {
 			return true;
 		}
 
-		// Fast path: check if any of our keys are in the other's bloom filter
-		let mut any_possible = false;
-		for k in self.keys.iter() {
-			if other_bloom.may_contain(k) {
-				any_possible = true;
-				break;
-			}
+		// Fast path: whether any of our keys may be in the other's filter, by
+		// comparing the filters whole when we have many keys, then key by key.
+		if self.probes.len() > PROBE_EACH_MAX_KEYS && !self.bloom.intersects(other_bloom) {
+			return true;
 		}
-		if !any_possible {
+		if !self.probes.iter().any(|p| other_bloom.may_contain_probe(*p)) {
 			return true;
 		}
 
@@ -207,5 +213,37 @@ impl CommitEntry {
 	/// Checks if this commit's write set is disjoint from a read set.
 	pub(crate) fn is_disjoint_readset(&self, read_keys: &[Key], read_bloom: &BloomFilter) -> bool {
 		self.is_disjoint_writeset(read_keys, read_bloom)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::BTreeSet;
+	use std::sync::Arc;
+
+	use tokio::sync::Semaphore;
+
+	use super::*;
+
+	fn entry(keys: &[Key]) -> CommitEntry {
+		CommitEntry::new(keys.to_vec(), Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap())
+	}
+
+	#[test]
+	fn disjointness_matches_an_exact_check_for_small_and_large_sets() {
+		let mut rng = fastrand::Rng::with_seed(7);
+		for _ in 0..2000 {
+			// Sizes on both sides of `PROBE_EACH_MAX_KEYS`, from a small key space
+			// so that overlaps are common.
+			let keys = |rng: &mut fastrand::Rng| -> Vec<Key> {
+				let n = rng.usize(0..=40);
+				(0..n).map(|_| rng.u16(0..512).to_be_bytes().to_vec()).collect()
+			};
+			let (a, b) = (keys(&mut rng), keys(&mut rng));
+			let exact = a.iter().collect::<BTreeSet<_>>().is_disjoint(&b.iter().collect());
+			let (ea, eb) = (entry(&a), entry(&b));
+			assert_eq!(ea.is_disjoint_writeset(eb.keys(), eb.bloom()), exact, "{a:?} {b:?}");
+			assert_eq!(ea.is_disjoint_readset(eb.keys(), eb.bloom()), exact, "{a:?} {b:?}");
+		}
 	}
 }
