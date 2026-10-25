@@ -1039,13 +1039,8 @@ impl CommitPipeline {
 		read_set: &[Key],
 		read_bloom: &BloomFilter,
 	) -> Result<()> {
-		let conflicts = |other: &CommitEntry| -> bool {
-			if other.is_ignorable_at(start_seq) {
-				return false;
-			}
-			!other.is_disjoint_writeset(entry.keys(), entry.bloom())
-				|| (!read_set.is_empty() && !other.is_disjoint_readset(read_set, read_bloom))
-		};
+		let conflicts =
+			|other: &CommitEntry| other.conflicts_with(entry, start_seq, read_set, read_bloom);
 		for s in (window + 1)..seq {
 			let mut spins = 0;
 			let conflict = loop {

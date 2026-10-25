@@ -42,6 +42,9 @@ mod stall;
 // reach them: not part of the stable API, and free to change in any release.
 #[doc(hidden)]
 pub mod storage;
+/// Internals exposed for the benchmarks in `benches/`; not part of the API.
+#[doc(hidden)]
+pub use ring::bench::ValidateWindow;
 mod task;
 // Reachable only because `Options::key_manager` is a public field. The key manager, the cipher
 // types and the errors are re-exported at the root, so keep the module out of the documented API.

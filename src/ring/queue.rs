@@ -156,6 +156,22 @@ impl CommitEntry {
 		self.permit.lock().take()
 	}
 
+	/// Whether this commit, in the window of `entry` whose snapshot is
+	/// `start_seq`, conflicts with its writes or with its locked reads.
+	pub(crate) fn conflicts_with(
+		&self,
+		entry: &CommitEntry,
+		start_seq: u64,
+		read_set: &[Key],
+		read_bloom: &BloomFilter,
+	) -> bool {
+		if self.is_ignorable_at(start_seq) {
+			return false;
+		}
+		!self.is_disjoint_writeset(entry.keys(), entry.bloom())
+			|| (!read_set.is_empty() && !self.is_disjoint_readset(read_set, read_bloom))
+	}
+
 	/// Checks if this commit's write set is disjoint from another write set.
 	pub(crate) fn is_disjoint_writeset(
 		&self,

@@ -1,3 +1,4 @@
+pub(crate) mod bench;
 mod bloom;
 mod commit_ring;
 mod pipeline;

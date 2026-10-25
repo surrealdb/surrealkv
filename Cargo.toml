@@ -293,3 +293,7 @@ harness = false
 [[bench]]
 name = "tde_bench"
 harness = false
+
+[[bench]]
+name = "validate_bench"
+harness = false
