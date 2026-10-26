@@ -290,12 +290,19 @@ jobs:
           toolchain: stable
           targets: wasm32-unknown-unknown
 
+      # Pinned: an unpinned install once gave wasm-pack v0.9.1, which does not accept `--test`, and
+      # the browser step failed before it ran any test. Installed by hand, not with
+      # jetli/wasm-pack-action, which renames the binary from /tmp into ~/.cargo/bin and fails with
+      # EXDEV on runners where the two are on different file systems; `install` copies.
       - name: Install wasm-pack
-        uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa # v0.4.0
-        with:
-          # Pinned: with the default, the action once installed wasm-pack v0.9.1, which does not
-          # accept `--test`, and the browser step failed before it ran any test.
-          version: v0.15.0
+        env:
+          WASM_PACK: wasm-pack-v0.15.0-x86_64-unknown-linux-musl
+        run: |
+          curl --proto '=https' --tlsv1.2 --retry 5 -sSfL \
+            "https://github.com/rustwasm/wasm-pack/releases/download/v0.15.0/$WASM_PACK.tar.gz" \
+            | tar xz -C "$RUNNER_TEMP"
+          install -m 755 "$RUNNER_TEMP/$WASM_PACK/wasm-pack" "$HOME/.cargo/bin/wasm-pack"
+          wasm-pack --version
 
       # The browser tests link the whole engine, zstd's C code included. That is compiled by
       # clang, and archived by the archiver of the target: GNU `ar` and Apple's write no symbol
