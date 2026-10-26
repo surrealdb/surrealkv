@@ -184,7 +184,10 @@ fn all_failed(results: &[crate::Result<()>]) -> Vec<String> {
 /// error that says so.
 fn all_stopped(results: &[crate::Result<()>]) {
 	for result in results {
-		assert!(matches!(result, Err(Error::DatabaseStopped(_))), "{result:?}");
+		assert!(
+			matches!(result.as_ref().map_err(Error::poisoned_by), Err(Error::DatabaseStopped(_))),
+			"{result:?}"
+		);
 	}
 }
 
@@ -1766,7 +1769,10 @@ async fn nothing_of_a_group_that_failed_while_being_logged_again_becomes_readabl
 	// database took it.
 	tree.core.inner.seal_active_wal_segment().unwrap();
 	assert!(matches!(
-		commit_one(&tree, "later", Durability::Immediate).await,
+		commit_one(&tree, "later", Durability::Immediate)
+			.await
+			.as_ref()
+			.map_err(Error::poisoned_by),
 		Err(Error::DatabaseStopped(_))
 	));
 	assert_eq!(readable(&tree, &group), Vec::<String>::new(), "after a later commit");
@@ -1788,7 +1794,10 @@ async fn nothing_of_a_group_whose_mid_group_rotation_failed_becomes_readable() {
 	// The next rotation goes ahead without fsyncing the segment that failed.
 	tree.core.inner.rotate_memtable().unwrap();
 	assert!(matches!(
-		commit_one(&tree, "later", Durability::Immediate).await,
+		commit_one(&tree, "later", Durability::Immediate)
+			.await
+			.as_ref()
+			.map_err(Error::poisoned_by),
 		Err(Error::DatabaseStopped(_))
 	));
 	assert_eq!(readable(&tree, &group), Vec::<String>::new(), "after a later commit");

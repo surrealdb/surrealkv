@@ -257,7 +257,7 @@ async fn a_key_problem_after_part_of_a_group_was_applied_stops_the_database_as_a
 		tree.core.commit_pipeline.set_hook(None);
 
 		for result in &results {
-			match result {
+			match result.as_ref().map_err(Error::poisoned_by) {
 				Err(Error::DatabaseStopped(message)) => {
 					assert!(
 						message.contains("the key provider is unavailable"),
@@ -281,7 +281,10 @@ async fn a_key_problem_after_part_of_a_group_was_applied_stops_the_database_as_a
 		// the outcome of the group.
 		km.set(Mode::Up);
 		let later = commit(&tree, "later", 40).await;
-		assert!(matches!(later, Err(Error::DatabaseStopped(_))), "{what}: {later:?}");
+		assert!(
+			matches!(later.as_ref().map_err(Error::poisoned_by), Err(Error::DatabaseStopped(_))),
+			"{what}: {later:?}"
+		);
 		crash(&tree);
 	}
 }

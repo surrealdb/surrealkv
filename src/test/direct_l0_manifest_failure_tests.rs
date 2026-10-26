@@ -856,7 +856,10 @@ async fn a_direct_failure_after_part_of_the_group_was_applied_still_stops_the_da
 
 	let results = run_group(&tree, &mut model, false).await;
 	for result in &results {
-		assert!(matches!(result, Err(Error::DatabaseStopped(_))), "{result:?}");
+		assert!(
+			matches!(result.as_ref().map_err(Error::poisoned_by), Err(Error::DatabaseStopped(_))),
+			"{result:?}"
+		);
 	}
 	assert_eq!(armer.calls(), 1, "the failure landed on the direct write");
 	let handler = &tree.core.inner.error_handler;

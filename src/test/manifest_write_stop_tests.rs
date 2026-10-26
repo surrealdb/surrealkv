@@ -23,7 +23,7 @@ use super::manifest_write_failure_tests::{
 	GRACE,
 };
 use super::{sfs as fs, tfs};
-use crate::error::BackgroundErrorReason;
+use crate::error::{BackgroundErrorReason, ErrorSeverity};
 use crate::levels::{fail_replacements, ReplaceFailure};
 use crate::{Durability, Error, Mode, Options, Result, Tree};
 
@@ -103,7 +103,13 @@ fn files_with_extension(path: &Path, dir: &str, extension: &str) -> Vec<String> 
 fn assert_stopped(tree: &Tree, what: &str) {
 	let handler = &tree.core.inner.error_handler;
 	assert!(handler.is_db_stopped(), "{what}: the database is stopped");
-	assert!(matches!(handler.check_error(), Err(Error::DatabaseStopped(_))), "{what}");
+	assert!(
+		matches!(
+			handler.check_error().as_ref().map_err(Error::poisoned_by),
+			Err(Error::DatabaseStopped(_))
+		),
+		"{what}"
+	);
 	assert!(handler.commit_group_error().is_some(), "{what}");
 	assert_eq!(handler.get_error().unwrap().reason, BackgroundErrorReason::CommitGroup, "{what}");
 }
@@ -155,15 +161,21 @@ async fn a_flush_that_succeeds_after_a_group_stopped_the_database_does_not_end_t
 	);
 	assert_stopped(&tree, "after the flush");
 	let commit = commit_one(Arc::clone(&tree), "after".into(), vec![b'a'; 40]).await;
-	assert!(matches!(commit, Err(Error::DatabaseStopped(_))), "{commit:?}");
+	assert!(
+		matches!(commit.as_ref().map_err(Error::poisoned_by), Err(Error::DatabaseStopped(_))),
+		"{commit:?}"
+	);
 
 	// A memtable queued now is not flushed, by the caller or by the task.
 	tree.core.inner.rotate_memtable().unwrap();
 	assert_eq!(immutables(&tree), 1);
-	assert!(matches!(tree.flush(), Err(Error::DatabaseStopped(_))));
+	assert!(matches!(
+		tree.flush().as_ref().map_err(Error::poisoned_by),
+		Err(Error::DatabaseStopped(_))
+	));
 	let checkpoint = TempDir::new("manifest_stop_in_flight_checkpoint").unwrap();
 	assert!(matches!(
-		tree.create_checkpoint(checkpoint.path().join("cp")),
+		tree.create_checkpoint(checkpoint.path().join("cp")).as_ref().map_err(Error::poisoned_by),
 		Err(Error::DatabaseStopped(_))
 	));
 	assert_eq!(table_ids(&tree), vec![1], "no flush ran after the stop");
@@ -191,6 +203,7 @@ async fn a_failed_manifest_write_in_the_flush_before_a_direct_write_stops_the_da
 	fail_replacements(&manifest, ReplaceFailure::BeforeRename, 0, usize::MAX);
 
 	let group = group_with_oversized();
+	// Every commit of the group is told that recovery decides its outcome.
 	for (i, result) in commit_group(&tree, &group).await.iter().enumerate() {
 		match result {
 			Err(Error::DatabaseStopped(message)) => {
@@ -200,6 +213,17 @@ async fn a_failed_manifest_write_in_the_flush_before_a_direct_write_stops_the_da
 		}
 	}
 	assert_stopped(&tree, "after the group");
+
+	// The group poisoned the database: a commit after it does not start, and recovery does not
+	// find it.
+	let later = commit_one(Arc::clone(&tree), "later".to_string(), vec![b'l'; 40]).await;
+	match &later {
+		Err(Error::DatabasePoisoned(cause)) => {
+			assert!(matches!(**cause, Error::DatabaseStopped(_)), "{later:?}")
+		}
+		other => panic!("a commit after the group: expected a poisoned database, got {other:?}"),
+	}
+	assert!(later.unwrap_err().is_poisoned());
 	assert_eq!(immutables(&tree), 1, "the memtable that holds part of the group is queued");
 
 	// The disk is back, and the background task is woken: whatever it would retry is refused.
@@ -217,7 +241,10 @@ async fn a_failed_manifest_write_in_the_flush_before_a_direct_write_stops_the_da
 	assert_eq!(immutables(&tree), 1, "the memtable is still queued");
 	assert!(table_ids(&tree).is_empty(), "no table was written");
 	assert_eq!(files_with_extension(dir.path(), "wal", ".wal"), segments, "no segment is removed");
-	assert!(matches!(tree.flush(), Err(Error::DatabaseStopped(_))));
+	assert!(matches!(
+		tree.flush().as_ref().map_err(Error::poisoned_by),
+		Err(Error::DatabaseStopped(_))
+	));
 	let seen = keys(&tree);
 	assert_eq!(seen.len(), 10, "readers see what they saw before the group: {seen:?}");
 
@@ -228,6 +255,60 @@ async fn a_failed_manifest_write_in_the_flush_before_a_direct_write_stops_the_da
 	let mut expected: Vec<String> = base().into_iter().chain(group).map(|(key, _)| key).collect();
 	expected.sort();
 	assert_eq!(keys(&reopened), expected);
+	reopened.close().await.unwrap();
+}
+
+/// A commit to a database that an uncertain manifest write poisoned does not start, however
+/// uncertain that write was: it is told so, with the failure as the cause, and the database opened
+/// again does not hold it.
+#[test(tokio::test)]
+async fn a_commit_to_a_database_poisoned_by_an_uncertain_manifest_write_does_not_start() {
+	if tfs::skip_listed() {
+		return;
+	}
+	let dir = TempDir::new("manifest_stop_poisoned").unwrap();
+	let tree = open(dir.path(), 16 * 1024 * 1024);
+	for result in commit_group(&tree, &base()).await {
+		result.unwrap();
+	}
+	let severity = tree.core.inner.error_handler.set_error(
+		Error::ManifestWriteUncertain("replacing the manifest: injected".to_string()),
+		BackgroundErrorReason::ManifestWrite,
+	);
+	assert!(severity >= ErrorSeverity::FatalError, "{severity:?}");
+
+	let poisoned = commit_one(Arc::clone(&tree), "after".to_string(), vec![b'r'; 40])
+		.await
+		.expect_err("a poisoned database fails a commit");
+	assert!(
+		matches!(&poisoned, Error::DatabasePoisoned(cause) if matches!(**cause, Error::ManifestWriteUncertain(_))),
+		"{poisoned:?}"
+	);
+	assert!(poisoned.is_poisoned());
+	assert!(
+		matches!(poisoned.poisoned_by(), Error::ManifestWriteUncertain(_)),
+		"{:?}",
+		poisoned.poisoned_by()
+	);
+	assert!(
+		poisoned.to_string().starts_with("Database stopped: Manifest write outcome unknown"),
+		"{poisoned}"
+	);
+	assert!(
+		!keys(&tree).contains(&"after".to_string()),
+		"a commit to a poisoned database is visible"
+	);
+
+	tree.close().await.unwrap();
+	drop(tree);
+	let reopened = open(dir.path(), 16 * 1024 * 1024);
+	let mut expected: Vec<String> = base().into_iter().map(|(key, _)| key).collect();
+	expected.sort();
+	assert_eq!(
+		keys(&reopened),
+		expected,
+		"the database opened again holds the commit it did not start"
+	);
 	reopened.close().await.unwrap();
 }
 

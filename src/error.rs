@@ -60,12 +60,18 @@ pub enum Error {
 	PipelineStall,
 	/// A commit group failed after part of it was applied, and the database stopped. Whether the
 	/// commits of that group took effect is decided by recovery when the database is opened
-	/// again, so a commit of that group that fails with this error has an unknown outcome. A
-	/// commit that was refused because the database had stopped did not start. Reads of data that
-	/// was already visible keep working, including after a compaction that ran while the group was
-	/// applied: a compaction keeps every version above the visible sequence number, and the newest
-	/// one at or below it.
+	/// again, so a commit of that group that fails with this error has an unknown outcome. The
+	/// database is poisoned by it: a later commit does not start, and fails with
+	/// [`Error::DatabasePoisoned`] holding this error. Reads of data that was already visible keep
+	/// working, including after a compaction that ran while the group was applied: a compaction
+	/// keeps every version above the visible sequence number, and the newest one at or below it.
 	DatabaseStopped(String),
+	/// The database is poisoned: a failure it cannot recover from in place stopped it for good,
+	/// and the operation did not start. A commit that fails with this error took no effect,
+	/// whatever the failure that poisoned the database says of its own outcome. The cause is that
+	/// failure, with its type. Nothing works again until the database is opened again, which
+	/// recovers what the failure left.
+	DatabasePoisoned(Box<Error>),
 	Other(String), // Other errors
 	NoSnapshot,
 	CommitFail(String),
@@ -141,6 +147,10 @@ impl fmt::Display for Error {
 			Self::TableNotFound(id) => write!(f, "Table not found: {id}"),
 			Self::PipelineStall => write!(f, "Pipeline stall"),
 			Self::DatabaseStopped(err) => write!(f, "Database stopped: {err}"),
+			Self::DatabasePoisoned(cause) => match &**cause {
+				Self::DatabaseStopped(_) => write!(f, "{cause}"),
+				cause => write!(f, "Database stopped: {cause}"),
+			},
             Self::Other(err) => write!(f, "Other error: {err}"),
             Self::NoSnapshot => write!(f, "No snapshot available"),
             Self::CommitFail(err) => write!(f, "Commit failed: {err}"),
@@ -169,6 +179,22 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Error {
+	/// Whether the database is poisoned, stopped for good: this error poisoned it
+	/// ([`Error::DatabaseStopped`]), or the operation did not start because it was
+	/// ([`Error::DatabasePoisoned`]). Nothing works again until the database is opened again.
+	pub fn is_poisoned(&self) -> bool {
+		matches!(self, Self::DatabaseStopped(_) | Self::DatabasePoisoned(_))
+	}
+
+	/// The failure that poisoned the database, if this error is an operation it stopped
+	/// ([`Error::DatabasePoisoned`]); this error itself otherwise.
+	pub fn poisoned_by(&self) -> &Error {
+		match self {
+			Self::DatabasePoisoned(cause) => cause,
+			other => other,
+		}
+	}
+
 	/// Whether this is an I/O error that a pool raised for holding as many files as it may: the
 	/// one that does not pass by waiting for a refill (see `vfs::PoolFull`). It is an `Error::Io`
 	/// and keeps that shape, so that the layers that read an I/O error as fatal go on doing so,
@@ -773,6 +799,13 @@ impl BackgroundErrorHandler {
 	/// Check if the database is stopped due to a background error.
 	/// Returns the error if stopped, Ok(()) otherwise.
 	/// This is the fast path check used before user operations.
+	///
+	/// An error that stops writes until it passes ([`ErrorSeverity::HardError`]) is returned as
+	/// it is. One that stopped the database for good ([`ErrorSeverity::FatalError`] and above)
+	/// poisoned it, and is returned as [`Error::DatabasePoisoned`] holding it, so that a caller can
+	/// tell an operation that a poisoned database did not start from one that failed itself: such
+	/// a commit took no effect even where the failure that poisoned the database was an uncertain
+	/// one.
 	pub fn check_error(&self) -> Result<()> {
 		// Fast path: check atomic flag first
 		if !self.is_db_stopped.load(Ordering::Acquire) {
@@ -782,6 +815,9 @@ impl BackgroundErrorHandler {
 		// Slow path: get the actual error
 		let errors = self.bg_errors.read();
 		if let Some(error) = Self::most_severe(&errors) {
+			if error.severity >= ErrorSeverity::FatalError {
+				return Err(Error::DatabasePoisoned(Box::new(error.error.clone())));
+			}
 			if error.severity >= ErrorSeverity::HardError {
 				return Err(error.error.clone());
 			}
@@ -1027,7 +1063,10 @@ mod tests {
 			assert!(!handler.recover(BackgroundErrorReason::CommitGroup), "{flush_first}");
 			assert!(handler.is_db_stopped(), "{flush_first}");
 			assert!(
-				matches!(handler.check_error(), Err(Error::DatabaseStopped(_))),
+				matches!(
+					handler.check_error().as_ref().map_err(Error::poisoned_by),
+					Err(Error::DatabaseStopped(_))
+				),
 				"{flush_first}"
 			);
 			assert!(handler.commit_group_error().is_some(), "{flush_first}");
@@ -1048,7 +1087,10 @@ mod tests {
 		assert_eq!(severity, ErrorSeverity::FatalError);
 
 		assert!(!handler.recover(BackgroundErrorReason::MemtablaFlush), "a fatal one stays");
-		assert!(matches!(handler.check_error(), Err(Error::DatabaseStopped(_))));
+		assert!(matches!(
+			handler.check_error().as_ref().map_err(Error::poisoned_by),
+			Err(Error::DatabaseStopped(_))
+		));
 		assert!(handler.commit_group_error().is_some());
 	}
 
@@ -1479,7 +1521,10 @@ mod tests {
 					assert!(handler.is_db_stopped(), "{err:?}");
 					assert!(!handler.recover(BackgroundErrorReason::MemtablaFlush), "{err:?}");
 					assert!(
-						matches!(handler.check_error(), Err(Error::Encryption(ref got)) if *got == err),
+						matches!(
+							handler.check_error().as_ref().map_err(Error::poisoned_by),
+							Err(Error::Encryption(got)) if *got == err
+						),
 						"{err:?}"
 					);
 				}

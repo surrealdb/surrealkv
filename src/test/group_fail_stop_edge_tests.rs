@@ -185,7 +185,7 @@ fn in_memtables(tree: &Tree, wanted: &[String]) -> Vec<String> {
 
 /// The message of the error every commit of a database stopped by a failed group gets.
 fn stop_message(result: &Result<()>, what: &str) -> String {
-	match result {
+	match result.as_ref().map_err(Error::poisoned_by) {
 		Err(Error::DatabaseStopped(message)) => {
 			assert!(message.contains("decided by recovery"), "{what}: {message}");
 			result.as_ref().unwrap_err().to_string()
@@ -811,7 +811,13 @@ fn churn(seed: u64) -> Churn {
 			let later =
 				commit_one(Arc::clone(&tree), "later".into(), vec![1; 10], Durability::Immediate)
 					.await;
-			assert!(matches!(later, Err(Error::DatabaseStopped(_))), "seed {seed}: {later:?}");
+			assert!(
+				matches!(
+					later.as_ref().map_err(Error::poisoned_by),
+					Err(Error::DatabaseStopped(_))
+				),
+				"seed {seed}: {later:?}"
+			);
 		}
 
 		// A recovery holds every acknowledged commit, and nothing that was never attempted.
@@ -1042,7 +1048,10 @@ async fn a_range_delete_in_an_l0_table_of_a_failed_group_hides_nothing() {
 	}
 	for handle in handles {
 		let result = handle.await.unwrap();
-		assert!(matches!(result, Err(Error::DatabaseStopped(_))), "{result:?}");
+		assert!(
+			matches!(result.as_ref().map_err(Error::poisoned_by), Err(Error::DatabaseStopped(_))),
+			"{result:?}"
+		);
 	}
 	tree.core.commit_pipeline.set_hook(None);
 	assert_eq!(tree.core.inner.l0_file_count(), 2, "the oversized batch is in a table");
@@ -2000,7 +2009,14 @@ async fn the_hold_on_the_log_ends_with_a_group_that_applied_nothing_or_completed
 	let results = commit_group(&tree, &entries, Durability::Immediate).await;
 	tree.core.commit_pipeline.set_hook(None);
 	for result in &results {
-		assert!(result.is_err() && !matches!(result, Err(Error::DatabaseStopped(_))), "{result:?}");
+		assert!(
+			result.is_err()
+				&& !matches!(
+					result.as_ref().map_err(Error::poisoned_by),
+					Err(Error::DatabaseStopped(_))
+				),
+			"{result:?}"
+		);
 	}
 	assert!(released(), "a group that applied nothing holds the log");
 	crash(&tree);
