@@ -561,7 +561,11 @@ async fn a_commit_whose_rotation_cannot_fsync_the_vlog_fails_whole_and_is_not_lo
 	);
 	assert!(!logged.contains(&failed_key), "the failed commit was logged: {logged:?}");
 
-	match try_put(&tree, &failed_key, &failed_value, Durability::Eventual).await {
+	match try_put(&tree, &failed_key, &failed_value, Durability::Eventual)
+		.await
+		.as_ref()
+		.map_err(Error::stopped_by)
+	{
 		Err(Error::DatabaseStopped(message)) => {
 			assert!(message.contains("value log"), "the cause is the value log: {message}")
 		}
@@ -606,8 +610,9 @@ async fn a_failed_vlog_fsync_in_a_rotation_after_part_of_a_group_was_applied_sto
 	}
 	let mut errors = Vec::new();
 	for handle in handles {
-		match handle.await.unwrap() {
-			Err(Error::DatabaseStopped(message)) => errors.push(message),
+		let result = handle.await.unwrap();
+		match result.as_ref().map_err(Error::stopped_by) {
+			Err(Error::DatabaseStopped(message)) => errors.push(message.clone()),
 			other => panic!("expected the database to be stopped, got {other:?}"),
 		}
 	}
@@ -624,7 +629,10 @@ async fn a_failed_vlog_fsync_in_a_rotation_after_part_of_a_group_was_applied_sto
 		assert_eq!(get(&tree, key).unwrap(), None, "{key} is visible");
 	}
 	assert!(matches!(
-		try_put(&tree, "after", &payload(99, 300), Durability::Eventual).await,
+		try_put(&tree, "after", &payload(99, 300), Durability::Eventual)
+			.await
+			.as_ref()
+			.map_err(Error::stopped_by),
 		Err(Error::DatabaseStopped(_))
 	));
 

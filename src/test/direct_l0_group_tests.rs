@@ -1114,7 +1114,7 @@ async fn failing_group_on_a_recovered_tree(queued: usize, fails: Fails) {
 	for handle in handles {
 		let outcome = handle.await.unwrap();
 		assert!(
-			matches!(outcome, Err(Error::DatabaseStopped(_))),
+			matches!(outcome.as_ref().map_err(Error::stopped_by), Err(Error::DatabaseStopped(_))),
 			"{what}: every committer of the group is told the database stopped, got {outcome:?}"
 		);
 	}

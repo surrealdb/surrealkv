@@ -945,7 +945,7 @@ async fn a_mid_group_rotation_with_a_failing_gate_stops_the_database_and_acknowl
 		}));
 	}
 	for handle in handles {
-		match handle.await.unwrap() {
+		match handle.await.unwrap().as_ref().map_err(Error::stopped_by) {
 			Err(Error::DatabaseStopped(message)) => {
 				assert!(message.contains("WAL segment is held"), "{message}")
 			}
@@ -954,7 +954,7 @@ async fn a_mid_group_rotation_with_a_failing_gate_stops_the_database_and_acknowl
 	}
 	assert!(group.iter().all(|(key, _)| get(&tree, key).is_none()), "nothing is readable");
 	assert!(matches!(
-		commit_one(&tree, "later", Durability::Immediate).await,
+		commit_one(&tree, "later", Durability::Immediate).await.as_ref().map_err(Error::stopped_by),
 		Err(Error::DatabaseStopped(_))
 	));
 	assert_eq!(heals.load(Ordering::SeqCst), 0, "a stopped database is never healed");

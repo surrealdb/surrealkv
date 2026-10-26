@@ -232,7 +232,7 @@ async fn assert_refused(tree: &Tree, key: &str, value: &[u8], durability: Durabi
 	let mut txn = tree.begin().unwrap();
 	txn.set_durability(durability);
 	txn.set(key.as_bytes(), value).unwrap();
-	match txn.commit().await {
+	match txn.commit().await.as_ref().map_err(Error::stopped_by) {
 		Err(Error::DatabaseStopped(message)) => {
 			assert!(message.contains("value log"), "the cause is the value log: {message}")
 		}

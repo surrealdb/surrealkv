@@ -1076,7 +1076,10 @@ mod tests {
 		core.fail_memtable.store(false, Ordering::SeqCst);
 		task_manager.wake_up_memtable();
 		wait_for(|| core.memtable_compactions.load(Ordering::SeqCst) == 1).await;
-		assert!(matches!(core.error_handler.check_error(), Err(Error::DatabaseStopped(_))));
+		assert!(matches!(
+			core.error_handler.check_error().as_ref().map_err(Error::stopped_by),
+			Err(Error::DatabaseStopped(_))
+		));
 		assert!(core.error_handler.commit_group_error().is_some());
 		assert!(write_stall.check().await.is_err(), "writers stay refused");
 		task_manager.stop().await;
@@ -1119,7 +1122,10 @@ mod tests {
 		time::sleep(Duration::from_millis(400)).await;
 		assert_eq!(core.level_attempts.load(Ordering::SeqCst), 1);
 
-		assert!(matches!(core.error_handler.check_error(), Err(Error::ManifestWriteUncertain(_))));
+		assert!(matches!(
+			core.error_handler.check_error().as_ref().map_err(Error::stopped_by),
+			Err(Error::ManifestWriteUncertain(_))
+		));
 		assert!(write_stall.check().await.is_err(), "writers stay refused");
 		task_manager.stop().await;
 	}
@@ -1368,13 +1374,11 @@ mod tests {
 			let recorded = core.error_handler.get_error().unwrap();
 			assert_eq!(recorded.severity, severity, "{error:?}");
 			assert_eq!(recorded.reason, BackgroundErrorReason::MemtablaFlush);
-			// Writes stop, and a commit is told the error as it is.
-			match core.error_handler.check_error() {
+			// Writes stop, and a commit is told the error, refused by the stopped database where
+			// the error stopped it for good.
+			match core.error_handler.check_error().as_ref().map_err(Error::stopped_by) {
 				Err(Error::Encryption(told)) => {
-					assert!(
-						matches!(&error, Error::Encryption(sent) if *sent == told),
-						"{error:?}"
-					);
+					assert!(matches!(&error, Error::Encryption(sent) if sent == told), "{error:?}");
 				}
 				other => panic!("{error:?}: {other:?}"),
 			}
