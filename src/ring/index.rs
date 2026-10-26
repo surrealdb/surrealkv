@@ -234,14 +234,21 @@ mod tests {
 
 	#[test]
 	fn a_lookup_conflicts_exactly_when_the_key_sets_overlap() {
-		let mut rng = fastrand::Rng::with_seed(7);
+		// A seeded xorshift: `fastrand` is not a dev-dependency on every target.
+		let mut state = 7u64;
+		let mut next = move |bound: u64| {
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			state % bound
+		};
 		for _ in 0..2000 {
 			// A small key space, so that overlaps are common.
-			let keys = |rng: &mut fastrand::Rng| -> Vec<Key> {
-				let n = rng.usize(0..=40);
-				(0..n).map(|_| rng.u16(0..512).to_be_bytes().to_vec()).collect()
+			let mut keys = || -> Vec<Key> {
+				let n = next(41);
+				(0..n).map(|_| (next(512) as u16).to_be_bytes().to_vec()).collect()
 			};
-			let (a, b) = (keys(&mut rng), keys(&mut rng));
+			let (a, b) = (keys(), keys());
 			let exact = !a.iter().collect::<BTreeSet<_>>().is_disjoint(&b.iter().collect());
 			let index = WriteIndex::new();
 			index.insert(&entry(&a), 1, 0);
