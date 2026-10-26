@@ -4,7 +4,8 @@
 //! A power cut loses any of the pages of a segment that were written but not synced, in any order,
 //! so it can zero an unsynced page and keep a later one: damage with intact records after it. Such
 //! damage is cut when the marks say that it was never synced, and refused when they say it was, or
-//! when the segment holds no marks (it does not start with a leading mark).
+//! when the segment holds no marks (it does not start with a leading mark), unless its head reads
+//! as zeros: a head that a power cut lost was never synced, and neither was the rest of it.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -562,4 +563,67 @@ fn a_sync_within_a_bound_marks_no_more_than_the_bound() {
 	// The leading mark of the new segment claims nothing, and the sync adds no claim to it.
 	assert_eq!(scan(&second, 0).highest_mark, Some(0), "a bound of another segment claims nothing");
 	wal.write().close().unwrap();
+}
+
+/// A power cut that lost the first page of a segment that was never synced takes its leading mark
+/// with it, so the segment reads as one without marks. Its head reads as zeros, which says that
+/// no fsync completed after its first append, so the damage is cut wherever it ends, whether or
+/// not the binary writes marks, in the only segment of a database that never synced and in the
+/// one an interval sync left behind.
+#[test_log::test(tokio::test)]
+async fn damage_that_takes_the_head_of_a_never_synced_segment_is_cut() {
+	for marks in [true, false] {
+		for interval in [false, true] {
+			for lost in [1, 3] {
+				let what = format!("marks {marks}, interval {interval}, {lost} record(s) lost");
+				let dir = TempDir::new().unwrap();
+				let o = opts(dir.path(), marks);
+				let tree = Tree::new(Arc::clone(&o)).unwrap();
+				if interval {
+					put(&tree, "synced", Durability::Eventual).await;
+					tree.flush_wal(true).unwrap();
+					tree.core.inner.rotate_memtable().unwrap();
+				}
+				let segment = active_segment(&tree, &o);
+				let mut ends = Vec::new();
+				for i in 0..6 {
+					put(&tree, &format!("unsynced{i}"), Durability::Eventual).await;
+					ends.push(len(&segment));
+				}
+				crash(tree);
+				zero(&segment, 0..ends[lost - 1]);
+				assert!(!segment_holds_marks_in(&*test_fs(), &segment).unwrap(), "{what}");
+				assert!(scan(&segment, ends[lost - 1]).intact_records > 0, "{what}");
+
+				let tree = Tree::new(Arc::clone(&o)).unwrap_or_else(|e| panic!("{what}: {e}"));
+				if interval {
+					assert_eq!(get(&tree, "synced").as_deref(), Some(&VALUE[..]), "{what}");
+				}
+				for i in 0..6 {
+					assert_eq!(get(&tree, &format!("unsynced{i}")), None, "{what}: unsynced{i}");
+				}
+				tree.close().await.unwrap();
+			}
+		}
+	}
+}
+
+/// Damage to the leading mark that does not read as zeros is not what a power cut leaves, and is
+/// refused when intact records follow it, as damage in any other segment without marks is.
+#[test_log::test(tokio::test)]
+async fn damage_at_the_head_that_does_not_read_as_zeros_is_refused() {
+	let dir = TempDir::new().unwrap();
+	let o = opts(dir.path(), true);
+	let tree = Tree::new(Arc::clone(&o)).unwrap();
+	let segment = active_segment(&tree, &o);
+	for i in 0..6 {
+		put(&tree, &format!("k{i}"), Durability::Eventual).await;
+	}
+	crash(tree);
+	let mut bytes = fs::read(&segment).unwrap();
+	bytes[HEADER_SIZE..MARK as usize].iter_mut().for_each(|b| *b ^= 0xff);
+	fs::write(&segment, bytes).unwrap();
+
+	let err = Tree::new(Arc::clone(&o)).err().expect("the damage must be refused");
+	assert!(err.to_string().contains("interior corruption at offset 0"), "{err}");
 }

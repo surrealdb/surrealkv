@@ -598,22 +598,38 @@ fn record_starts_at(data: &[u8], start_offset: u64, pos: usize) -> bool {
 		.is_some_and(|payload| calculate_crc32(&[type_byte], payload) == crc)
 }
 
+/// The record of the compression of a segment: a header and the byte of the compression.
+const COMPRESSION_RECORD_LEN: usize = HEADER_SIZE + 1;
+
 /// Whether the segment at `path` holds sync marks: whether it starts with a leading mark, after
 /// the record of its compression if it has one, see [`RecordType::SyncMark`]. A segment written
 /// by a binary that writes no marks has none, and neither has one whose first bytes were lost:
 /// both are read as segments without marks. Reads only the head of the segment.
 pub(crate) fn segment_holds_marks_in(fs: &dyn Fs, path: &Path) -> Result<bool> {
-	/// The record of the compression of a segment: a header and the byte of the compression.
-	const COMPRESSION_RECORD_LEN: usize = HEADER_SIZE + 1;
-	let head = fs
-		.read_prefix(path, COMPRESSION_RECORD_LEN + HEADER_SIZE + SYNC_MARK_LEN)?
-		.unwrap_or_default();
+	let head = segment_head_in(fs, path)?;
 	let leading = if head.get(6) == Some(&(RecordType::SetCompressionType as u8)) {
 		COMPRESSION_RECORD_LEN
 	} else {
 		0
 	};
 	Ok(sync_mark_in(&head, 0, leading).is_some())
+}
+
+/// The head of the segment at `path`: the bytes that the record of its compression and its
+/// leading mark take, or as many of them as the segment holds.
+fn segment_head_in(fs: &dyn Fs, path: &Path) -> Result<Vec<u8>> {
+	Ok(fs
+		.read_prefix(path, COMPRESSION_RECORD_LEN + HEADER_SIZE + SYNC_MARK_LEN)?
+		.unwrap_or_default())
+}
+
+/// Whether the head of the segment at `path` reads as zeros, as the first page of a file reads
+/// once a power cut lost it. The head is written by the first append to the segment, and every
+/// fsync covers the whole file, so a head that was lost was never synced, and neither was
+/// anything after it: no fsync completed after the first append.
+fn segment_head_was_lost_in(fs: &dyn Fs, path: &Path) -> Result<bool> {
+	let head = segment_head_in(fs, path)?;
+	Ok(!head.is_empty() && head.iter().all(|&b| b == 0))
 }
 
 /// What [`scan_after_in`] found after an offset of a segment.
@@ -713,8 +729,10 @@ pub(crate) fn classify_wal_damage(
 /// (it starts with a leading mark): the last fsync to complete before any of those records was
 /// written ended at or below the damage, so nothing at or after it was synced when they were, and
 /// a record acknowledged as durable after them would have had to wait for an fsync that covered
-/// the damage too. Everything else is interior corruption, which a segment without marks and an
-/// older segment always are.
+/// the damage too. The same holds for damage in the last segment whose head reads as zeros, with
+/// or without marks: a head that a power cut lost was never synced, and neither was anything after
+/// it, see [`segment_head_was_lost_in`]. Everything else is interior corruption, which any other
+/// segment without marks and an older segment always are.
 ///
 /// What the marks cannot see is an fsync that completed after the last mark was written, and
 /// was not followed by an append or a close: damage below the length it covered, followed by
@@ -743,7 +761,10 @@ pub(crate) fn classify_wal_damage_in(
 			file_size,
 		});
 	}
-	if is_last_segment && !synced && segment_holds_marks_in(fs, file_path)? {
+	if is_last_segment
+		&& !synced
+		&& (segment_holds_marks_in(fs, file_path)? || segment_head_was_lost_in(fs, file_path)?)
+	{
 		Ok(WalDamage::UnsyncedTail {
 			last_valid_offset,
 			intact_records_after,
