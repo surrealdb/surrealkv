@@ -521,7 +521,7 @@ async fn a_table_that_fails_authentication_in_a_compaction_is_reported_as_such_a
 		);
 		assert!(
 			matches!(
-				commit_error(&tree).await.stopped_by(),
+				commit_error(&tree).await.poisoned_by(),
 				Error::Encryption(EncryptionError::AuthenticationFailed)
 			),
 			"{suite:?}"

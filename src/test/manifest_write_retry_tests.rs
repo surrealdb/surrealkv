@@ -595,7 +595,7 @@ async fn a_value_log_sync_failure_in_the_flush_stops_the_database() {
 	txn.set(key_of(300), val_of(300, 0)).unwrap();
 	assert!(
 		matches!(
-			txn.commit().await.as_ref().map_err(Error::stopped_by),
+			txn.commit().await.as_ref().map_err(Error::poisoned_by),
 			Err(Error::DatabaseStopped(_))
 		),
 		"a commit after the failure"

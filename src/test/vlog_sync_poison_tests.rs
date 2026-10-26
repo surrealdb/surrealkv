@@ -174,7 +174,7 @@ async fn a_failed_value_log_fsync_fails_its_commit_and_stops_the_database() {
 		match try_put(&tree, key, &value_of(3, 600), durability)
 			.await
 			.as_ref()
-			.map_err(Error::stopped_by)
+			.map_err(Error::poisoned_by)
 		{
 			Err(Error::DatabaseStopped(message)) => {
 				assert!(message.contains("value log"), "{message}")
@@ -228,7 +228,7 @@ async fn a_restore_ends_the_failure_of_the_value_log_it_replaces() {
 			try_put(&tree, "after", &value_of(3, 600), Durability::Immediate)
 				.await
 				.as_ref()
-				.map_err(Error::stopped_by),
+				.map_err(Error::poisoned_by),
 			Err(Error::DatabaseStopped(_))
 		),
 		"a commit after the restore of a stopped database"

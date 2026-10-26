@@ -185,7 +185,7 @@ fn in_memtables(tree: &Tree, wanted: &[String]) -> Vec<String> {
 
 /// The message of the error every commit of a database stopped by a failed group gets.
 fn stop_message(result: &Result<()>, what: &str) -> String {
-	match result.as_ref().map_err(Error::stopped_by) {
+	match result.as_ref().map_err(Error::poisoned_by) {
 		Err(Error::DatabaseStopped(message)) => {
 			assert!(message.contains("decided by recovery"), "{what}: {message}");
 			result.as_ref().unwrap_err().to_string()
@@ -812,7 +812,10 @@ fn churn(seed: u64) -> Churn {
 				commit_one(Arc::clone(&tree), "later".into(), vec![1; 10], Durability::Immediate)
 					.await;
 			assert!(
-				matches!(later.as_ref().map_err(Error::stopped_by), Err(Error::DatabaseStopped(_))),
+				matches!(
+					later.as_ref().map_err(Error::poisoned_by),
+					Err(Error::DatabaseStopped(_))
+				),
 				"seed {seed}: {later:?}"
 			);
 		}
@@ -1046,7 +1049,7 @@ async fn a_range_delete_in_an_l0_table_of_a_failed_group_hides_nothing() {
 	for handle in handles {
 		let result = handle.await.unwrap();
 		assert!(
-			matches!(result.as_ref().map_err(Error::stopped_by), Err(Error::DatabaseStopped(_))),
+			matches!(result.as_ref().map_err(Error::poisoned_by), Err(Error::DatabaseStopped(_))),
 			"{result:?}"
 		);
 	}
@@ -2009,7 +2012,7 @@ async fn the_hold_on_the_log_ends_with_a_group_that_applied_nothing_or_completed
 		assert!(
 			result.is_err()
 				&& !matches!(
-					result.as_ref().map_err(Error::stopped_by),
+					result.as_ref().map_err(Error::poisoned_by),
 					Err(Error::DatabaseStopped(_))
 				),
 			"{result:?}"

@@ -680,7 +680,7 @@ async fn a_failure_in_the_log_again_of_a_cut_group_stops_the_database_and_recove
 	assert!(failed > 0 && failed < results.len(), "{failed} of {} commits failed", results.len());
 	assert!(
 		results.iter().filter_map(|r| r.as_ref().err()).all(|e| matches!(
-			e.stopped_by(),
+			e.poisoned_by(),
 			crate::Error::DatabaseStopped(_) | crate::Error::Io(_)
 		)),
 		"the failure is the stop of the database: {results:?}"

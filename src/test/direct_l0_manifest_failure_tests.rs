@@ -857,7 +857,7 @@ async fn a_direct_failure_after_part_of_the_group_was_applied_still_stops_the_da
 	let results = run_group(&tree, &mut model, false).await;
 	for result in &results {
 		assert!(
-			matches!(result.as_ref().map_err(Error::stopped_by), Err(Error::DatabaseStopped(_))),
+			matches!(result.as_ref().map_err(Error::poisoned_by), Err(Error::DatabaseStopped(_))),
 			"{result:?}"
 		);
 	}

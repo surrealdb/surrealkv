@@ -149,5 +149,5 @@ async fn a_reversed_range_is_refused_and_a_closed_tree_stops() {
 
 	tree.close().await.unwrap();
 	let result = tree.compact_range(None, None, &CompactRangeOptions::default());
-	assert!(matches!(result.as_ref().map_err(Error::stopped_by), Err(Error::DatabaseStopped(_))));
+	assert!(matches!(result.as_ref().map_err(Error::poisoned_by), Err(Error::DatabaseStopped(_))));
 }

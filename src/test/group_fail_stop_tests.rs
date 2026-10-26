@@ -7,9 +7,9 @@
 //! that was reported as failed would take effect, and be written to a table.
 //!
 //! A group that fails once any of it is applied therefore stops the database. Every committer of
-//! the group gets `Error::DatabaseStopped`, and every commit that comes after and every one that
-//! was accepted behind the group is refused with it (`Error::Refused`), and nothing is published
-//! past it: the batches that were
+//! the group gets `Error::DatabaseStopped`, which poisons the database: every commit that comes
+//! after and every one that was accepted behind the group fails with `Error::DatabasePoisoned`
+//! holding it, and nothing is published past it: the batches that were
 //! applied stay out of sight of every reader of the process. What readers could see before still
 //! reads. Nothing moves from the memtables to a table and nothing is compacted either, and `close`
 //! leaves the memtables to the WAL, so that recovery finds the whole group in its records.
@@ -283,7 +283,7 @@ fn fresh(entries: &Entries) -> Vec<String> {
 
 /// The error every commit of the stopped database gets.
 fn stop_error(result: &Result<()>, what: &str) -> String {
-	match result.as_ref().map_err(Error::stopped_by) {
+	match result.as_ref().map_err(Error::poisoned_by) {
 		Err(Error::DatabaseStopped(message)) => {
 			assert!(message.contains("decided by recovery"), "{what}: {message}");
 			result.as_ref().unwrap_err().to_string()
@@ -1046,23 +1046,23 @@ async fn a_stopped_database_flushes_compacts_and_checkpoints_nothing() {
 	let log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
 
 	assert!(matches!(
-		tree.flush().as_ref().map_err(Error::stopped_by),
+		tree.flush().as_ref().map_err(Error::poisoned_by),
 		Err(Error::DatabaseStopped(_))
 	));
 	assert!(matches!(
 		CompactionOperations::compact_memtable(&*tree.core.inner)
 			.as_ref()
-			.map_err(Error::stopped_by),
+			.map_err(Error::poisoned_by),
 		Err(Error::DatabaseStopped(_))
 	));
 	let strategy = Arc::new(Strategy::from_options(Arc::clone(&tree.core.inner.opts)));
 	assert!(matches!(
-		tree.compact(strategy).as_ref().map_err(Error::stopped_by),
+		tree.compact(strategy).as_ref().map_err(Error::poisoned_by),
 		Err(Error::DatabaseStopped(_))
 	));
 	let checkpoint = TempDir::new("group_fail_stop_checkpoint").unwrap();
 	assert!(matches!(
-		tree.create_checkpoint(checkpoint.path().join("cp")).as_ref().map_err(Error::stopped_by),
+		tree.create_checkpoint(checkpoint.path().join("cp")).as_ref().map_err(Error::poisoned_by),
 		Err(Error::DatabaseStopped(_))
 	));
 
@@ -1099,7 +1099,7 @@ async fn a_stopped_database_does_not_checkpoint_a_table_that_holds_part_of_the_g
 	let checkpoint = TempDir::new("group_fail_stop_checkpoint").unwrap();
 	let cp = checkpoint.path().join("cp");
 	assert!(matches!(
-		tree.create_checkpoint(&cp).as_ref().map_err(Error::stopped_by),
+		tree.create_checkpoint(&cp).as_ref().map_err(Error::poisoned_by),
 		Err(Error::DatabaseStopped(_))
 	));
 	assert!(!sfs::exists(&cp), "nothing was copied");
@@ -1144,7 +1144,7 @@ async fn a_compaction_cannot_replace_what_readers_see_with_what_was_never_publis
 
 	let strategy = Arc::new(Strategy::from_options(options));
 	assert!(matches!(
-		tree.compact(strategy).as_ref().map_err(Error::stopped_by),
+		tree.compact(strategy).as_ref().map_err(Error::poisoned_by),
 		Err(Error::DatabaseStopped(_))
 	));
 	assert_eq!(tree.core.inner.l0_file_count(), 3, "nothing was compacted");

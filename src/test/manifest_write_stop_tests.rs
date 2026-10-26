@@ -105,7 +105,7 @@ fn assert_stopped(tree: &Tree, what: &str) {
 	assert!(handler.is_db_stopped(), "{what}: the database is stopped");
 	assert!(
 		matches!(
-			handler.check_error().as_ref().map_err(Error::stopped_by),
+			handler.check_error().as_ref().map_err(Error::poisoned_by),
 			Err(Error::DatabaseStopped(_))
 		),
 		"{what}"
@@ -162,7 +162,7 @@ async fn a_flush_that_succeeds_after_a_group_stopped_the_database_does_not_end_t
 	assert_stopped(&tree, "after the flush");
 	let commit = commit_one(Arc::clone(&tree), "after".into(), vec![b'a'; 40]).await;
 	assert!(
-		matches!(commit.as_ref().map_err(Error::stopped_by), Err(Error::DatabaseStopped(_))),
+		matches!(commit.as_ref().map_err(Error::poisoned_by), Err(Error::DatabaseStopped(_))),
 		"{commit:?}"
 	);
 
@@ -170,12 +170,12 @@ async fn a_flush_that_succeeds_after_a_group_stopped_the_database_does_not_end_t
 	tree.core.inner.rotate_memtable().unwrap();
 	assert_eq!(immutables(&tree), 1);
 	assert!(matches!(
-		tree.flush().as_ref().map_err(Error::stopped_by),
+		tree.flush().as_ref().map_err(Error::poisoned_by),
 		Err(Error::DatabaseStopped(_))
 	));
 	let checkpoint = TempDir::new("manifest_stop_in_flight_checkpoint").unwrap();
 	assert!(matches!(
-		tree.create_checkpoint(checkpoint.path().join("cp")).as_ref().map_err(Error::stopped_by),
+		tree.create_checkpoint(checkpoint.path().join("cp")).as_ref().map_err(Error::poisoned_by),
 		Err(Error::DatabaseStopped(_))
 	));
 	assert_eq!(table_ids(&tree), vec![1], "no flush ran after the stop");
@@ -214,15 +214,16 @@ async fn a_failed_manifest_write_in_the_flush_before_a_direct_write_stops_the_da
 	}
 	assert_stopped(&tree, "after the group");
 
-	// A commit after the group is refused: it does not start, and recovery does not find it.
+	// The group poisoned the database: a commit after it does not start, and recovery does not
+	// find it.
 	let later = commit_one(Arc::clone(&tree), "later".to_string(), vec![b'l'; 40]).await;
 	match &later {
-		Err(Error::Refused(cause)) => {
+		Err(Error::DatabasePoisoned(cause)) => {
 			assert!(matches!(**cause, Error::DatabaseStopped(_)), "{later:?}")
 		}
-		other => panic!("a commit after the group: expected a refusal, got {other:?}"),
+		other => panic!("a commit after the group: expected a poisoned database, got {other:?}"),
 	}
-	assert!(later.unwrap_err().is_database_stopped());
+	assert!(later.unwrap_err().is_poisoned());
 	assert_eq!(immutables(&tree), 1, "the memtable that holds part of the group is queued");
 
 	// The disk is back, and the background task is woken: whatever it would retry is refused.
@@ -241,7 +242,7 @@ async fn a_failed_manifest_write_in_the_flush_before_a_direct_write_stops_the_da
 	assert!(table_ids(&tree).is_empty(), "no table was written");
 	assert_eq!(files_with_extension(dir.path(), "wal", ".wal"), segments, "no segment is removed");
 	assert!(matches!(
-		tree.flush().as_ref().map_err(Error::stopped_by),
+		tree.flush().as_ref().map_err(Error::poisoned_by),
 		Err(Error::DatabaseStopped(_))
 	));
 	let seen = keys(&tree);
@@ -257,15 +258,15 @@ async fn a_failed_manifest_write_in_the_flush_before_a_direct_write_stops_the_da
 	reopened.close().await.unwrap();
 }
 
-/// A commit refused by a database that a failed manifest write stopped did not start, however
+/// A commit to a database that an uncertain manifest write poisoned does not start, however
 /// uncertain that write was: it is told so, with the failure as the cause, and the database opened
 /// again does not hold it.
 #[test(tokio::test)]
-async fn a_commit_refused_after_an_uncertain_manifest_write_did_not_start() {
+async fn a_commit_to_a_database_poisoned_by_an_uncertain_manifest_write_does_not_start() {
 	if tfs::skip_listed() {
 		return;
 	}
-	let dir = TempDir::new("manifest_stop_refused").unwrap();
+	let dir = TempDir::new("manifest_stop_poisoned").unwrap();
 	let tree = open(dir.path(), 16 * 1024 * 1024);
 	for result in commit_group(&tree, &base()).await {
 		result.unwrap();
@@ -276,31 +277,38 @@ async fn a_commit_refused_after_an_uncertain_manifest_write_did_not_start() {
 	);
 	assert!(severity >= ErrorSeverity::FatalError, "{severity:?}");
 
-	let refused = commit_one(Arc::clone(&tree), "refused".to_string(), vec![b'r'; 40])
+	let poisoned = commit_one(Arc::clone(&tree), "after".to_string(), vec![b'r'; 40])
 		.await
-		.expect_err("a stopped database refuses a commit");
+		.expect_err("a poisoned database fails a commit");
 	assert!(
-		matches!(&refused, Error::Refused(cause) if matches!(**cause, Error::ManifestWriteUncertain(_))),
-		"{refused:?}"
+		matches!(&poisoned, Error::DatabasePoisoned(cause) if matches!(**cause, Error::ManifestWriteUncertain(_))),
+		"{poisoned:?}"
 	);
-	assert!(refused.is_database_stopped());
+	assert!(poisoned.is_poisoned());
 	assert!(
-		matches!(refused.stopped_by(), Error::ManifestWriteUncertain(_)),
+		matches!(poisoned.poisoned_by(), Error::ManifestWriteUncertain(_)),
 		"{:?}",
-		refused.stopped_by()
+		poisoned.poisoned_by()
 	);
 	assert!(
-		refused.to_string().starts_with("Database stopped: Manifest write outcome unknown"),
-		"{refused}"
+		poisoned.to_string().starts_with("Database stopped: Manifest write outcome unknown"),
+		"{poisoned}"
 	);
-	assert!(!keys(&tree).contains(&"refused".to_string()), "a refused commit is visible");
+	assert!(
+		!keys(&tree).contains(&"after".to_string()),
+		"a commit to a poisoned database is visible"
+	);
 
 	tree.close().await.unwrap();
 	drop(tree);
 	let reopened = open(dir.path(), 16 * 1024 * 1024);
 	let mut expected: Vec<String> = base().into_iter().map(|(key, _)| key).collect();
 	expected.sort();
-	assert_eq!(keys(&reopened), expected, "the database opened again holds the refused commit");
+	assert_eq!(
+		keys(&reopened),
+		expected,
+		"the database opened again holds the commit it did not start"
+	);
 	reopened.close().await.unwrap();
 }
 
