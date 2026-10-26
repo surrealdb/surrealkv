@@ -11,7 +11,7 @@ members = [
 [package]
 name = "surrealkv"
 publish = true
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
 license = "Apache-2.0"
 readme = "CARGO.md"
@@ -33,9 +33,9 @@ default = ["encryption"]
 encryption = []
 
 [dependencies]
-surrealkv-compat-rocksdb = { path = "crates/surrealkv-compat-rocksdb", version = "0.2.0" }
-surrealkv-compat-v1 = { path = "crates/surrealkv-compat-v1", version = "0.2.0" }
-surrealkv-compat-indxdb = { path = "crates/surrealkv-compat-indxdb", version = "0.2.0" }
+surrealkv-compat-rocksdb = { path = "crates/surrealkv-compat-rocksdb", version = "0.2.1" }
+surrealkv-compat-v1 = { path = "crates/surrealkv-compat-v1", version = "0.2.1" }
+surrealkv-compat-indxdb = { path = "crates/surrealkv-compat-indxdb", version = "0.2.1" }
 artmap = "0.6.0"
 byteslice = "0.2.0"
 affinitypool = "0.8.0"
