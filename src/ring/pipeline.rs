@@ -6,10 +6,9 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 
-use super::bloom::BloomFilter;
 use super::commit_ring::{CommitRing, SlotRead, DEFAULT_COMMIT_RING_CAPACITY};
+use super::index::{key_hash, WriteIndex};
 use super::queue::{CommitEntry, EntryState, Payload};
-use super::sync::backoff;
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::{CoreInner, GroupShape};
@@ -558,6 +557,9 @@ pub(crate) struct CommitPipeline {
 	/// at or below the retired watermark are garbage, which `free_retired`
 	/// removes a chunk at a time.
 	overflow: Mutex<BTreeMap<u64, Arc<CommitEntry>>>,
+	/// The write keys of the commits that live or future windows can still reach, which
+	/// validation looks a committer's keys up in, see `validate`.
+	index: WriteIndex,
 	/// Admission permits, one per claimed entry, released only once the
 	/// completed prefix has passed it. At most half the ring's capacity of
 	/// entries therefore sit above the completed prefix, so the previous
@@ -668,6 +670,7 @@ impl CommitPipeline {
 			#[cfg(test)]
 			est_cap_lifted: AtomicBool::new(false),
 			overflow: Mutex::new(BTreeMap::new()),
+			index: WriteIndex::new(),
 			admission,
 			inner,
 			write_stall,
@@ -917,7 +920,6 @@ impl CommitPipeline {
 		if self.shutdown.load(Ordering::Acquire) {
 			return Err(Error::PipelineStall);
 		}
-		let read_bloom = bloom_of(read_keys);
 		let permit =
 			Arc::clone(&self.admission).acquire_owned().await.map_err(|_| Error::PipelineStall)?;
 		// The claimed sequence bounds the window; the entry publishes nothing, so the guard
@@ -928,7 +930,7 @@ impl CommitPipeline {
 			pipeline: self,
 			entry: &entry,
 		};
-		self.validate(&entry, seq, start_seq, window, read_keys, &read_bloom)
+		self.validate(&entry, seq, start_seq, window, read_keys)
 	}
 
 	/// Commits a batch through the commit ring and the group-commit flusher.
@@ -977,7 +979,6 @@ impl CommitPipeline {
 		self.fire_commit(CommitStage::Admitted);
 
 		let write_keys: Vec<Key> = batch.entries.iter().map(|e| e.key.clone()).collect();
-		let read_bloom = bloom_of(read_set);
 		let entry = Arc::new(CommitEntry::new(write_keys, permit));
 		let seq = self.publish(&entry);
 
@@ -986,7 +987,7 @@ impl CommitPipeline {
 			pipeline: self,
 			entry: &entry,
 		};
-		self.validate(&entry, seq, start_seq, window, read_set, &read_bloom)?;
+		self.validate(&entry, seq, start_seq, window, read_set)?;
 
 		#[cfg(test)]
 		self.fire_commit(CommitStage::Validated);
@@ -1013,9 +1014,12 @@ impl CommitPipeline {
 		complete_rx.await.map_err(|_| Error::PipelineStall)?
 	}
 
-	/// Claims the next ring sequence and publishes `entry` into it.
+	/// Claims the next ring sequence, records the write keys of `entry` in the index, and
+	/// publishes it. The keys are recorded before the slot is published, so a committer that has
+	/// seen every sequence below its own published finds them.
 	fn publish(&self, entry: &Arc<CommitEntry>) -> u64 {
 		let seq = self.ring.claim();
+		self.index.insert(entry, seq, self.ring.taken());
 		self.ring.publish_with(seq, Arc::clone(entry), |prev_seq, prev| {
 			// A live window may still reach an entry above the retired
 			// watermark: keep it where validation looks once its slot is gone.
@@ -1030,6 +1034,10 @@ impl CommitPipeline {
 	/// Checks `entry`, published at `seq`, against every commit in
 	/// `(window, seq)` that its snapshot at `start_seq` does not already see.
 	/// Entries still in flight count as conflicts: they may yet commit.
+	///
+	/// Every such commit recorded its write keys in the index before it published, so once every
+	/// sequence below `seq` is published, looking up the committer's own write keys and locked
+	/// reads finds each one that wrote any of them, at a cost that does not grow with the window.
 	fn validate(
 		&self,
 		entry: &CommitEntry,
@@ -1037,30 +1045,14 @@ impl CommitPipeline {
 		start_seq: u64,
 		window: u64,
 		read_set: &[Key],
-		read_bloom: &BloomFilter,
 	) -> Result<()> {
-		let conflicts =
-			|other: &CommitEntry| other.conflicts_with(entry, start_seq, read_set, read_bloom);
-		for s in (window + 1)..seq {
-			let mut spins = 0;
-			let conflict = loop {
-				match self.ring.read(s, |other| conflicts(other)) {
-					SlotRead::Ready(conflict) => break conflict,
-					// Claimed before us but not yet published: the claimer
-					// publishes without awaiting, so this is brief.
-					SlotRead::Pending => {
-						backoff(spins);
-						spins += 1;
-					}
-					// Lapped while our window was open: it was kept in the
-					// overflow. Retired entries sit below every live window,
-					// so if it is missing, treat it conservatively.
-					SlotRead::Gone => {
-						break self.overflow.lock().get(&s).is_none_or(|other| conflicts(other));
-					}
-				}
-			};
-			if conflict {
+		// Claimed before us but not yet published: the claimer publishes
+		// without awaiting, so this is brief.
+		self.ring.wait_published_below(seq);
+		let writes = entry.keys().iter().zip(entry.hashes().iter().copied());
+		let reads = read_set.iter().map(|k| (k, key_hash(k)));
+		for (key, hash) in writes.chain(reads) {
+			if self.index.conflicts(key, hash, seq, start_seq, window) {
 				return Err(Error::TransactionWriteConflict);
 			}
 		}
@@ -2450,14 +2442,6 @@ fn encode_values(
 		return Err(Error::BatchTooLarge);
 	}
 	Ok(())
-}
-
-fn bloom_of(keys: &[Key]) -> BloomFilter {
-	let mut bloom = BloomFilter::new();
-	for k in keys {
-		bloom.insert(k);
-	}
-	bloom
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

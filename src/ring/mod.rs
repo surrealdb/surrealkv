@@ -1,6 +1,6 @@
 pub(crate) mod bench;
-mod bloom;
 mod commit_ring;
+mod index;
 mod pipeline;
 mod queue;
 pub(crate) mod sync;
