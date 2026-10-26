@@ -4,17 +4,17 @@ use std::sync::Arc;
 
 use tokio::sync::Semaphore;
 
-use super::bloom::BloomFilter;
+use super::index::{key_hash, WriteIndex};
 use super::queue::CommitEntry;
 use crate::Key;
 
 /// A committing transaction and the window of in-flight commits it validates
-/// against, all with disjoint keys so every entry is checked and none conflicts.
+/// against, all with disjoint keys so none conflicts.
 pub struct ValidateWindow {
 	entry: CommitEntry,
-	window: Vec<CommitEntry>,
+	index: WriteIndex,
+	seq: u64,
 	read_set: Vec<Key>,
-	read_bloom: BloomFilter,
 }
 
 impl ValidateWindow {
@@ -38,26 +38,27 @@ impl ValidateWindow {
 			CommitEntry::new(keys, Arc::clone(&semaphore).try_acquire_owned().unwrap())
 		};
 		let entry = entry_of(keys(keys_per_entry));
-		let window = (0..window).map(|_| entry_of(keys(keys_per_entry))).collect();
-		let read_set = keys(read_keys);
-		let mut read_bloom = BloomFilter::new();
-		for k in &read_set {
-			read_bloom.insert(k);
+		let index = WriteIndex::new();
+		for seq in 1..=window as u64 {
+			index.insert(&Arc::new(entry_of(keys(keys_per_entry))), seq, 0);
 		}
+		let read_set = keys(read_keys);
 		Self {
 			entry,
-			window,
+			index,
+			seq: window as u64 + 1,
 			read_set,
-			read_bloom,
 		}
 	}
 
-	/// Checks the committer against every entry in the window, as
+	/// Looks the committer's keys up in the index, as
 	/// `CommitPipeline::validate` does, and returns how many conflict.
 	pub fn validate(&self) -> usize {
-		self.window
-			.iter()
-			.filter(|other| other.conflicts_with(&self.entry, 0, &self.read_set, &self.read_bloom))
+		let writes = self.entry.keys().iter().zip(self.entry.hashes().iter().copied());
+		let reads = self.read_set.iter().map(|k| (k, key_hash(k)));
+		writes
+			.chain(reads)
+			.filter(|(key, hash)| self.index.conflicts(key, *hash, self.seq, 0, 0))
 			.count()
 	}
 }

@@ -223,6 +223,22 @@ impl<T: RingEntry> CommitRing<T> {
 		}
 	}
 
+	/// Waits until every sequence below `seq` is published. Each claimer
+	/// publishes without awaiting, so the wait is only ever as long as a
+	/// claim-to-publish window, unless that thread is descheduled.
+	pub(crate) fn wait_published_below(&self, seq: u64) {
+		let from = self.published.load(Ordering::Acquire).max(self.start - 1) + 1;
+		for s in from..seq {
+			let mut spins = 0;
+			// A slot only moves on to a later lap once its occupant was
+			// published, so a later sequence number means ours was too
+			while self.slot(s).seq.load(Ordering::Acquire) < s {
+				backoff(spins);
+				spins += 1;
+			}
+		}
+	}
+
 	/// Advances the contiguous published prefix as far as currently
 	/// possible.
 	pub(crate) fn advance_published(&self) {
