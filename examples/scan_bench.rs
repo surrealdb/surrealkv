@@ -35,7 +35,11 @@ async fn main() {
 	let mem = args.get(3).is_some_and(|a| a == "mem");
 	let opts = Options::default()
 		.with_path(dir.clone())
-		.with_max_memtable_size(if mem { 2 << 30 } else { 64 << 20 })
+		.with_max_memtable_size(if mem {
+			2 << 30
+		} else {
+			64 << 20
+		})
 		.with_target_file_size(16 << 20)
 		.with_block_cache_capacity(16 << 30)
 		.with_block_size(64 << 10)

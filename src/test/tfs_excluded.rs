@@ -397,7 +397,11 @@ pub(crate) static EXCLUDED: &[Rule] = &[
 /// The tests that are left out of `mem-strict` only. A pool there is refilled by what waits for
 /// spare files, which the engine's own tasks do and a test that calls `Tree::compact` or a value
 /// log directly does not.
-pub(crate) static EXCLUDED_STRICT: &[Rule] = &[rule(
-	"test::vlog_gc_tests::one_cleanup_removes_a_hundred_files_and_never_the_active_one",
-	Why::StrictByHand,
-)];
+pub(crate) static EXCLUDED_STRICT: &[Rule] = &[
+	rule(
+		"test::vlog_gc_tests::one_cleanup_removes_a_hundred_files_and_never_the_active_one",
+		Why::StrictByHand,
+	),
+	// Compacts by hand into levels of many small tables.
+	rule("test::level_scan_tests::", Why::StrictByHand),
+];

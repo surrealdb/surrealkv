@@ -781,7 +781,11 @@ impl LSMIterator for LevelIterator<'_> {
 		let user_key = InternalKey::user_key_from_encoded(target);
 		// The first table whose largest key is not before the target's user key.
 		let from = self.tables.partition_point(|table| {
-			table.meta.largest_point.as_ref().is_some_and(|largest| largest.user_key.as_slice() < user_key)
+			table
+				.meta
+				.largest_point
+				.as_ref()
+				.is_some_and(|largest| largest.user_key.as_slice() < user_key)
 		});
 		if from >= self.tables.len() {
 			self.current = None;
@@ -874,7 +878,6 @@ pub(crate) struct KMergeIterator<'iter> {
 
 	/// Whether the iterator has been initialized
 	initialized: bool,
-
 }
 
 impl<'a> KMergeIterator<'a> {
@@ -1086,7 +1089,8 @@ impl<'a> KMergeIterator<'a> {
 			} else if iter.seek(target)? {
 				// Non-current: seek to target, then advance while key <= target (need to be
 				// strictly greater)
-				while iter.valid() && compare_internal(iter.key().encoded(), target) != Ordering::Greater
+				while iter.valid()
+					&& compare_internal(iter.key().encoded(), target) != Ordering::Greater
 				{
 					if !iter.next()? {
 						break;
@@ -1115,7 +1119,9 @@ impl<'a> KMergeIterator<'a> {
 			} else if iter.seek(target)? {
 				// Non-current: seek to target, then move backward while key >= target (need to
 				// be strictly less)
-				while iter.valid() && compare_internal(iter.key().encoded(), target) != Ordering::Less {
+				while iter.valid()
+					&& compare_internal(iter.key().encoded(), target) != Ordering::Less
+				{
 					if !iter.prev()? {
 						break;
 					}
@@ -1171,8 +1177,7 @@ impl LSMIterator for KMergeIterator<'_> {
 		self.direction = MergeDirection::Forward;
 
 		for iter in &mut self.iterators {
-			if iter.seek(target)? {
-			}
+			if iter.seek(target)? {}
 		}
 
 		self.find_winner();

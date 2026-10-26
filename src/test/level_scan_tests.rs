@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tempdir::TempDir;
 use test_log::test;
 
+use super::tfs;
 use crate::{CompactRangeOptions, LSMIterator, Mode, Options, Tree};
 
 /// A tree that flushes and compacts only when a test asks, with small tables, so that a level
@@ -118,16 +119,15 @@ fn backward(it: &mut impl LSMIterator) -> Vec<(Vec<u8>, Vec<u8>)> {
 	out
 }
 
-fn within(
-	expected: &BTreeMap<Vec<u8>, Vec<u8>>,
-	lo: &[u8],
-	hi: &[u8],
-) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn within(expected: &BTreeMap<Vec<u8>, Vec<u8>>, lo: &[u8], hi: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
 	expected.range(lo.to_vec()..hi.to_vec()).map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
 #[test(tokio::test)]
 async fn a_range_reads_every_level_in_order() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("level_scan_order").unwrap();
 	let (tree, expected) = layered(dir.path()).await;
 	let txn = tree.begin_with_mode(Mode::ReadOnly).unwrap();
@@ -155,6 +155,9 @@ async fn a_range_reads_every_level_in_order() {
 
 #[test(tokio::test)]
 async fn a_range_turns_and_seeks_across_tables() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("level_scan_turns").unwrap();
 	let (tree, expected) = layered(dir.path()).await;
 	let txn = tree.begin_with_mode(Mode::ReadOnly).unwrap();
@@ -197,6 +200,9 @@ async fn a_range_turns_and_seeks_across_tables() {
 
 #[test(tokio::test)]
 async fn a_range_read_in_chunks_sees_every_entry_once() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("level_scan_chunks").unwrap();
 	let (tree, expected) = layered(dir.path()).await;
 	let txn = tree.begin_with_mode(Mode::ReadOnly).unwrap();
