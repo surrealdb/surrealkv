@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -587,6 +588,7 @@ impl MemTable {
 			current_versions: Vec::new(),
 			version_idx: 0,
 			encoded_key_buf: Vec::new(),
+			ahead: VecDeque::with_capacity(LOOKAHEAD + 1),
 		};
 
 		let _ = miter.seek_first();
@@ -666,6 +668,27 @@ pub(crate) struct MemTableIterator<'a> {
 	current_versions: Vec<(u64, &'a Value)>,
 	version_idx: usize,
 	encoded_key_buf: Vec<u8>,
+	/// The entries the range has yielded past the one the cursor is on, in the direction of
+	/// iteration: see [`LOOKAHEAD`]. Emptied whenever the range is rebuilt.
+	ahead: VecDeque<ArenaVersionedEntryRef<'a, Key, Value>>,
+}
+
+/// How many entries a memtable cursor reads ahead of the one it is on. A memtable entry is a leaf,
+/// a version node, and a key and a value on the heap, each a likely cache miss in a scan: an entry
+/// read ahead has its key and value fetched while the entries before it are read, so a scan waits
+/// on the misses of several entries at once rather than on each in turn.
+const LOOKAHEAD: usize = 4;
+
+/// Asks the processor to bring the cache line at `p` in, without waiting for it.
+#[inline(always)]
+fn prefetch(p: *const u8) {
+	#[cfg(target_arch = "x86_64")]
+	// SAFETY: a prefetch is a hint: it reads nothing and faults on no address.
+	unsafe {
+		std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p.cast());
+	}
+	#[cfg(not(target_arch = "x86_64"))]
+	let _ = p;
 }
 
 impl<'a> MemTableIterator<'a> {
@@ -688,6 +711,26 @@ impl<'a> MemTableIterator<'a> {
 		};
 		self.populate_encoded_key();
 		self.valid()
+	}
+
+	/// The next entry of the range in the cursor's direction, reading up to [`LOOKAHEAD`] entries
+	/// past it and fetching their keys and values into the cache.
+	fn pull(&mut self) -> Option<ArenaVersionedEntryRef<'a, Key, Value>> {
+		while self.ahead.len() <= LOOKAHEAD {
+			let entry = match self.direction {
+				IterDirection::Forward => self.range.next(),
+				IterDirection::Backward => self.range.next_back(),
+			};
+			let Some(entry) = entry else {
+				break;
+			};
+			prefetch(entry.key().as_ptr());
+			let value = entry.value();
+			prefetch(value.as_ptr());
+			prefetch(value.as_ptr().wrapping_add(64));
+			self.ahead.push_back(entry);
+		}
+		self.ahead.pop_front()
 	}
 
 	fn populate_encoded_key(&mut self) {
@@ -724,8 +767,9 @@ impl LSMIterator for MemTableIterator<'_> {
 		};
 		self.range = self.map.range::<_, [u8]>((Bound::Included(start), upper_bound(&self.upper)));
 		self.direction = IterDirection::Forward;
+		self.ahead.clear();
 
-		while let Some(entry) = self.range.next() {
+		while let Some(entry) = self.pull() {
 			self.position(Some(entry));
 			if entry.key().as_slice() != target_user_key {
 				return Ok(true);
@@ -747,7 +791,8 @@ impl LSMIterator for MemTableIterator<'_> {
 		self.range =
 			self.map.range::<_, [u8]>((lower_bound(&self.lower), upper_bound(&self.upper)));
 		self.direction = IterDirection::Forward;
-		let entry = self.range.next();
+		self.ahead.clear();
+		let entry = self.pull();
 		Ok(self.position(entry))
 	}
 
@@ -755,7 +800,8 @@ impl LSMIterator for MemTableIterator<'_> {
 		self.range =
 			self.map.range::<_, [u8]>((lower_bound(&self.lower), upper_bound(&self.upper)));
 		self.direction = IterDirection::Backward;
-		let entry = self.range.next_back();
+		self.ahead.clear();
+		let entry = self.pull();
 		Ok(self.position(entry))
 	}
 
@@ -776,9 +822,10 @@ impl LSMIterator for MemTableIterator<'_> {
 				.map
 				.range::<_, [u8]>((Bound::Excluded(cur.as_slice()), upper_bound(&self.upper)));
 			self.direction = IterDirection::Forward;
+			self.ahead.clear();
 		}
 
-		let entry = self.range.next();
+		let entry = self.pull();
 		Ok(self.position(entry))
 	}
 
@@ -799,9 +846,10 @@ impl LSMIterator for MemTableIterator<'_> {
 				.map
 				.range::<_, [u8]>((lower_bound(&self.lower), Bound::Excluded(cur.as_slice())));
 			self.direction = IterDirection::Backward;
+			self.ahead.clear();
 		}
 
-		let entry = self.range.next_back();
+		let entry = self.pull();
 		Ok(self.position(entry))
 	}
 

@@ -133,6 +133,8 @@ pub mod legacy_migration_tests;
 #[cfg(test)]
 pub mod level_order_crash_tests;
 #[cfg(test)]
+pub mod level_scan_tests;
+#[cfg(test)]
 pub mod level_tests;
 #[cfg(test)]
 pub mod lsm_tests;

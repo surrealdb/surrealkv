@@ -1642,6 +1642,11 @@ pub(crate) struct TableIterator<'a> {
 	/// When set, blocks are read with this comparator instead of the default.
 	/// Used for specialized iteration patterns like history queries.
 	custom_comparator: Option<Arc<dyn Comparator>>,
+
+	/// Whether every point key of the table satisfies the range's upper bound, and its lower
+	/// bound: then a step needs no check of that bound.
+	upper_holds: bool,
+	lower_holds: bool,
 }
 
 impl<'a> TableIterator<'a> {
@@ -1655,7 +1660,10 @@ impl<'a> TableIterator<'a> {
 			range,
 			exhausted: false,
 			custom_comparator: None,
-		})
+			upper_holds: false,
+			lower_holds: false,
+		}
+		.with_bounds_checked())
 	}
 
 	/// Creates a new TableIterator with a custom comparator.
@@ -1676,7 +1684,21 @@ impl<'a> TableIterator<'a> {
 			range,
 			exhausted: false,
 			custom_comparator: Some(comparator),
-		})
+			upper_holds: false,
+			lower_holds: false,
+		}
+		.with_bounds_checked())
+	}
+
+	/// Notes which bounds of the range every point key of the table satisfies: those between its
+	/// smallest and largest point keys.
+	fn with_bounds_checked(mut self) -> Self {
+		let meta = &self.table.meta;
+		self.upper_holds =
+			meta.largest_point.as_ref().is_some_and(|k| self.satisfies_upper_bound(&k.user_key));
+		self.lower_holds =
+			meta.smallest_point.as_ref().is_some_and(|k| self.satisfies_lower_bound(&k.user_key));
+		self
 	}
 
 	fn is_valid(&self) -> bool {
@@ -2253,7 +2275,9 @@ impl LSMIterator for TableIterator<'_> {
 
 		self.advance_internal()?;
 
-		if !self.is_valid() || !self.satisfies_upper_bound(self.current_user_key()) {
+		if !self.is_valid()
+			|| (!self.upper_holds && !self.satisfies_upper_bound(self.current_user_key()))
+		{
 			self.mark_exhausted();
 		}
 		Ok(self.is_valid())
@@ -2271,7 +2295,9 @@ impl LSMIterator for TableIterator<'_> {
 
 		self.prev_internal()?;
 
-		if !self.is_valid() || !self.satisfies_lower_bound(self.current_user_key()) {
+		if !self.is_valid()
+			|| (!self.lower_holds && !self.satisfies_lower_bound(self.current_user_key()))
+		{
 			self.mark_exhausted();
 		}
 		Ok(self.is_valid())
