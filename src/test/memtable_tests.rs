@@ -342,7 +342,7 @@ fn test_key_updates_with_sequence_numbers() {
 	assert!(result.is_some());
 	let (_, encoded_val) = result.unwrap();
 	assert_value(&encoded_val, b"old_value"); // Should get the value with seq_num
-	                                          // <= 8
+	                                       // <= 8
 }
 
 #[test]
@@ -812,4 +812,46 @@ fn test_excluded_bound_first_skips_all_versions() {
 	assert!(first);
 	let key = iter2.key().to_owned();
 	assert_eq!(&key.user_key, b"b", "After reset, first key should still be 'b'");
+}
+
+/// The batches of a group inserted from several threads leave the memtable as inserting them one
+/// at a time does: every key at its sequence number, and the latest sequence number of the group.
+#[test]
+fn adding_a_group_from_several_threads_is_adding_it_one_batch_at_a_time() {
+	let group = || -> Vec<Batch> {
+		(0..64u64)
+			.map(|b| {
+				let mut batch = Batch::new(1 + b * 10);
+				for e in 0..10u64 {
+					let key = format!("k{:04}", b * 10 + e).into_bytes();
+					if e % 7 == 3 {
+						batch.delete(key, 0).unwrap();
+					} else {
+						batch.set(key, format!("v{b}-{e}").into_bytes(), 0).unwrap();
+					}
+				}
+				batch
+			})
+			.collect()
+	};
+	let one_at_a_time = MemTable::new(8 << 20);
+	for mut batch in group() {
+		let needed = batch.memtable_size_estimate();
+		one_at_a_time.add_owned(&mut batch, needed).unwrap();
+	}
+	for threads in [1, 3, 8, 64] {
+		let parallel = MemTable::new(8 << 20);
+		let mut batches = group();
+		let needed = batches.iter().map(Batch::memtable_size_estimate).sum();
+		parallel.add_owned_parallel(&mut batches, needed, threads).unwrap();
+		assert_eq!(parallel.lsn(), one_at_a_time.lsn());
+		for i in 0..640u64 {
+			let key = format!("k{i:04}").into_bytes();
+			assert_eq!(
+				parallel.get(&key, None).map(|(k, v)| (k.seq_num(), k.kind(), v)),
+				one_at_a_time.get(&key, None).map(|(k, v)| (k.seq_num(), k.kind(), v)),
+				"{threads} threads, key {i}"
+			);
+		}
+	}
 }

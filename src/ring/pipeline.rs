@@ -304,6 +304,26 @@ fn try_reserve_wal(buf: &mut Vec<u8>, bytes: usize) -> Result<()> {
 	try_reserve_bytes(buf, bytes)
 }
 
+/// The fewest entries a run of a group's batches has for its batches to go into the memtable from
+/// several threads at once ([`MemTable::add_owned_parallel`]): below this, starting the threads
+/// costs more than inserting the entries one after another.
+const PARALLEL_APPLY_ENTRIES: usize = 256;
+
+/// How many threads insert a group's batches into the memtable: the flusher applies one group
+/// after another, and a group of thousands of commits waits for every one of its inserts. One in a
+/// browser, which has no threads to start.
+fn apply_threads() -> usize {
+	#[cfg(target_arch = "wasm32")]
+	return 1;
+	#[cfg(not(target_arch = "wasm32"))]
+	{
+		static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+		*THREADS.get_or_init(|| {
+			std::thread::available_parallelism().map_or(1, |n| n.get() / 8).clamp(1, 8)
+		})
+	}
+}
+
 /// Folds `permit` into `merged`, so that a group gives its admission permits back with one
 /// release, one acquisition of the semaphore's lock, rather than one per entry.
 fn merge_permit(merged: &mut Option<OwnedSemaphorePermit>, permit: Option<OwnedSemaphorePermit>) {
@@ -2061,6 +2081,22 @@ impl CommitPipeline {
 	) -> Result<(usize, ApplyStop)> {
 		let tag = active.get_wal_number();
 		let mut at = from;
+		// The batches up to the first that is oversized or logged in another segment go in at
+		// once, from several threads, if there are enough of them and the memtable has room for
+		// all of them; otherwise one at a time, below, which finds where the memtable fills.
+		let run = (from..batches.len())
+			.find(|&i| oversized[i] || segments[i] != tag)
+			.unwrap_or(batches.len());
+		let entries: usize = batches[from..run].iter().map(|batch| batch.entries.len()).sum();
+		let threads = apply_threads();
+		if threads > 1 && run - from > 1 && entries >= PARALLEL_APPLY_ENTRIES {
+			let needed = estimates[from..run].iter().sum();
+			match active.add_owned_parallel(&mut batches[from..run], needed, threads) {
+				Ok(()) => at = run,
+				Err(Error::ArenaFull) => {}
+				Err(e) => return Ok((from, ApplyStop::Torn(e))),
+			}
+		}
 		while at < batches.len() {
 			if oversized[at] {
 				return Ok((at, ApplyStop::Oversized));
