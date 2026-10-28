@@ -38,7 +38,7 @@ async fn the_memtables_hold_no_more_than_their_size_whatever_the_values_weigh() 
 		let mut tx = tree.begin().unwrap();
 		for i in 0..64 {
 			let row = chunk * 64 + i;
-			tx.set(format!("row{row:08}").as_bytes(), &vec![(row % 251) as u8; VALUE]).unwrap();
+			tx.set(format!("row{row:08}").as_bytes(), vec![(row % 251) as u8; VALUE]).unwrap();
 		}
 		tx.commit().await.unwrap();
 		most = most.max(held(&tree));
@@ -49,7 +49,7 @@ async fn the_memtables_hold_no_more_than_their_size_whatever_the_values_weigh() 
 
 	// One value larger than a memtable is written to a table of its own, not held.
 	let mut tx = tree.begin().unwrap();
-	tx.set(b"huge", &vec![7u8; 2 * MEMTABLE]).unwrap();
+	tx.set(b"huge", vec![7u8; 2 * MEMTABLE]).unwrap();
 	tx.commit().await.unwrap();
 	assert!(held(&tree) <= bound, "the memtables hold {} bytes after the huge value", held(&tree));
 
