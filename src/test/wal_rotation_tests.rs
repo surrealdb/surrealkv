@@ -974,7 +974,7 @@ fn next_commit_fits(tree: &Tree, i: usize) -> bool {
 		)
 		.unwrap();
 	let active = tree.core.inner.active_memtable.read().unwrap();
-	(active.arena_capacity() - active.size()) as u64 >= batch.memtable_size_estimate()
+	active.room() >= batch.memtable_size_estimate()
 }
 
 /// Commits single keys (from key 0) until the next one no longer fits.
@@ -1420,7 +1420,8 @@ async fn a_stale_subset_is_re_appended_as_one_group() {
 		let first = active_wal(&tree);
 		let groups = observe_groups(&tree);
 
-		let group = shape_pairs(&[Small; 24], ROTATING, 1000);
+		// The values count towards the memtable: eight more fill it once, partway through.
+		let group = shape_pairs(&[Small; 8], ROTATING, 1000);
 		let results = commit_group(
 			&tree,
 			Durability::Immediate,
@@ -1430,7 +1431,7 @@ async fn a_stale_subset_is_re_appended_as_one_group() {
 		results.iter().for_each(|r| {
 			r.as_ref().unwrap();
 		});
-		assert_eq!(groups.lock().unwrap().sizes, vec![24], "one group of 24");
+		assert_eq!(groups.lock().unwrap().sizes, vec![8], "one group of 8");
 		assert_eq!(active_wal(&tree), first + 1, "the arena filled once, partway through");
 		assert!(groups.lock().unwrap().repair_rounds > 0);
 

@@ -39,6 +39,9 @@ use crate::{BackgroundErrorReason, Durability, Error, ErrorSeverity, Mode, Optio
 
 /// A memtable that holds about 21 small commits, so that a group of 30 fills it part-way.
 const SMALL: usize = 4096;
+/// The length of the value of an ordinary commit. A memtable counts its values towards its size,
+/// so the values are short enough that a group of such commits fills a `SMALL` memtable part-way.
+const FILL: usize = 4;
 
 /// How long a scenario may take before it is declared stuck.
 const DEADLINE: Duration = Duration::from_secs(90);
@@ -156,7 +159,7 @@ type Entries = Vec<(String, Vec<u8>)>;
 
 /// Ten keys that are committed, and acknowledged, before the group.
 fn base() -> Entries {
-	(0..10).map(|i| (format!("base{i}"), vec![OLD; 40])).collect()
+	(0..10).map(|i| (format!("base{i}"), vec![OLD; FILL])).collect()
 }
 
 /// `count` commits that overwrite the first three keys of `base` and add the others.
@@ -168,7 +171,7 @@ fn numbered(count: usize) -> Entries {
 			} else {
 				format!("group{i}")
 			};
-			(key, vec![NEW; 40])
+			(key, vec![NEW; FILL])
 		})
 		.collect()
 }
@@ -616,11 +619,13 @@ async fn run(failure: Failure, mix: Mix) {
 	// Every later commit fails with the same error, and so does one in a segment of its own, which
 	// would have published a sequence number above the group's.
 	for durability in [Durability::Eventual, Durability::Immediate] {
-		let later = commit_one(Arc::clone(&tree), "later".into(), vec![NEW; 40], durability).await;
+		let later =
+			commit_one(Arc::clone(&tree), "later".into(), vec![NEW; FILL], durability).await;
 		assert_eq!(stop_error(&later, &what), errors[0], "{what} {durability:?}");
 	}
 	let _ = tree.core.inner.seal_active_wal_segment();
-	let later = commit_one(Arc::clone(&tree), "later".into(), vec![NEW; 40], Durability::Immediate);
+	let later =
+		commit_one(Arc::clone(&tree), "later".into(), vec![NEW; FILL], Durability::Immediate);
 	assert_eq!(stop_error(&later.await, &what), errors[0], "{what}");
 	assert_eq!(get(&tree, "later"), None, "{what}");
 	assert_unchanged("after later commits");
@@ -751,7 +756,7 @@ async fn deletes_of_a_failed_group_hide_nothing() {
 			match i {
 				5 => txn.delete_range(&b"base3"[..], &b"base8"[..]).unwrap(),
 				6 => txn.delete(&b"base9"[..]).unwrap(),
-				_ => txn.set(format!("group{i}").as_bytes(), &[NEW; 40]).unwrap(),
+				_ => txn.set(format!("group{i}").as_bytes(), &[NEW; FILL]).unwrap(),
 			}
 			txn.commit().await
 		}));
@@ -770,7 +775,8 @@ async fn deletes_of_a_failed_group_hide_nothing() {
 		.iter()
 		.any(|e| e.memtable.has_range_deletions() && e.memtable.get(b"base9", None).is_some());
 	assert!(tombstones_applied, "the deletes were applied before the failure");
-	let later = commit_one(Arc::clone(&tree), "later".into(), vec![NEW; 40], Durability::Immediate);
+	let later =
+		commit_one(Arc::clone(&tree), "later".into(), vec![NEW; FILL], Durability::Immediate);
 	stop_error(&later.await, "a later commit");
 	assert_eq!(scan(&tree), before, "a delete of the group hides a key readers see");
 	for (key, value) in &before {
@@ -779,9 +785,9 @@ async fn deletes_of_a_failed_group_hide_nothing() {
 
 	// The range delete covers `base3` up to, and not including, `base8`.
 	let mut expected: BTreeMap<String, Vec<u8>> =
-		[0, 1, 2, 8].iter().map(|i| (format!("base{i}"), vec![OLD; 40])).collect();
+		[0, 1, 2, 8].iter().map(|i| (format!("base{i}"), vec![OLD; FILL])).collect();
 	expected.extend(
-		(0..30).filter(|i| ![5, 6].contains(i)).map(|i| (format!("group{i}"), vec![NEW; 40])),
+		(0..30).filter(|i| ![5, 6].contains(i)).map(|i| (format!("group{i}"), vec![NEW; FILL])),
 	);
 	assert_eq!(recover_image(dir.path()), expected, "the group, deletes included, recovered whole");
 	crash(&tree);
@@ -822,10 +828,10 @@ async fn a_group_that_fails_before_anything_is_applied_does_not_stop_the_databas
 	assert!(tree.core.inner.error_handler.check_error().is_ok());
 
 	// Commits go on once the WAL rotated.
-	commit_one(Arc::clone(&tree), "later".into(), vec![NEW; 40], Durability::Immediate)
+	commit_one(Arc::clone(&tree), "later".into(), vec![NEW; FILL], Durability::Immediate)
 		.await
 		.unwrap();
-	assert_eq!(get(&tree, "later"), Some(vec![NEW; 40]));
+	assert_eq!(get(&tree, "later"), Some(vec![NEW; FILL]));
 	assert_eq!(get(&tree, "big0"), None);
 	crash(&tree);
 }
@@ -887,7 +893,7 @@ fn committers_accepted_behind_a_failing_group_all_get_the_stop_error() {
 							queued.lock().unwrap().push(handle.spawn(commit_one(
 								tree,
 								format!("queued{i}"),
-								vec![NEW; 40],
+								vec![NEW; FILL],
 								Durability::Immediate,
 							)));
 						}
@@ -975,7 +981,7 @@ fn a_writer_stalled_when_the_group_fails_is_woken_with_an_error() {
 						*writer.lock().unwrap() = Some(handle.spawn(commit_one(
 							Arc::clone(&tree),
 							"stalled".into(),
-							vec![NEW; 40],
+							vec![NEW; FILL],
 							Durability::Immediate,
 						)));
 						let started = Instant::now();
@@ -1121,7 +1127,7 @@ async fn a_compaction_cannot_replace_what_readers_see_with_what_was_never_publis
 	let tree = open(Arc::clone(&options)).await;
 
 	// The version readers see of "big10" is in a table already.
-	let old = vec![OLD; 40];
+	let old = vec![OLD; FILL];
 	commit_one(Arc::clone(&tree), "big10".into(), old.clone(), Durability::Immediate)
 		.await
 		.unwrap();
@@ -1212,7 +1218,8 @@ async fn a_restore_discards_what_a_failed_group_applied() {
 	tree.restore_from_checkpoint(&cp).unwrap();
 	assert!(in_memtables(&tree, &group).is_empty());
 	assert_eq!(scan(&tree), base().into_iter().collect());
-	let later = commit_one(Arc::clone(&tree), "later".into(), vec![NEW; 40], Durability::Immediate);
+	let later =
+		commit_one(Arc::clone(&tree), "later".into(), vec![NEW; FILL], Durability::Immediate);
 	stop_error(&later.await, "a commit after the restore");
 	crash(&tree);
 }

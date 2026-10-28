@@ -318,6 +318,15 @@ impl TaskManager {
 									core.after_background_unit();
 								}
 								rt::relax().await;
+								// One unit moves one level's worth of tables, and the
+								// wake-ups that come while it runs are dropped: work
+								// off what the strategy still picks before waiting.
+								if !stop_flag.load(Ordering::SeqCst)
+									&& core.compaction_pending(strategy.as_ref())
+								{
+									retry_wait = COMPACTION_RETRY_MIN;
+									continue;
+								}
 								break;
 							}
 							Err(e) => {

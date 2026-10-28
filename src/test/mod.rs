@@ -45,6 +45,8 @@ pub mod compact_range_tests;
 #[cfg(test)]
 pub mod compaction_crash_tests;
 #[cfg(test)]
+pub mod compaction_drain_tests;
+#[cfg(test)]
 pub mod compaction_failure_recovery_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod compaction_horizon_tests;

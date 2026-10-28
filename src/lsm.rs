@@ -10,7 +10,7 @@ use crate::batch::Batch;
 use crate::checkpoint::{CheckpointGate, CheckpointMetadata, DatabaseCheckpoint};
 use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::manual::RangeStrategy;
-use crate::compaction::CompactionStrategy;
+use crate::compaction::{CompactionChoice, CompactionStrategy};
 use crate::error::{BackgroundErrorHandler, Result};
 use crate::levels::{
 	check_manifest_before_open,
@@ -65,6 +65,15 @@ pub trait CompactionOperations: Send + Sync {
 	/// Compaction merges SSTables to reduce read amplification and remove
 	/// tombstones.
 	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()>;
+
+	/// Whether `strategy` would move tables down a level now. The level task compacts until this
+	/// is false, so a backlog left by a burst of flushes is worked off without waiting for the next
+	/// flush. A compaction of the last level into itself does not count: it does not change the
+	/// shape it was picked for, and running it again at once would only rewrite the same tables.
+	fn compaction_pending(&self, strategy: &dyn CompactionStrategy) -> bool {
+		let _ = strategy;
+		false
+	}
 
 	/// Returns a reference to the background error handler
 	fn error_handler(&self) -> Arc<BackgroundErrorHandler>;
@@ -2010,6 +2019,19 @@ impl CompactionOperations for CoreInner {
 		compactor.compact()?;
 
 		Ok(())
+	}
+
+	fn compaction_pending(&self, strategy: &dyn CompactionStrategy) -> bool {
+		if self.error_handler.commit_group_error().is_some() {
+			return false;
+		}
+		let Ok(manifest) = self.level_manifest.read() else {
+			return false;
+		};
+		matches!(
+			strategy.pick_levels(&manifest),
+			Ok(CompactionChoice::Merge(input)) if input.source_level != input.target_level
+		)
 	}
 
 	/// Returns a reference to the background error handler
