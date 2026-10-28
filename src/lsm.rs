@@ -11,7 +11,7 @@ use crate::checkpoint::{CheckpointGate, CheckpointMetadata, DatabaseCheckpoint};
 use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::manual::RangeStrategy;
 use crate::compaction::CompactionStrategy;
-use crate::error::{BackgroundErrorHandler, Result};
+use crate::error::{BackgroundErrorHandler, Result, WriteStallReason};
 use crate::levels::{
 	check_manifest_before_open,
 	plan_orphan_cleanup,
@@ -63,8 +63,9 @@ pub trait CompactionOperations: Send + Sync {
 
 	/// Performs compaction according to the specified strategy.
 	/// Compaction merges SSTables to reduce read amplification and remove
-	/// tombstones.
-	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()>;
+	/// tombstones. Returns whether tables were moved into a lower level, after which the
+	/// strategy may have more to do (see `Compactor::compact`).
+	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<bool>;
 
 	/// Returns a reference to the background error handler
 	fn error_handler(&self) -> Arc<BackgroundErrorHandler>;
@@ -109,7 +110,7 @@ pub trait CompactionOperations: Send + Sync {
 
 	/// Called with the outcome of a level compaction, so that the next one waits for as many files
 	/// as the last one needed.
-	fn compaction_ran(&self, result: &Result<()>) {
+	fn compaction_ran(&self, result: &Result<bool>) {
 		let _ = result;
 	}
 }
@@ -1984,7 +1985,7 @@ impl CompactionOperations for CoreInner {
 	/// - Merges overlapping SSTables to reduce read amplification
 	/// - Removes deleted entries to reclaim space
 	/// - Maintains the level invariants (size ratios and key ranges)
-	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()> {
+	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<bool> {
 		// A stopped database moves no table: a table may hold batches of the group that failed, and
 		// recovery has to find the group as it was left. A compaction that was already running
 		// keeps what readers can see, because it keeps every version above the visible sequence
@@ -2007,9 +2008,7 @@ impl CompactionOperations for CoreInner {
 
 		// Execute compaction according to the chosen strategy
 		let compactor = Compactor::new(options, strategy);
-		compactor.compact()?;
-
-		Ok(())
+		compactor.compact()
 	}
 
 	/// Returns a reference to the background error handler
@@ -2062,12 +2061,12 @@ impl CompactionOperations for CoreInner {
 		}
 	}
 
-	fn compaction_ran(&self, result: &Result<()>) {
+	fn compaction_ran(&self, result: &Result<bool>) {
 		if !self.pooled {
 			return;
 		}
 		match result {
-			Ok(()) => self.compaction_hint.store(COMPACTION_HINT_MIN, Ordering::Release),
+			Ok(_) => self.compaction_hint.store(COMPACTION_HINT_MIN, Ordering::Release),
 			Err(Error::FilePoolExhausted) => {
 				let hint = self.compaction_hint.load(Ordering::Acquire);
 				self.compaction_hint
@@ -2731,6 +2730,16 @@ impl Core {
 			Arc::clone(&opts),
 			Arc::clone(&write_stall),
 		));
+		// A writer stalled on level 0 asks for its compaction: a stalled writer makes no flush that
+		// would. A writer stalled on the memtables needs no such thing, as every memtable that is
+		// queued wakes the flush task, which flushes until the queue is empty. The tasks hold the
+		// controller, so it holds them weakly.
+		let tasks = Arc::downgrade(&task_manager);
+		write_stall.set_rearm(move |reason| {
+			if let (WriteStallReason::L0FileLimit, Some(tasks)) = (reason, tasks.upgrade()) {
+				tasks.wake_up_level();
+			}
+		});
 
 		// Initialize the CommitPipeline for lock-free OCC commits and background flushing.
 		let commit_pipeline = Arc::new(crate::ring::CommitPipeline::new(

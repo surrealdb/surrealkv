@@ -24,6 +24,8 @@ pub enum CompactionPriority {
 pub(crate) struct Strategy {
 	// Number of L0 files that trigger compaction
 	level0_file_num_trigger: usize,
+	// Number of L0 files at which writes stall
+	l0_stall_threshold: usize,
 	// Base size for level 1+ in bytes
 	max_bytes_for_level: u64,
 	// Size multiplier for each level
@@ -36,6 +38,7 @@ impl Default for Strategy {
 		let opts = Options::default();
 		Self {
 			level0_file_num_trigger: opts.level0_max_files,
+			l0_stall_threshold: opts.l0_stall_threshold,
 			max_bytes_for_level: opts.max_bytes_for_level,
 			level_multiplier: opts.level_multiplier,
 			compaction_priority: CompactionPriority::default(),
@@ -48,6 +51,7 @@ impl Strategy {
 	pub(crate) fn from_options(opts: Arc<Options>) -> Self {
 		Self {
 			level0_file_num_trigger: opts.level0_max_files,
+			l0_stall_threshold: opts.l0_stall_threshold,
 			max_bytes_for_level: opts.max_bytes_for_level,
 			level_multiplier: opts.level_multiplier,
 			compaction_priority: CompactionPriority::default(),
@@ -61,6 +65,7 @@ impl Strategy {
 	) -> Self {
 		Self {
 			level0_file_num_trigger: opts.level0_max_files,
+			l0_stall_threshold: opts.l0_stall_threshold,
 			max_bytes_for_level: opts.max_bytes_for_level,
 			level_multiplier: opts.level_multiplier,
 			compaction_priority: priority,
@@ -381,7 +386,13 @@ impl Strategy {
 		let l0_bytes = Self::level_bytes(&levels[0]);
 		let l0_byte_score = l0_bytes as f64 / self.max_bytes_for_level as f64;
 		let l0_score = l0_file_score.max(l0_byte_score);
-		if l0_score >= 1.0 {
+		if levels[0].tables.len() >= self.l0_stall_threshold {
+			// Writes stall at this many level 0 files, and only the compaction of level 0 lets
+			// them go: it comes before every other level, whatever their scores. A level that
+			// scores higher, such as a bottom level over its target, would otherwise be picked
+			// again and again while the writers wait.
+			scores.push((0, f64::INFINITY));
+		} else if l0_score >= 1.0 {
 			scores.push((0, l0_score));
 		}
 
