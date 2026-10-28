@@ -1545,9 +1545,9 @@ async fn allocations_per_group(
 /// still fails for a single allocation per entry from a group of 8: the gather, the encoding,
 /// the log, the apply and the completion allocate nothing per commit or per entry.
 ///
-/// The values that arrive without room to spare cost one reallocation each, which is the only
-/// allocation per entry there is: a group of `n` entries counts `n` more, no matter how its
-/// commits and entries divide it.
+/// The values that arrive without room to spare cost one reallocation each, which their committers
+/// make when they prepare the batch (`Batch::prepare_inline`), so the flusher allocates no more
+/// for them either.
 #[tokio::test]
 async fn a_group_of_small_commits_allocates_a_constant_number_of_times() {
 	if tfs::skip_listed() {
@@ -1579,15 +1579,10 @@ async fn a_group_of_small_commits_allocates_a_constant_number_of_times() {
 				size, entries, sync, false, GROUPS,
 			))
 			.await;
-			let bound = (size * entries) as u64 + PER_GROUP;
 			assert!(
-				counts.iter().all(|count| *count <= bound),
+				counts.iter().all(|count| *count <= PER_GROUP),
 				"{size} commits of {entries} entries, sync {sync}, values without room: more \
-				 than {bound} allocations a group: {counts:?}"
-			);
-			assert!(
-				counts.iter().all(|count| *count >= (size * entries) as u64),
-				"control: the reallocation of every value is counted: {counts:?}"
+				 than {PER_GROUP} allocations a group: {counts:?}"
 			);
 		}
 	}

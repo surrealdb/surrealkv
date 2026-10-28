@@ -9,7 +9,7 @@ use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 use super::commit_ring::{CommitRing, SlotRead, DEFAULT_COMMIT_RING_CAPACITY};
 use super::index::{key_hash, WriteIndex};
 use super::queue::{CommitEntry, EntryState, Payload};
-use crate::batch::Batch;
+use crate::batch::{wrap_inline, Batch};
 use crate::error::{Error, Result};
 use crate::lsm::{CoreInner, GroupShape};
 use crate::memtable::MemTable;
@@ -18,13 +18,7 @@ use crate::stall::WriteStallController;
 use crate::storage::{AffinityLogStore, LogStore};
 use crate::task::{TaskManager, FLUSH_RETRY_MAX, FLUSH_RETRY_MIN};
 use crate::varint::varint_len_u64;
-use crate::vlog::{
-	VLog,
-	ValueLocation,
-	BIT_HAS_TIMESTAMP,
-	VALUE_LOCATION_VERSION,
-	VALUE_TIMESTAMP_SIZE,
-};
+use crate::vlog::{VLog, ValueLocation};
 use crate::{InternalKey, InternalKeyKind, Key};
 
 /// Observation points inside `flush_group`, so tests can act at an exact step
@@ -936,7 +930,7 @@ impl CommitPipeline {
 	/// Commits a batch through the commit ring and the group-commit flusher.
 	pub(crate) async fn commit(
 		&self,
-		batch: Batch,
+		mut batch: Batch,
 		sync: bool,
 		start_seq: u64,
 		window: u64,
@@ -953,6 +947,13 @@ impl CommitPipeline {
 		if batch.is_empty() {
 			return self.check_conflicts(read_set, start_seq, window).await;
 		}
+
+		// The committer wraps the values and encodes the batch, so the flusher, which runs the
+		// groups one after another, only copies it. Before admission: a batch that is refused
+		// holds no permit.
+		let opts = &self.inner.opts;
+		let vlog_threshold = self.inner.vlog.is_some().then_some(opts.vlog_value_threshold);
+		batch.prepare_inline(vlog_threshold, opts.enable_versioning)?;
 
 		// Write stall backpressure
 		self.write_stall.check().await?;
@@ -1563,7 +1564,9 @@ impl CommitPipeline {
 		// failed sync fails the group before the WAL has been touched.
 		if let Some(vlog_inst) = vlog {
 			if sync {
-				vlog_inst.sync()?;
+				// A group of inline values appended nothing to the value log, which then needs no
+				// fsync of its own, and each group would otherwise pay for one.
+				vlog_inst.sync_dirty()?;
 			} else {
 				vlog_inst.flush()?;
 			}
@@ -2385,57 +2388,32 @@ fn encode_values(
 	vlog_threshold: usize,
 	stamp: bool,
 ) -> Result<()> {
+	// A batch its committer prepared has its values wrapped already, and was held to the limit.
+	if batch.prepared.is_some() {
+		return Ok(());
+	}
 	// What a value adds to `Batch::size`: its length, and the varint that gives it.
 	let value_size = |len: usize| varint_len_u64(len as u64) as u64 + len as u64;
 	let starting_seq_num = batch.starting_seq_num;
 	for (i, entry) in batch.entries.iter_mut().enumerate() {
-		if entry.kind == InternalKeyKind::RangeDelete {
-			continue;
-		}
-		let timestamp = stamp.then_some(entry.timestamp);
-		if entry.value.is_none() {
-			if let (Some(timestamp), InternalKeyKind::SoftDelete) = (timestamp, entry.kind) {
-				let mut value = Vec::new();
-				try_reserve_bytes(&mut value, 2 + VALUE_TIMESTAMP_SIZE)?;
-				value.extend_from_slice(&[BIT_HAS_TIMESTAMP, VALUE_LOCATION_VERSION]);
-				value.extend_from_slice(&timestamp.to_be_bytes());
-				batch.size = batch.size - value_size(0) + value_size(value.len());
-				entry.value = Some(value);
-			}
-			continue;
-		}
-		let value = entry.value.as_mut().expect("checked above");
-		let size_before = value_size(value.len());
-		match vlog {
-			Some(vlog) if value.len() > vlog_threshold => {
+		match (vlog, entry.value.as_mut()) {
+			(Some(vlog), Some(value))
+				if entry.kind != InternalKeyKind::RangeDelete && value.len() > vlog_threshold =>
+			{
+				let size_before = value_size(value.len());
+				let timestamp = stamp.then_some(entry.timestamp);
 				let ikey =
 					InternalKey::new(entry.key.clone(), starting_seq_num + i as u64, entry.kind);
 				let pointer = vlog.append(&ikey.encode(), value)?;
 				*value = ValueLocation::with_pointer(pointer).with_timestamp(timestamp).encode();
+				batch.size = batch.size - size_before + value_size(value.len());
 			}
 			_ => {
-				// `ValueLocation::with_inline_value(value).with_timestamp(timestamp).encode()`,
-				// without the copies.
-				let len = value.len();
-				let header = if timestamp.is_some() {
-					2 + VALUE_TIMESTAMP_SIZE
-				} else {
-					2
-				};
-				try_reserve_bytes(value, header)?;
-				value.resize(len + header, 0);
-				value.copy_within(0..len, header);
-				value[1] = VALUE_LOCATION_VERSION;
-				match timestamp {
-					Some(timestamp) => {
-						value[0] = BIT_HAS_TIMESTAMP;
-						value[2..header].copy_from_slice(&timestamp.to_be_bytes());
-					}
-					None => value[0] = 0,
+				if let Some(grown) = wrap_inline(entry, stamp)? {
+					batch.size += grown;
 				}
 			}
 		}
-		batch.size = batch.size - size_before + value_size(value.len());
 	}
 	// The bytes of every wrapped value count against the limit `add_record` enforces.
 	if batch.exceeds_max_size() {
@@ -2525,6 +2503,39 @@ mod encode_values_tests {
 					let expected = copying_reference(&batch, stamp);
 					let mut expected_bytes = Vec::new();
 					expected.encode_into(&mut expected_bytes).unwrap();
+
+					// What a committer prepares is what the flusher would log, with no value
+					// log, and with one that none of the values reaches.
+					for threshold in [None, Some(70_000)] {
+						let mut prepared = batch.clone();
+						prepared.set_starting_seq_num(0);
+						prepared.prepare_inline(threshold, stamp).unwrap();
+						assert!(prepared.prepared.is_some());
+						prepared.set_starting_seq_num(41);
+						encode_values(&mut prepared, None, usize::MAX, stamp).unwrap();
+						let mut prepared_bytes = Vec::new();
+						prepared.encode_into(&mut prepared_bytes).unwrap();
+						let what = format!(
+							"prepared stamp={stamp} entries={entries} value_len={value_len} \
+							 {kind_offset} {threshold:?}"
+						);
+						assert_eq!(prepared_bytes, expected_bytes, "{what}");
+						assert_eq!(prepared.size, expected.size, "{what}");
+						assert!(prepared.encoded_len_hint() >= prepared_bytes.len(), "{what}");
+						assert_eq!(
+							prepared.memtable_size_estimate(),
+							expected.memtable_size_estimate(),
+							"{what}"
+						);
+					}
+					// A value for the value log leaves the batch to the flusher.
+					if value_len > 8 && (0..entries).any(|i| matches!((i + kind_offset) % 6, 0 | 4))
+					{
+						let mut left = batch.clone();
+						left.prepare_inline(Some(8), stamp).unwrap();
+						assert!(left.prepared.is_none());
+						assert_eq!(left.size, batch.size);
+					}
 
 					encode_values(&mut batch, None, usize::MAX, stamp).unwrap();
 					let mut actual_bytes = Vec::new();
