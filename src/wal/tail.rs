@@ -27,9 +27,11 @@
 //!   synced, which it refuses. A segment that holds marks says how far it was synced, so a hole in
 //!   what no mark covers is cut. One without marks says nothing, so a hole in it is refused as
 //!   before marks existed: a sealed segment, and one whose head holds no mark, of a binary that
-//!   writes none or whose first page a power cut lost. A sync that completed after the last mark
-//!   was written is not told either, so a value that it made durable and that is gone since is cut,
-//!   not refused: a power cut cannot leave that, only a disk that loses synced bytes can.
+//!   writes none. One whose first page a power cut lost has no record left to check: recovery cuts
+//!   it whole, as it was never synced (`classify_wal_damage_in`). A sync that completed after the
+//!   last mark was written is not told either, so a value that it made durable and that is gone
+//!   since is cut, not refused: a power cut cannot leave that, only a disk that loses synced bytes
+//!   can.
 //!
 //! An encrypted log is held to the same rule: the records of its segment are authenticated when
 //! they are read, and an entry of a sealed file is held to its length and to the checksum of what

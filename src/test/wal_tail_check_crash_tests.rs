@@ -10,7 +10,7 @@ use test_log::test;
 use super::fs_engine_followup_tests::{options_for, pool_over};
 use super::fs_engine_tests::{commit_range, key_of, value_of, within};
 use crate::vfs::MemRaw;
-use crate::{CrashMode, Durability, Error, Mode, Tree, TreeBuilder, WalRecoveryMode};
+use crate::{CrashMode, Durability, Mode, Tree, TreeBuilder, WalRecoveryMode};
 
 const COMMITS: usize = 120;
 const VALUE: usize = 300;
@@ -137,48 +137,34 @@ async fn every_image_opens_in_salvage_mode_and_its_keys_are_values_or_nothing_in
 	.await;
 }
 
+/// Nothing in these images was synced, so the default mode finds no hole that a sync mark says
+/// was synced, nor a segment whose damage may have been synced: every image opens, with the values
+/// of a prefix of the commits and nothing else. That holds when the crash took the first page of
+/// the segment, and the leading mark with it.
 #[test(tokio::test)]
-async fn every_image_opens_in_the_default_mode_with_values_or_nothing_or_is_refused_for_a_hole() {
+async fn every_image_opens_in_the_default_mode_with_values_or_nothing() {
 	within("tolerate", async {
 		for vlog_file_size in [None, Some(2_000)] {
 			let raw = crashed(vlog_file_size).await;
-			let images = images(&raw);
-			let total = images.len();
-			let (mut opened, mut refused) = (0, 0);
-			for (what, image) in images {
+			for (what, image) in images(&raw) {
 				let what = format!("{what}, files of {vlog_file_size:?}");
 				let (fs, _pool) = pool_over(&image);
-				let opened_tree = TreeBuilder::with_options(options(
+				let tree = TreeBuilder::with_options(options(
 					&fs,
 					WalRecoveryMode::TolerateTornTail,
 					vlog_file_size,
 				))
 				.build_async()
-				.await;
-				match opened_tree {
-					Ok(tree) => {
-						opened += 1;
-						let (present, damage) = read(&tree, 0..COMMITS);
-						assert_eq!(damage, None, "{what}");
-						assert!(
-							is_a_prefix(&tree, 0..COMMITS),
-							"{what}: {present} keys that are not a prefix"
-						);
-						tree.abandon();
-					}
-					Err(error) => {
-						refused += 1;
-						// What is refused is a hole, and the error says what to do about it.
-						let text = error.to_string();
-						assert!(
-							matches!(error, Error::Other(_)) && text.contains("SalvageValidPrefix"),
-							"{what}: {text}"
-						);
-					}
-				}
+				.await
+				.unwrap_or_else(|error| panic!("{what}: {error}"));
+				let (present, damage) = read(&tree, 0..COMMITS);
+				assert_eq!(damage, None, "{what}");
+				assert!(
+					is_a_prefix(&tree, 0..COMMITS),
+					"{what}: {present} keys that are not a prefix"
+				);
+				tree.abandon();
 			}
-			assert_eq!(opened + refused, total);
-			assert!(opened > 0 && refused > 0, "opened {opened}, refused {refused} of {total}");
 		}
 	})
 	.await;
