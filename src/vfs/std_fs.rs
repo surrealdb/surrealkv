@@ -106,6 +106,161 @@ impl FsFile for StdFile {
 	}
 }
 
+/// How far [`PreallocFile`] keeps written zeros ahead of the end of the file. A multiple of the
+/// WAL's block, so that the zeros past the end are whole blocks of padding to a reader.
+///
+/// The sync after the zeros are written commits the new size of the file to the file system's
+/// journal and writes the zeros out, so it is slow, and on a file system that other processes
+/// change it waits for their changes too: zeros far ahead, in large writes, make such syncs rare.
+#[cfg(unix)]
+const PREALLOC_AHEAD: u64 = 32 * 1024 * 1024;
+
+/// The zeros [`PreallocFile`] writes ahead, a piece at a time: allocated on first use, and never
+/// touched, so the pages are the kernel's shared zero page until then.
+#[cfg(unix)]
+fn zeros() -> &'static [u8] {
+	static ZEROS: std::sync::OnceLock<Box<[u8]>> = std::sync::OnceLock::new();
+	ZEROS.get_or_init(|| vec![0; 1024 * 1024].into_boxed_slice())
+}
+
+/// A file appended to and synced over and over, which keeps a run of zeros written ahead of its end
+/// ([`Fs::open_append_preallocated`]).
+///
+/// A sync of an append that grows a file has to commit the new size of the file to the file
+/// system's journal as well as write the bytes, and on ext4 or XFS that commit is most of what the
+/// sync costs. Writing into blocks that are allocated and written already changes nothing of the
+/// file but its bytes, so a sync of them is `fdatasync` of the data alone. An append here writes at
+/// the end the file keeps itself ([`FsFile::len`]), into zeros that were written ahead of it, and
+/// writes more of them, and grows the file, only once the end comes within half of
+/// [`PREALLOC_AHEAD`] of where they stop: the sync after that commits the new size, and the many
+/// after it do not. The zeros are written, not allocated with `fallocate`: an allocated block
+/// that was never written is marked unwritten, and the write that fills it changes that mark,
+/// which the sync then commits as it would a new size.
+///
+/// The zeros reach no further than a whole number of [`crate::wal::BLOCK_SIZE`] from the start of
+/// the file, so that what follows the end reads as the padding of blocks, which a reader of the log
+/// takes as the end of it. The log cuts a segment back to its end once it is done with it
+/// ([`FsFile::trim`]), so a segment that is closed or rotated is the length it would be without
+/// them. A crash leaves them, and the replay reads them as the end of the log. Nothing is cut when
+/// the file is dropped: a handle that outlives the log that wrote through it, and is dropped once
+/// a later open has appended to the segment, would cut those appends away.
+#[cfg(unix)]
+pub(crate) struct PreallocFile {
+	file: SysFile,
+	state: parking_lot::Mutex<PreallocState>,
+}
+
+#[cfg(unix)]
+struct PreallocState {
+	/// Where the next append writes: the length of the file to everyone who asks.
+	end: u64,
+	/// Where the written zeros stop, which is the length of the file on disk. Never below `end`.
+	zeroed: u64,
+}
+
+#[cfg(unix)]
+impl PreallocFile {
+	fn new(file: SysFile) -> io::Result<Self> {
+		let end = file.metadata()?.len();
+		Ok(Self {
+			file,
+			state: parking_lot::Mutex::new(PreallocState {
+				end,
+				zeroed: end,
+			}),
+		})
+	}
+
+	/// Writes all of `buf` at `offset`, answering how much of it reached the file if that fails.
+	fn write_at(&self, buf: &[u8], offset: u64) -> std::result::Result<(), (usize, io::Error)> {
+		use std::os::unix::fs::FileExt;
+		let mut done = 0;
+		while done < buf.len() {
+			match self.file.write_at(&buf[done..], offset + done as u64) {
+				Ok(0) => return Err((done, io::ErrorKind::WriteZero.into())),
+				Ok(n) => done += n,
+				Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+				Err(e) => return Err((done, e)),
+			}
+		}
+		Ok(())
+	}
+
+	/// Writes zeros from where they stop to the block boundary at or past `to`.
+	fn zero_through(&self, state: &mut PreallocState, to: u64) -> io::Result<()> {
+		let block = crate::wal::BLOCK_SIZE as u64;
+		let to = to.div_ceil(block) * block;
+		let zeros = zeros();
+		while state.zeroed < to {
+			let n = (to - state.zeroed).min(zeros.len() as u64) as usize;
+			self.write_at(&zeros[..n], state.zeroed).map_err(|(_, e)| e)?;
+			state.zeroed += n as u64;
+		}
+		Ok(())
+	}
+}
+
+#[cfg(unix)]
+impl File for PreallocFile {
+	#[inline]
+	fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+		<SysFile as File>::read_at(&self.file, offset, buf)
+	}
+
+	fn size(&self) -> Result<u64> {
+		Ok(self.state.lock().end)
+	}
+}
+
+#[cfg(unix)]
+impl FsFile for PreallocFile {
+	fn len(&self) -> io::Result<u64> {
+		Ok(self.state.lock().end)
+	}
+
+	fn append(&self, buf: &[u8]) -> io::Result<()> {
+		let mut state = self.state.lock();
+		let end = state.end + buf.len() as u64;
+		if end + PREALLOC_AHEAD / 2 > state.zeroed {
+			// Zeros that fail to reach the file are only not there yet: the append writes at the
+			// end all the same, which grows the file as an append without them would.
+			let _ = self.zero_through(&mut state, end + PREALLOC_AHEAD);
+		}
+		let at = state.end;
+		let written = self.write_at(buf, at);
+		let done = match &written {
+			Ok(()) => buf.len(),
+			Err((done, _)) => *done,
+		};
+		state.end = at + done as u64;
+		state.zeroed = state.zeroed.max(state.end);
+		written.map_err(|(_, e)| e)
+	}
+
+	fn set_len(&self, len: u64) -> io::Result<()> {
+		let mut state = self.state.lock();
+		self.file.set_len(len)?;
+		state.end = len;
+		state.zeroed = len;
+		Ok(())
+	}
+
+	fn sync(&self) -> io::Result<()> {
+		// The data, and the size where an append or the zeros ahead grew it: `fdatasync` commits a
+		// change of size as it does the bytes, and leaves out only the times of the file.
+		self.file.sync_data()
+	}
+
+	fn trim(&self) -> io::Result<()> {
+		let mut state = self.state.lock();
+		if state.zeroed > state.end {
+			self.file.set_len(state.end)?;
+			state.zeroed = state.end;
+		}
+		Ok(())
+	}
+}
+
 /// The options a creation starts from: the permission bits, where the platform has them.
 #[cfg_attr(not(unix), allow(unused_variables))]
 fn apply_mode(options: &mut OpenOptions, opts: CreateOpts) {
@@ -211,6 +366,18 @@ impl Fs for StdFs {
 		options.read(true).write(true).create(true).append(true);
 		apply_mode(&mut options, opts);
 		Ok(Arc::new(StdFile::appending(options.open(path)?)))
+	}
+
+	#[cfg(unix)]
+	fn open_append_preallocated(
+		&self,
+		path: &Path,
+		opts: CreateOpts,
+	) -> io::Result<Arc<dyn FsFile>> {
+		let mut options = OpenOptions::new();
+		options.read(true).write(true).create(true);
+		apply_mode(&mut options, opts);
+		Ok(Arc::new(PreallocFile::new(options.open(path)?)?))
 	}
 
 	fn open_append_existing(&self, path: &Path) -> io::Result<Arc<dyn FsFile>> {

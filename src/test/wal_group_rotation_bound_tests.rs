@@ -908,8 +908,19 @@ async fn groups_at_the_default_memtable_are_the_groups_of_the_byte_rule() {
 		let handles: Vec<_> = (1..=commits).map(|c| spawn_shape(&tree, shape, c)).collect();
 		// The held group's commit is accepted and not complete.
 		until("the commits to be accepted", || pipeline.accepted_waiting() == commits + 1).await;
-		let hints: Vec<usize> =
-			(1..=commits).map(|c| shape_batch(shape, c).encoded_len_hint()).collect();
+		// The gather counts a batch as its committer prepared it (`Batch::prepare_inline`): its
+		// encoded length, with the commit's timestamp on every entry.
+		let opts = &tree.core.inner.opts;
+		let threshold = tree.core.inner.vlog.is_some().then_some(opts.vlog_value_threshold);
+		let now = opts.clock.now();
+		let hints: Vec<usize> = (1..=commits)
+			.map(|c| {
+				let mut batch = shape_batch(shape, c);
+				batch.entries.iter_mut().for_each(|entry| entry.timestamp = now);
+				batch.prepare_inline(threshold, opts.enable_versioning).unwrap();
+				batch.encoded_len_hint()
+			})
+			.collect();
 		probe.release();
 		outcome(gate).await.unwrap();
 		assert_all_acked(handles).await;

@@ -35,6 +35,9 @@ pub(crate) struct Payload {
 	pub(crate) epoch: u64,
 }
 
+/// The sequence of an entry that has not claimed one yet ([`CommitEntry::seq`]).
+pub(crate) const UNCLAIMED: u64 = u64::MAX;
+
 /// One transaction's slot in the commit ring: its write set for conflict
 /// detection, and its batch until the flusher takes it.
 pub(crate) struct CommitEntry {
@@ -43,6 +46,9 @@ pub(crate) struct CommitEntry {
 	/// Each write key's hash, by which the write index records it and the
 	/// committer looks it up.
 	hashes: Box<[u64]>,
+	/// The ring sequence the commit claimed, or [`UNCLAIMED`]: a commit records its write keys in
+	/// the write index before it claims a sequence, see `CommitPipeline::publish`.
+	seq: AtomicU64,
 	/// `IN_FLIGHT`, `ACCEPTED`, `ABORTED`, or the visible commit's highest
 	/// sequence number.
 	state: AtomicU64,
@@ -76,6 +82,7 @@ impl CommitEntry {
 		Self {
 			keys: keys.into_boxed_slice(),
 			hashes,
+			seq: AtomicU64::new(UNCLAIMED),
 			state: AtomicU64::new(IN_FLIGHT),
 			payload: Mutex::new(None),
 			cost: AtomicU64::new(0),
@@ -89,6 +96,32 @@ impl CommitEntry {
 
 	pub(crate) fn hashes(&self) -> &[u64] {
 		&self.hashes
+	}
+
+	/// The ring sequence the commit claimed, or [`UNCLAIMED`].
+	pub(crate) fn seq(&self) -> u64 {
+		self.seq.load(Ordering::Acquire)
+	}
+
+	/// Records the ring sequence the commit claimed.
+	pub(crate) fn set_seq(&self, seq: u64) {
+		debug_assert_ne!(seq, UNCLAIMED);
+		self.seq.store(seq, Ordering::Release);
+	}
+
+	/// The ring sequence of a commit that has recorded its write keys, once it has claimed one. It
+	/// claims one right after it records them, with nothing awaited between the two, so this
+	/// waits no longer than that.
+	pub(crate) fn claimed_seq(&self) -> u64 {
+		let mut spins = 0;
+		loop {
+			let seq = self.seq();
+			if seq != UNCLAIMED {
+				return seq;
+			}
+			super::sync::backoff(spins);
+			spins += 1;
+		}
 	}
 
 	/// Whether this commit writes `key`.

@@ -448,6 +448,23 @@ pub(crate) trait Fs: Send + Sync + fmt::Debug + 'static {
 	/// A file to read and append to, created if it is absent. What the write-ahead log opens.
 	fn open_append(&self, path: &Path, opts: CreateOpts) -> io::Result<Arc<dyn FsFile>>;
 
+	/// [`Self::open_append`], for a file that is appended to and synced over and over, as the
+	/// active segment of the write-ahead log is. A file system that can make such a sync cheaper
+	/// does: `StdFs` keeps a run of written zeros ahead of the end (see `std_fs::PreallocFile`), so
+	/// that a sync makes the bytes durable without a change to the file's size to commit. Every
+	/// other file system opens the file as `open_append` does.
+	///
+	/// The file may then be longer than its end, by zeros a whole number of the WAL's blocks
+	/// long, until [`FsFile::trim`] cuts it back to its end. A crash may leave them: a reader of
+	/// the log reads zeros as the padding at the end of a block.
+	fn open_append_preallocated(
+		&self,
+		path: &Path,
+		opts: CreateOpts,
+	) -> io::Result<Arc<dyn FsFile>> {
+		self.open_append(path, opts)
+	}
+
 	/// A file to read and append to that must be there already: `NotFound` if the path is absent,
 	/// and nothing is created. What the repair of a log segment and the newest file of the
 	/// value log open, which both used to open an existing file and fail if it was gone. The
@@ -577,6 +594,14 @@ pub(crate) trait FsFile: File {
 	/// Makes the bytes and the length of the file durable (`fsync`, or `flush` of a browser's
 	/// access handle, which is a barrier for ordering and not a promise about a power cut).
 	fn sync(&self) -> io::Result<()>;
+
+	/// Gives back what the file keeps past its end, the zeros of a file opened with
+	/// [`Fs::open_append_preallocated`], once nothing more is appended to it. Nothing for every
+	/// other file. The cut is not synced: a crash that undoes it leaves zeros past the end, which
+	/// read the same.
+	fn trim(&self) -> io::Result<()> {
+		Ok(())
+	}
 }
 
 /// What the write-ahead log and the tests pass where they used to pass a `std::fs::File`.

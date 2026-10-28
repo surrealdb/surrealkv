@@ -139,9 +139,12 @@ impl<T: RingEntry> CommitRing<T> {
 	}
 
 	/// Atomically claims the next sequential slot in O(1).
+	///
+	/// An acquire and release of the counter: what a claimer did before it claimed (recorded its
+	/// write keys) happens before whatever a later claimer does after it claims (looks them up).
 	#[inline(always)]
 	pub(crate) fn claim(&self) -> u64 {
-		self.next.fetch_add(1, Ordering::Relaxed)
+		self.next.fetch_add(1, Ordering::AcqRel)
 	}
 
 	/// Accesses the slot for the given sequence number in O(1).
@@ -220,22 +223,6 @@ impl<T: RingEntry> CommitRing<T> {
 			// Released after retirement, or overwritten by a later lap
 			(std::cmp::Ordering::Equal, None) | (std::cmp::Ordering::Greater, _) => SlotRead::Gone,
 			(std::cmp::Ordering::Less, _) => SlotRead::Pending,
-		}
-	}
-
-	/// Waits until every sequence below `seq` is published. Each claimer
-	/// publishes without awaiting, so the wait is only ever as long as a
-	/// claim-to-publish window, unless that thread is descheduled.
-	pub(crate) fn wait_published_below(&self, seq: u64) {
-		let from = self.published.load(Ordering::Acquire).max(self.start - 1) + 1;
-		for s in from..seq {
-			let mut spins = 0;
-			// A slot only moves on to a later lap once its occupant was
-			// published, so a later sequence number means ours was too
-			while self.slot(s).seq.load(Ordering::Acquire) < s {
-				backoff(spins);
-				spins += 1;
-			}
 		}
 	}
 

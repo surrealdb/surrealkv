@@ -314,6 +314,10 @@ pub struct Options {
 	/// Whether the plaintext segments that are written hold sync marks, see
 	/// [`RecordType::SyncMark`]. Only tests turn them off.
 	pub(crate) sync_marks: bool,
+
+	/// Whether the active plaintext segment keeps written zeros ahead of its end, so that a sync
+	/// of a commit commits no change of the file's size, see `Fs::open_append_preallocated`.
+	pub(crate) preallocate: bool,
 }
 
 impl Default for Options {
@@ -328,6 +332,7 @@ impl Default for Options {
 			file_extension: Some("wal".to_string()),
 			max_file_size: DEFAULT_FILE_SIZE,
 			sync_marks: true,
+			preallocate: false,
 		}
 	}
 }
@@ -340,6 +345,7 @@ impl Options {
 			context: WalContext::for_options(opts)?,
 			#[cfg(test)]
 			sync_marks: opts.wal_sync_marks,
+			preallocate: opts.wal_preallocate,
 			..Self::default()
 		})
 	}

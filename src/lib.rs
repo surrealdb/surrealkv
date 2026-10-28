@@ -376,6 +376,11 @@ pub struct Options {
 	/// browser, where one has to be mounted and given with `with_file_system`.
 	pub(crate) fs: Arc<dyn vfs::Fs>,
 
+	/// Whether the active segment of the WAL keeps written zeros ahead of its end, so that the
+	/// sync of a commit makes its bytes durable without committing a new size of the file, see
+	/// [`Self::with_wal_preallocation`].
+	pub(crate) wal_preallocate: bool,
+
 	/// Test-only: whether the WAL writes sync marks (`wal::RecordType::SyncMark`). On by default;
 	/// the tests that put a record at a given place in a block turn them off, as a mark in front
 	/// of it would move it.
@@ -459,6 +464,7 @@ impl Default for Options {
 			encryption_cipher: CipherPreference::default(),
 			encryption_context: None,
 			fs: vfs::options_default_fs(),
+			wal_preallocate: false,
 			#[cfg(test)]
 			wal_sync_marks: true,
 		}
@@ -488,6 +494,20 @@ impl Options {
 	/// Puts the database in `fs`. The default is the operating system's files on a native build,
 	/// and in a browser there is no default: a file system has to be mounted and given here, or
 	/// building a tree fails with an error that says so before it touches anything.
+	/// Whether the active segment of the WAL keeps zeros written ahead of its end. Off by default.
+	///
+	/// A sync of an append that grows a file commits the new size of the file to the file
+	/// system's journal, and on ext4 or XFS that is most of what the sync of a small commit costs.
+	/// With this on, the segment's records are written into zeros written ahead of them a few MiB
+	/// at a time, so most syncs are of data alone (`fdatasync`), which takes a fraction of the
+	/// time. A segment that is closed is cut back to its records; one a crash leaves holds zeros
+	/// after them, which the replay reads as the end of the log. Only a plaintext WAL on the native
+	/// file system does this.
+	pub fn with_wal_preallocation(mut self, enabled: bool) -> Self {
+		self.wal_preallocate = enabled;
+		self
+	}
+
 	pub fn with_file_system(mut self, fs: FileSystem) -> Self {
 		self.fs = fs.0;
 		self

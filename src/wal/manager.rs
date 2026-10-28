@@ -432,7 +432,12 @@ impl Wal {
 	}
 
 	fn open_wal_file(file_path: &Path, opts: &Options) -> Result<Arc<dyn FsFile>> {
-		Ok(opts.context.fs.open_append(file_path, CreateOpts::new(opts.file_mode))?)
+		let fs = &opts.context.fs;
+		let create = CreateOpts::new(opts.file_mode);
+		if opts.preallocate && !opts.context.is_sealed() {
+			return Ok(fs.open_append_preallocated(file_path, create)?);
+		}
+		Ok(fs.open_append(file_path, create)?)
 	}
 
 	#[allow(
@@ -797,6 +802,12 @@ impl Wal {
 		};
 		if trailing_mark {
 			writer.close_with_trailing_mark()?;
+			// Nothing is appended to the segment again: it is cut back to its records. Not on a
+			// drop, which leaves the segment as a crash after its fsync would: a tree dropped
+			// after another opened its directory would cut what that one appended since.
+			if let Some(file) = &self.sync_fd {
+				let _ = file.trim();
+			}
 		} else {
 			writer.close()?;
 		}
@@ -872,6 +883,10 @@ impl Wal {
 		if !sync_failed && held.is_none() {
 			before_sync()?;
 			active.sync()?;
+			// Nothing is appended to the segment again: it is cut back to its records.
+			if let Some(file) = &self.sync_fd {
+				let _ = file.trim();
+			}
 		}
 
 		tracing::debug!("WAL rotating: {:020} -> {:020}", old_log_number, new_log_number);

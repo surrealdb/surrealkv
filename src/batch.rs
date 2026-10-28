@@ -7,7 +7,14 @@ use crate::varint::{
 	put_varint_u64,
 	varint_len_u64,
 };
-use crate::vlog::{ValueLocation, ValuePointer, VALUE_POINTER_SIZE};
+use crate::vlog::{
+	ValueLocation,
+	ValuePointer,
+	BIT_HAS_TIMESTAMP,
+	VALUE_LOCATION_VERSION,
+	VALUE_POINTER_SIZE,
+	VALUE_TIMESTAMP_SIZE,
+};
 use crate::{InternalKeyKind, Key, Value};
 
 /// The most bytes a batch may encode to: a WAL record is one batch, and the LZ4 block of a
@@ -49,6 +56,57 @@ fn encoded_len_bound(size: u64, entries: usize) -> u64 {
 		.saturating_add(ENCODED_ENTRY_SLACK.saturating_mul(entries as u64))
 }
 
+/// Wraps the value of `entry` in its inline location, the form a value has in the memtable and in
+/// the WAL: `ValueLocation::with_inline_value(value).with_timestamp(timestamp).encode()`, without
+/// the copies. A soft delete of a tree that stamps its values gets a value of its timestamp alone.
+/// Answers how many bytes that adds to `Batch::size`, or `None` for an entry with nothing to
+/// wrap: a range delete, whose value is its end key, and a delete without a value.
+pub(crate) fn wrap_inline(entry: &mut BatchEntry, stamp: bool) -> Result<Option<u64>> {
+	// What a value adds to `Batch::size`: its length, and the varint that gives it.
+	let value_size = |len: usize| varint_len_u64(len as u64) as u64 + len as u64;
+	if entry.kind == InternalKeyKind::RangeDelete {
+		return Ok(None);
+	}
+	let timestamp = stamp.then_some(entry.timestamp);
+	let Some(value) = entry.value.as_mut() else {
+		let (Some(timestamp), InternalKeyKind::SoftDelete) = (timestamp, entry.kind) else {
+			return Ok(None);
+		};
+		let mut value = Vec::new();
+		reserve(&mut value, 2 + VALUE_TIMESTAMP_SIZE)?;
+		value.extend_from_slice(&[BIT_HAS_TIMESTAMP, VALUE_LOCATION_VERSION]);
+		value.extend_from_slice(&timestamp.to_be_bytes());
+		let grown = value_size(value.len()) - value_size(0);
+		entry.value = Some(value);
+		return Ok(Some(grown));
+	};
+	let len = value.len();
+	let header = if timestamp.is_some() {
+		2 + VALUE_TIMESTAMP_SIZE
+	} else {
+		2
+	};
+	reserve(value, header)?;
+	value.resize(len + header, 0);
+	value.copy_within(0..len, header);
+	value[1] = VALUE_LOCATION_VERSION;
+	match timestamp {
+		Some(timestamp) => {
+			value[0] = BIT_HAS_TIMESTAMP;
+			value[2..header].copy_from_slice(&timestamp.to_be_bytes());
+		}
+		None => value[0] = 0,
+	}
+	Ok(Some(value_size(value.len()) - value_size(len)))
+}
+
+/// Reserves exactly `additional` more bytes in `buf`, or fails with an error instead of aborting
+/// when the allocator cannot give them.
+pub(crate) fn reserve(buf: &mut Vec<u8>, additional: usize) -> Result<()> {
+	buf.try_reserve_exact(additional)
+		.map_err(|e| Error::Io(std::sync::Arc::new(std::io::Error::from(e))))
+}
+
 /// Represents a single entry in a batch
 #[derive(Debug, Clone)]
 pub(crate) struct BatchEntry {
@@ -70,6 +128,15 @@ pub(crate) struct Batch {
 	// the pipeline overwrites it before the batch is written to WAL.
 	pub(crate) starting_seq_num: u64,
 	pub(crate) size: u64, // Total size of all records (not serialized)
+	/// The encoding of the batch after its sequence number, made by the committer once every
+	/// value is wrapped in its inline location ([`Self::prepare_inline`]), so that the flusher,
+	/// which logs the groups one after another, copies it instead of encoding the batch. `None`
+	/// for a batch the flusher encodes itself: one with a value for the value log, and every
+	/// batch that is not committed through the pipeline.
+	pub(crate) prepared: Option<Vec<u8>>,
+	/// The bytes that wrapping the values in [`Self::prepare_inline`] added to `size`, which
+	/// [`Self::gather_estimate`] leaves out: it allows for the wrapping of every entry already.
+	pub(crate) wrapped: u64,
 }
 
 impl Default for Batch {
@@ -86,6 +153,8 @@ impl Batch {
 			version: BATCH_VERSION,
 			starting_seq_num,
 			size: 0,
+			prepared: None,
+			wrapped: 0,
 		}
 	}
 
@@ -114,6 +183,10 @@ impl Batch {
 	/// counts. Only a hint: `size` is not tracked for decoded batches, and a batch holding value
 	/// pointers encodes longer, in which case the buffer simply grows.
 	pub(crate) fn encoded_len_hint(&self) -> usize {
+		if let Some(body) = &self.prepared {
+			// The version and the sequence number, a varint of at most ten bytes.
+			return 1 + 10 + body.len();
+		}
 		usize::try_from(encoded_len_bound(self.size, self.entries.len())).unwrap_or(usize::MAX)
 	}
 
@@ -136,6 +209,15 @@ impl Batch {
 		// Write sequence number (8 bytes)
 		put_varint_u64(encoded, self.starting_seq_num);
 
+		match &self.prepared {
+			Some(body) => encoded.extend_from_slice(body),
+			None => self.encode_body_into(encoded),
+		}
+		Ok(())
+	}
+
+	/// The part of the encoding after the sequence number: what [`Self::prepare_inline`] keeps.
+	fn encode_body_into(&self, encoded: &mut Vec<u8>) {
 		// Write count (4 bytes)
 		put_varint_u32(encoded, self.entries.len() as u32);
 
@@ -171,7 +253,45 @@ impl Batch {
 				}
 			}
 		}
+	}
 
+	/// Wraps every value of the batch in its inline location, as the flusher would
+	/// (`encode_values`), and keeps the encoding of the batch after its sequence number, so that
+	/// the flusher has only to copy it. Run by the committer, before the batch reaches the flusher,
+	/// which runs the commit groups one after another: what is done here is done by the
+	/// committers at once instead.
+	///
+	/// A batch with a value for the value log (one longer than `vlog_threshold`, where there is
+	/// a value log) is left as it is: its values go to the value log in the order the flusher
+	/// logs them, which only the flusher knows. A batch that the wrapped values push past the
+	/// size of a WAL record is refused with `BatchTooLarge`, as the flusher would refuse it.
+	pub(crate) fn prepare_inline(
+		&mut self,
+		vlog_threshold: Option<usize>,
+		stamp: bool,
+	) -> Result<()> {
+		if let Some(threshold) = vlog_threshold {
+			let separated = self.entries.iter().any(|entry| {
+				entry.kind != InternalKeyKind::RangeDelete
+					&& entry.value.as_ref().is_some_and(|value| value.len() > threshold)
+			});
+			if separated {
+				return Ok(());
+			}
+		}
+		for entry in &mut self.entries {
+			if let Some(grown) = wrap_inline(entry, stamp)? {
+				self.size = self.size.saturating_add(grown);
+				self.wrapped = self.wrapped.saturating_add(grown);
+			}
+		}
+		if self.exceeds_max_size() {
+			return Err(Error::BatchTooLarge);
+		}
+		let mut body = Vec::new();
+		reserve(&mut body, self.encoded_len_hint())?;
+		self.encode_body_into(&mut body);
+		self.prepared = Some(body);
 		Ok(())
 	}
 
@@ -259,7 +379,8 @@ impl Batch {
 	/// more where the value log replaces a value by a pointer, which the bound does not count.
 	pub(crate) fn gather_estimate(&self) -> u64 {
 		let entries = self.entries.len() as u64;
-		let bytes = self.size.saturating_sub(entries.saturating_mul(ENTRY_OVERHEAD));
+		let size = self.size.saturating_sub(self.wrapped);
+		let bytes = size.saturating_sub(entries.saturating_mul(ENTRY_OVERHEAD));
 		entries
 			.saturating_mul(GATHER_ENTRY_BYTES)
 			.saturating_add(GATHER_BYTE_COST.saturating_mul(bytes))
@@ -407,6 +528,8 @@ impl Batch {
 			valueptrs,
 			starting_seq_num: seq_num,
 			size: 0, // Decoded batches don't track size
+			prepared: None,
+			wrapped: 0,
 		})
 	}
 }
