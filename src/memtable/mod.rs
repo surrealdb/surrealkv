@@ -353,70 +353,6 @@ impl MemTable {
 			bytes: needed,
 		};
 		self.note_vlog_pointers(batch);
-		self.insert_owned(batch)?;
-		self.update_latest_sequence_number(batch.get_highest_seq_num());
-		Ok(())
-	}
-
-	/// [`add_owned`](Self::add_owned) of every batch of `batches`, whose estimates add up to
-	/// `needed`, with their entries inserted by up to `threads` threads at once. The map takes
-	/// concurrent inserts, and the batches of one commit group write different keys at
-	/// different sequence numbers, so the order they go in is not seen.
-	///
-	/// The whole of `needed` is reserved first: on `Err(ArenaFull)` every batch is untouched, and
-	/// the caller applies them one at a time instead, which finds where the memtable fills up.
-	/// Any other error, as with `add_owned`, is a drift that cannot happen, and leaves some of
-	/// the batches spent and others not.
-	pub(crate) fn add_owned_parallel(
-		&self,
-		batches: &mut [Batch],
-		needed: u64,
-		threads: usize,
-	) -> Result<()> {
-		self.try_reserve(needed)?;
-		let _guard = ReservationGuard {
-			memtable: self,
-			bytes: needed,
-		};
-		for batch in batches.iter() {
-			self.note_vlog_pointers(batch);
-		}
-		let highest = batches.iter().map(Batch::get_highest_seq_num).max().unwrap_or_default();
-		let chunk = batches.len().div_ceil(threads.max(1));
-		// Each part waits in a slot for the thread that takes it: a part whose thread the system
-		// refuses is taken and inserted here instead, once the others have started.
-		let slots: Vec<_> =
-			batches.chunks_mut(chunk).map(|part| parking_lot::Mutex::new(Some(part))).collect();
-		let insert = |slot: &parking_lot::Mutex<Option<&mut [Batch]>>| {
-			let part = slot.lock().take();
-			part.into_iter().flatten().try_for_each(|batch| self.insert_owned(batch))
-		};
-		let failed = std::thread::scope(|scope| {
-			let workers: Vec<_> = slots
-				.iter()
-				.filter_map(|slot| {
-					std::thread::Builder::new().spawn_scoped(scope, || insert(slot)).ok()
-				})
-				.collect();
-			let mut failed = slots.iter().find_map(|slot| insert(slot).err());
-			for worker in workers {
-				let joined = match worker.join() {
-					Ok(inserted) => inserted.err(),
-					Err(_) => Some(crate::Error::Other("a memtable insert panicked".to_string())),
-				};
-				failed = failed.or(joined);
-			}
-			failed
-		});
-		if let Some(e) = failed {
-			return Err(e);
-		}
-		self.update_latest_sequence_number(highest);
-		Ok(())
-	}
-
-	/// Moves the entries of `batch` into the map, whose room is reserved.
-	fn insert_owned(&self, batch: &mut Batch) -> Result<()> {
 		let start_seq_num = batch.starting_seq_num;
 		for (i, entry) in batch.entries.iter_mut().enumerate() {
 			let seq_num = start_seq_num + i as u64;
@@ -442,6 +378,7 @@ impl MemTable {
 				return Err(crate::Error::Other("memtable size estimate drift".to_string()));
 			}
 		}
+		self.update_latest_sequence_number(batch.get_highest_seq_num());
 		Ok(())
 	}
 
