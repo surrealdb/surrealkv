@@ -2063,3 +2063,53 @@ async fn test_backward_iter_does_not_stack_overflow_on_tombstones() {
 	let items = collect_snapshot_reverse(&mut iter).unwrap();
 	assert_eq!(items.len(), 0, "all keys are tombstoned; expected empty");
 }
+
+/// A flush holds `level_manifest.write` while it waits for `immutable_memtables.write`.
+/// Collecting a snapshot's iterator state must not hold `immutable_memtables.read` while it
+/// waits for `level_manifest.read`, or the two block each other forever.
+#[test(tokio::test(flavor = "multi_thread"))]
+async fn test_collect_iter_state_does_not_block_a_flush() {
+	use std::sync::mpsc;
+	use std::thread;
+	use std::time::{Duration, Instant};
+
+	use crate::snapshot::Snapshot;
+
+	let (tree, _temp_dir) = create_store();
+	let core = Arc::clone(&tree.core);
+
+	// Act as a flush: take level_manifest.write first.
+	let manifest = core.level_manifest.write().unwrap();
+
+	// A reader collects its iterator state while the flush holds the manifest.
+	let (done_tx, done_rx) = mpsc::channel();
+	let reader_core = Arc::clone(&core);
+	let reader = thread::spawn(move || {
+		let snapshot = Snapshot::new(reader_core, 0);
+		snapshot.collect_iter_state().unwrap();
+		done_tx.send(()).unwrap();
+	});
+
+	// Give the reader time to block on the manifest.
+	thread::sleep(Duration::from_millis(200));
+
+	// The flush then needs immutable_memtables.write. The reader must not be holding it.
+	let deadline = Instant::now() + Duration::from_secs(5);
+	let immutable = loop {
+		match core.immutable_memtables.try_write() {
+			Ok(guard) => break Some(guard),
+			Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+			Err(_) => break None,
+		}
+	};
+	let flush_got_immutable = immutable.is_some();
+	drop(immutable);
+	drop(manifest);
+
+	done_rx.recv_timeout(Duration::from_secs(5)).expect("reader did not finish");
+	reader.join().unwrap();
+	assert!(
+		flush_got_immutable,
+		"collect_iter_state held immutable_memtables.read while waiting for level_manifest.read"
+	);
+}

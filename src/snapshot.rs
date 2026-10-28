@@ -152,11 +152,15 @@ impl Snapshot {
 	/// This is a helper method used by both iterators and optimized operations
 	/// like count
 	pub(crate) fn collect_iter_state(&self) -> Result<IterState> {
+		// Take the locks in the order the writers take them: active -> level_manifest ->
+		// immutable_memtables. A flush holds level_manifest.write while it waits for
+		// immutable_memtables.write, so holding immutable_memtables.read while waiting for
+		// level_manifest.read here would deadlock against it.
 		let active = guardian::ArcRwLockReadGuardian::take(Arc::clone(&self.core.active_memtable))?;
-		let immutable =
-			guardian::ArcRwLockReadGuardian::take(Arc::clone(&self.core.immutable_memtables))?;
 		let manifest =
 			guardian::ArcRwLockReadGuardian::take(Arc::clone(&self.core.level_manifest))?;
+		let immutable =
+			guardian::ArcRwLockReadGuardian::take(Arc::clone(&self.core.immutable_memtables))?;
 
 		Ok(IterState {
 			active: active.clone(),

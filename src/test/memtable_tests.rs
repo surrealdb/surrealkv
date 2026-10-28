@@ -342,7 +342,7 @@ fn test_key_updates_with_sequence_numbers() {
 	assert!(result.is_some());
 	let (_, encoded_val) = result.unwrap();
 	assert_value(&encoded_val, b"old_value"); // Should get the value with seq_num
-	                                       // <= 8
+	                                          // <= 8
 }
 
 #[test]

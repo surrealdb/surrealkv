@@ -319,7 +319,8 @@ fn test_value_location_size_calculation() {
 	// Test VLog size
 	let pointer = ValuePointer::new(1, 100, 8, 256, 0x12345);
 	let vlog_location = ValueLocation::with_pointer(pointer);
-	assert_eq!(vlog_location.encoded_size(), 1 + 1 + VALUE_POINTER_SIZE); // meta + version + pointer
+	assert_eq!(vlog_location.encoded_size(), 1 + 1 + VALUE_POINTER_SIZE); // meta + version +
+	                                                                      // pointer
 }
 
 #[test(tokio::test)]
