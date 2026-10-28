@@ -40,7 +40,9 @@ impl ValidateWindow {
 		let entry = entry_of(keys(keys_per_entry));
 		let index = WriteIndex::new();
 		for seq in 1..=window as u64 {
-			index.insert(&Arc::new(entry_of(keys(keys_per_entry))), seq, 0);
+			let writer = Arc::new(entry_of(keys(keys_per_entry)));
+			index.insert(&writer, 0);
+			writer.set_seq(seq);
 		}
 		let read_set = keys(read_keys);
 		Self {

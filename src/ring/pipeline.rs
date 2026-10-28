@@ -1015,12 +1015,15 @@ impl CommitPipeline {
 		complete_rx.await.map_err(|_| Error::PipelineStall)?
 	}
 
-	/// Claims the next ring sequence, records the write keys of `entry` in the index, and
-	/// publishes it. The keys are recorded before the slot is published, so a committer that has
-	/// seen every sequence below its own published finds them.
+	/// Records the write keys of `entry` in the index, claims the next ring sequence, stores it
+	/// in the entry and publishes it. The keys are recorded before the sequence is claimed, so a
+	/// committer that claims a later one finds them without waiting for this one to publish (see
+	/// `WriteIndex`). Nothing is awaited from the record to the store, so a committer that finds
+	/// the keys before the sequence waits only for the claim.
 	fn publish(&self, entry: &Arc<CommitEntry>) -> u64 {
+		self.index.insert(entry, self.ring.taken());
 		let seq = self.ring.claim();
-		self.index.insert(entry, seq, self.ring.taken());
+		entry.set_seq(seq);
 		self.ring.publish_with(seq, Arc::clone(entry), |prev_seq, prev| {
 			// A live window may still reach an entry above the retired
 			// watermark: keep it where validation looks once its slot is gone.
@@ -1036,9 +1039,10 @@ impl CommitPipeline {
 	/// `(window, seq)` that its snapshot at `start_seq` does not already see.
 	/// Entries still in flight count as conflicts: they may yet commit.
 	///
-	/// Every such commit recorded its write keys in the index before it published, so once every
-	/// sequence below `seq` is published, looking up the committer's own write keys and locked
-	/// reads finds each one that wrote any of them, at a cost that does not grow with the window.
+	/// Every such commit recorded its write keys in the index before it claimed its sequence, and
+	/// so before this one claimed `seq`: looking up the committer's own write keys and locked reads
+	/// finds each one that wrote any of them, at a cost that does not grow with the window, and
+	/// without waiting for the commits below `seq` that wrote none of them.
 	fn validate(
 		&self,
 		entry: &CommitEntry,
@@ -1047,9 +1051,6 @@ impl CommitPipeline {
 		window: u64,
 		read_set: &[Key],
 	) -> Result<()> {
-		// Claimed before us but not yet published: the claimer publishes
-		// without awaiting, so this is brief.
-		self.ring.wait_published_below(seq);
 		let writes = entry.keys().iter().zip(entry.hashes().iter().copied());
 		let reads = read_set.iter().map(|k| (k, key_hash(k)));
 		for (key, hash) in writes.chain(reads) {
