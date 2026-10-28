@@ -1431,7 +1431,8 @@ mod tests {
 		// rest of first block Truncate somewhere in the second block to remove Last
 		// fragment
 		let truncated_len = BLOCK_SIZE + BLOCK_SIZE / 2; // ~1.5 blocks
-		let truncated_len = truncated_len.min(file_data.len() - 100); // Ensure we're removing something
+		let truncated_len = truncated_len.min(file_data.len() - 100); // Ensure we're removing
+																	  // something
 		std::fs::write(file_path, &file_data[..truncated_len]).expect("should write file");
 
 		let file = File::open(file_path).expect("should open file");

@@ -126,7 +126,8 @@ const TRUNK_PAGE_ENTRY_SIZE: usize = 4; // 4-byte entries
 const TRUNK_PAGE_MAX_ENTRIES: usize = (PAGE_SIZE - TRUNK_PAGE_HEADER_SIZE) / TRUNK_PAGE_ENTRY_SIZE;
 
 // Constants for size calculation
-const LEAF_HEADER_SIZE: usize = 1 + 4 + 8 + 8; // type(1) + key_count(4) + next_leaf(8) + prev_leaf(8) = 21 bytes
+const LEAF_HEADER_SIZE: usize = 1 + 4 + 8 + 8; // type(1) + key_count(4) + next_leaf(8) +
+											   // prev_leaf(8) = 21 bytes
 const INTERNAL_HEADER_SIZE: usize = 1 + 4 + 4; // type(1) + key_count(4) + child_count(4) = 9 bytes
 const KEY_SIZE_PREFIX: usize = 4; // 4 bytes for key length
 const VALUE_SIZE_PREFIX: usize = 4; // 4 bytes for value length
@@ -1531,7 +1532,8 @@ impl<F: VfsFile> BPlusTree<F> {
 					let (key_on_page, key_overflow) =
 						calculate_overflow(promoted_key.len(), min_local, max_local);
 					let entry_size = KEY_SIZE_PREFIX
-						+ key_on_page + CHILD_PTR_SIZE
+						+ key_on_page
+						+ CHILD_PTR_SIZE
 						+ overflow_ptr_size(key_overflow);
 					let would_be_size = parent.current_size() + entry_size;
 					let size_threshold = InternalNode::max_size();

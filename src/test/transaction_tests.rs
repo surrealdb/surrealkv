@@ -2128,7 +2128,7 @@ async fn test_soft_delete_mixed_with_other_operations() {
 		tx.soft_delete(b"key1").unwrap(); // Soft delete
 		tx.delete(b"key2").unwrap(); // Hard delete
 		tx.set(b"key3", b"value3_updated").unwrap(); // Update
-											   // key4 remains unchanged
+													 // key4 remains unchanged
 		tx.commit().await.unwrap();
 	}
 
@@ -2708,8 +2708,8 @@ async fn test_scan_all_versions() {
 	let all_versions = collect_history_all(&mut iter).unwrap();
 
 	// Should get all versions of all keys in the range
-	assert_eq!(all_versions.len(), 6); // 2 versions of key1 + 2 versions of key2 + 1 version of key3 + 1 version of
-									// key4
+	assert_eq!(all_versions.len(), 6); // 2 versions of key1 + 2 versions of key2 + 1 version of
+									   // key3 + 1 version of key4
 
 	// Group by key to verify we have all versions
 	let mut key_versions: KeyVersionsMap = HashMap::new();
@@ -2801,7 +2801,8 @@ async fn test_scan_all_versions_with_deletes() {
 	}
 
 	// Should get all versions including soft delete markers, exclude hard-deleted keys
-	assert_eq!(all_versions.len(), 3); // 3 versions of key2 (key1 is hard deleted, soft delete marker included)
+	assert_eq!(all_versions.len(), 3); // 3 versions of key2 (key1 is hard deleted, soft delete
+									   // marker included)
 
 	// Group by key to verify we have all versions
 	let mut key_versions: KeyVersionsMap = HashMap::new();
@@ -3402,7 +3403,8 @@ mod version_tests {
 		let results =
 			scan_all_versions_via_history(&txn, &b""[..], &b"\xff\xff\xff\xff"[..]).unwrap();
 		// history() returns ALL versions, not just latest per key
-		assert_eq!(results.len(), 7); // 2 for key1 + 2 for key2 + 1 for key3 + 1 for key4 + 1 for key5
+		assert_eq!(results.len(), 7); // 2 for key1 + 2 for key2 + 1 for key3 + 1 for key4 + 1 for
+									  // key5
 
 		// Test 2: Range from key2 (inclusive) should exclude key1
 		let results =
