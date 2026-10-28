@@ -7,7 +7,8 @@ use artmap::arena::{ArenaVersionedArtMap, ArenaVersionedEntryRef, ArenaVersioned
 
 /// Upper bound on what one entry costs a memtable: the worst-case arena bytes
 /// of one insert (as reported by artmap) plus the value length. Keys and
-/// values live on the heap, so the value term is not arena space; it keeps
+/// values live on the heap: the value term is not arena space, but a memtable
+/// counts its values towards its bound (`MemTable::used`), and the term keeps
 /// the estimate proportional to the logical batch size, which is what the
 /// direct-to-L0 cutoff for oversized batches compares against.
 #[inline]
@@ -91,9 +92,9 @@ impl ImmutableMemtables {
 		self.0.iter()
 	}
 
-	/// Returns the total memory size of all immutable memtables.
+	/// Returns the bytes all immutable memtables hold: arena and values, see [`MemTable::used`].
 	pub(crate) fn total_size(&self) -> usize {
-		self.0.iter().map(|e| e.memtable.size()).sum()
+		self.0.iter().map(|e| e.memtable.used() as usize).sum()
 	}
 
 	pub(crate) fn is_empty(&self) -> bool {
@@ -138,6 +139,15 @@ pub(crate) struct MemTable {
 	/// to ensure batch-atomic insertion: a batch either fits entirely (reservation
 	/// succeeds) or the memtable is left unchanged (reservation fails with ArenaFull).
 	reserved: AtomicU64,
+	/// The bytes of the values inserted. Values live on the heap, outside the arena, and count
+	/// towards the size the memtable is bounded by ([`MemTable::used`]), so a memtable of large
+	/// values is full once it holds `max_memtable_size` of them, not only once their index fills
+	/// the arena.
+	value_bytes: AtomicU64,
+	/// Whether the values count towards the bound. Only a test that needs the arena to be what
+	/// runs out turns it off.
+	#[cfg(test)]
+	values_counted: std::sync::atomic::AtomicBool,
 	/// Tracked range tombstones: (start_key, end_key, seq_num)
 	pub(crate) range_deletions: parking_lot::RwLock<Vec<(Key, Key, u64)>>,
 	pub(crate) has_range_deletions: std::sync::atomic::AtomicBool,
@@ -173,6 +183,9 @@ impl MemTable {
 			wal_number: AtomicU64::new(0),
 			min_vlog_file_id: AtomicU32::new(u32::MAX),
 			reserved: AtomicU64::new(0),
+			value_bytes: AtomicU64::new(0),
+			#[cfg(test)]
+			values_counted: std::sync::atomic::AtomicBool::new(true),
 			range_deletions: parking_lot::RwLock::new(Vec::new()),
 			has_range_deletions: std::sync::atomic::AtomicBool::new(false),
 		}
@@ -251,8 +264,32 @@ impl MemTable {
 		self.map.is_empty()
 	}
 
+	/// The bytes of arena allocated.
 	pub(crate) fn size(&self) -> usize {
 		self.map.arena().size()
+	}
+
+	/// The bytes the memtable holds towards its bound: the arena allocated and the values
+	/// inserted. [`max_entry_bytes`] bounds what one entry adds to it.
+	pub(crate) fn used(&self) -> u64 {
+		#[cfg(test)]
+		if !self.values_counted.load(Ordering::Acquire) {
+			return self.size() as u64;
+		}
+		self.size() as u64 + self.value_bytes.load(Ordering::Acquire)
+	}
+
+	/// Bounds the memtable by its arena alone, as a memtable whose estimates fall short of the
+	/// arena is.
+	#[cfg(test)]
+	pub(crate) fn count_arena_only(&self) {
+		self.values_counted.store(false, Ordering::Release);
+	}
+
+	/// The bytes a batch may still add, next to no reservation.
+	#[cfg(test)]
+	pub(crate) fn room(&self) -> u64 {
+		(self.arena_capacity() as u64).saturating_sub(self.used())
 	}
 
 	/// Arena capacity in bytes (total, including artmap's 64-byte null region).
@@ -260,10 +297,11 @@ impl MemTable {
 		self.map.arena().capacity()
 	}
 
-	/// Whether `bytes` more fit in the arena next to the `reserved` bytes already
-	/// claimed by in-flight inserts.
+	/// Whether `bytes` more fit next to the `reserved` bytes already claimed by in-flight
+	/// inserts. The values count as well as the arena, so a batch that fits also fits the arena
+	/// alone: what an entry adds to either is bounded by its [`max_entry_bytes`].
 	fn fits(&self, bytes: u64, reserved: u64) -> bool {
-		let used = self.size() as u64;
+		let used = self.used();
 		let avail = (self.arena_capacity() as u64).saturating_sub(used).saturating_sub(reserved);
 		bytes <= avail
 	}
@@ -354,6 +392,7 @@ impl MemTable {
 		};
 		self.note_vlog_pointers(batch);
 		let start_seq_num = batch.starting_seq_num;
+		let mut value_bytes = 0u64;
 		for (i, entry) in batch.entries.iter_mut().enumerate() {
 			let seq_num = start_seq_num + i as u64;
 			if entry.kind == InternalKeyKind::RangeDelete {
@@ -365,6 +404,7 @@ impl MemTable {
 			let trailer = (seq_num << 8) | (entry.kind as u64);
 			let value = entry.value.take();
 			let has_value = value.is_some();
+			let value_len = value.as_ref().map_or(0, Vec::len) as u64;
 			// A delete stores an empty value.
 			let inserted = self.map.try_insert(
 				std::mem::take(&mut entry.key),
@@ -375,9 +415,13 @@ impl MemTable {
 				entry.key = full.key;
 				entry.value = has_value.then_some(full.value);
 				tracing::error!("ArenaFull after reservation; memtable size estimator drift");
+				self.value_bytes.fetch_add(value_bytes, Ordering::AcqRel);
 				return Err(crate::Error::Other("memtable size estimate drift".to_string()));
 			}
+			value_bytes += value_len;
 		}
+		// Counted before the reservation is released, so the bytes are never missing from both.
+		self.value_bytes.fetch_add(value_bytes, Ordering::AcqRel);
 		self.update_latest_sequence_number(batch.get_highest_seq_num());
 		Ok(())
 	}
@@ -449,7 +493,10 @@ impl MemTable {
 	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) -> Result<()> {
 		let trailer = (key.seq_num() << 8) | (key.kind() as u64);
 		match self.map.try_insert(key.user_key.clone(), trailer, value.clone()) {
-			Ok(()) => Ok(()),
+			Ok(()) => {
+				self.value_bytes.fetch_add(value.len() as u64, Ordering::AcqRel);
+				Ok(())
+			}
 			Err(_) => {
 				debug_assert!(
 					false,

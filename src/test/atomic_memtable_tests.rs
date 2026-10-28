@@ -348,9 +348,7 @@ fn add_releases_reservation_after_success() {
 
 	// Reserve every byte still available. If the previous reservation leaked,
 	// this would falsely report ArenaFull.
-	let capacity = memtable.arena_capacity() as u64;
-	let used = memtable.size() as u64;
-	let still_available = capacity - used;
+	let still_available = memtable.room();
 	memtable.try_reserve(still_available).expect("reservation leak after successful add");
 	memtable.release_reservation(still_available);
 }
@@ -437,4 +435,27 @@ fn try_reserve_zero_always_succeeds() {
 	batch.set(vec![0u8; 8], vec![0u8; 4096], 0).unwrap();
 	let _ = memtable.add(&batch); // expected to fail
 	memtable.try_reserve(0).expect("try_reserve(0) failed on full memtable");
+}
+
+#[test]
+fn values_count_towards_the_bound() {
+	// Values live on the heap, not in the arena: a memtable whose arena has room is still full
+	// once its arena and its values reach its size.
+	let memtable = MemTable::new(256 * 1024);
+	let value = vec![7u8; 16 * 1024];
+	let mut added = 0usize;
+	loop {
+		let mut batch = Batch::new(added as u64 + 1);
+		batch.set(format!("k{added:06}").into_bytes(), value.clone(), 0).unwrap();
+		match memtable.add(&batch) {
+			Ok(()) => added += 1,
+			Err(Error::ArenaFull) => break,
+			Err(e) => panic!("unexpected error: {e:?}"),
+		}
+		assert!(added < 64, "the values never filled the memtable");
+	}
+	assert_eq!(added, 15, "fifteen values of 16 KiB and their entries fit 256 KiB");
+	assert!(memtable.used() >= (added * value.len()) as u64);
+	assert!(memtable.used() <= memtable.arena_capacity() as u64);
+	assert!(memtable.size() < 16 * 1024, "the arena itself is mostly unused");
 }
