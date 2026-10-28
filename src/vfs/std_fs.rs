@@ -108,12 +108,20 @@ impl FsFile for StdFile {
 
 /// How far [`PreallocFile`] keeps written zeros ahead of the end of the file. A multiple of the
 /// WAL's block, so that the zeros past the end are whole blocks of padding to a reader.
+///
+/// The sync after the zeros are written commits the new size of the file to the file system's
+/// journal and writes the zeros out, so it is slow, and on a file system that other processes
+/// change it waits for their changes too: zeros far ahead, in large writes, make such syncs rare.
 #[cfg(unix)]
-const PREALLOC_AHEAD: u64 = 4 * 1024 * 1024;
+const PREALLOC_AHEAD: u64 = 32 * 1024 * 1024;
 
-/// The zeros [`PreallocFile`] writes ahead, a piece at a time.
+/// The zeros [`PreallocFile`] writes ahead, a piece at a time: allocated on first use, and never
+/// touched, so the pages are the kernel's shared zero page until then.
 #[cfg(unix)]
-static ZEROS: [u8; 64 * 1024] = [0; 64 * 1024];
+fn zeros() -> &'static [u8] {
+	static ZEROS: std::sync::OnceLock<Box<[u8]>> = std::sync::OnceLock::new();
+	ZEROS.get_or_init(|| vec![0; 1024 * 1024].into_boxed_slice())
+}
 
 /// A file appended to and synced over and over, which keeps a run of zeros written ahead of its end
 /// ([`Fs::open_append_preallocated`]).
@@ -124,8 +132,8 @@ static ZEROS: [u8; 64 * 1024] = [0; 64 * 1024];
 /// file but its bytes, so a sync of them is `fdatasync` of the data alone. An append here writes at
 /// the end the file keeps itself ([`FsFile::len`]), into zeros that were written ahead of it, and
 /// writes more of them, and grows the file, only once the end comes within half of
-/// [`PREALLOC_AHEAD`] of where they stop: the sync after that commits the new size, and the next
-/// few thousand do not. The zeros are written, not allocated with `fallocate`: an allocated block
+/// [`PREALLOC_AHEAD`] of where they stop: the sync after that commits the new size, and the many
+/// after it do not. The zeros are written, not allocated with `fallocate`: an allocated block
 /// that was never written is marked unwritten, and the write that fills it changes that mark,
 /// which the sync then commits as it would a new size.
 ///
@@ -182,9 +190,10 @@ impl PreallocFile {
 	fn zero_through(&self, state: &mut PreallocState, to: u64) -> io::Result<()> {
 		let block = crate::wal::BLOCK_SIZE as u64;
 		let to = to.div_ceil(block) * block;
+		let zeros = zeros();
 		while state.zeroed < to {
-			let n = (to - state.zeroed).min(ZEROS.len() as u64) as usize;
-			self.write_at(&ZEROS[..n], state.zeroed).map_err(|(_, e)| e)?;
+			let n = (to - state.zeroed).min(zeros.len() as u64) as usize;
+			self.write_at(&zeros[..n], state.zeroed).map_err(|(_, e)| e)?;
 			state.zeroed += n as u64;
 		}
 		Ok(())
