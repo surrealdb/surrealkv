@@ -3499,8 +3499,9 @@ async fn a_group_applied_before_a_restore_publishes_nothing_after_it() {
 }
 
 /// A writer that waits for level-0 files to be compacted resumes when a restore replaces them by
-/// fewer: the restore changes what the stall waits on, and nothing else will wake the writer on an
-/// idle tree.
+/// fewer. The stalled writer also asks for the compaction of level 0, which may end the stall
+/// before the restore, or run while it does: either way the writer is not left waiting, and the
+/// tree is not left stalled.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_writer_stalled_on_level_zero_files_resumes_when_a_restore_removes_them() {
 	if tfs::skip_listed() {
@@ -3527,10 +3528,11 @@ async fn a_writer_stalled_on_level_zero_files_resumes_when_a_restore_removes_the
 	assert_eq!(table_ids(&tree).len(), 3, "setup: the tree is at its level-0 stall threshold");
 
 	let writer = commit_task(&tree, "stalled_writer");
-	let deadline = Instant::now() + WATCHDOG;
-	while !tree.core.write_stall.is_stalled() {
-		assert!(Instant::now() < deadline, "setup: the writer never stalled");
-		tokio::time::sleep(Duration::from_millis(2)).await;
+	// The compaction the writer asks for can end the stall at once, so it is not waited for.
+	let deadline = Instant::now() + Duration::from_millis(500);
+	while !tree.core.write_stall.is_stalled() && !writer.is_finished() && Instant::now() < deadline
+	{
+		tokio::time::sleep(Duration::from_millis(1)).await;
 	}
 
 	let restoring = restore_call(&tree, &ckpt);
@@ -3540,7 +3542,12 @@ async fn a_writer_stalled_on_level_zero_files_resumes_when_a_restore_removes_the
 		.await
 		.expect("the stalled writer never resumed after the restore removed what it waited on")
 		.unwrap();
-	outcome.expect("the writer that was stalled commits once the restore is over");
+	// A writer the compaction let go before the restore may have its group in flight when the
+	// restore replaces the database, which refuses the group, as it does any such group.
+	assert!(
+		outcome.is_ok() || is_stall(&outcome),
+		"the writer that was stalled commits, or its group is refused by the restore: {outcome:?}"
+	);
 	assert!(!tree.core.write_stall.is_stalled(), "the tree is still stalled after the restore");
 	let mut t = txn(&tree);
 	t.set(&b"after"[..], &b"the stall"[..]).unwrap();
