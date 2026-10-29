@@ -152,6 +152,8 @@ pub mod manifest_write_failure_tests;
 pub mod manifest_write_retry_tests;
 #[cfg(test)]
 pub mod manifest_write_stop_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod memtable_memory_tests;
 #[cfg(test)]
 pub mod memtable_tests;
 #[cfg(test)]

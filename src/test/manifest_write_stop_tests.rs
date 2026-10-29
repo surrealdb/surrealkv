@@ -29,6 +29,9 @@ use crate::{Durability, Error, Mode, Options, Result, Tree};
 
 /// A memtable that holds about 21 small commits.
 const SMALL: usize = 4096;
+/// The length of the value of an ordinary commit. A memtable counts its values towards its size,
+/// so the values are short enough that a group of such commits fills a `SMALL` memtable part-way.
+const FILL: usize = 4;
 
 fn open(path: &Path, max_memtable_size: usize) -> Arc<Tree> {
 	let tree = Arc::new(
@@ -70,7 +73,7 @@ async fn commit_group(tree: &Arc<Tree>, entries: &[(String, Vec<u8>)]) -> Vec<Re
 }
 
 fn base() -> Vec<(String, Vec<u8>)> {
-	(0..10).map(|i| (format!("base{i}"), vec![b'b'; 40])).collect()
+	(0..10).map(|i| (format!("base{i}"), vec![b'b'; FILL])).collect()
 }
 
 /// Twenty commits with an oversized one in the middle: it bypasses the memtable, and the memtable
@@ -79,7 +82,7 @@ fn group_with_oversized() -> Vec<(String, Vec<u8>)> {
 	(0..20)
 		.map(|i| match i {
 			10 => ("big10".to_string(), vec![b'g'; SMALL + 1000]),
-			_ => (format!("group{i}"), vec![b'g'; 40]),
+			_ => (format!("group{i}"), vec![b'g'; FILL]),
 		})
 		.collect()
 }
@@ -136,7 +139,7 @@ async fn a_flush_that_succeeds_after_a_group_stopped_the_database_does_not_end_t
 	fail_replacements(&manifest, ReplaceFailure::BeforeRename, 0, 1);
 	tree.core.inner.rotate_memtable().unwrap();
 	// What is committed after the rotation stays in the active memtable, to be queued later.
-	commit_one(Arc::clone(&tree), "later".into(), vec![b'l'; 40]).await.unwrap();
+	commit_one(Arc::clone(&tree), "later".into(), vec![b'l'; FILL]).await.unwrap();
 	tree.core.task_manager.lock().unwrap().as_ref().unwrap().wake_up_memtable();
 	assert!(retry.is_reached(), "the failed flush is retried");
 	let flush_error = tree.core.inner.error_handler.get_error().unwrap();
@@ -160,7 +163,7 @@ async fn a_flush_that_succeeds_after_a_group_stopped_the_database_does_not_end_t
 		"the task ended the error of the flush"
 	);
 	assert_stopped(&tree, "after the flush");
-	let commit = commit_one(Arc::clone(&tree), "after".into(), vec![b'a'; 40]).await;
+	let commit = commit_one(Arc::clone(&tree), "after".into(), vec![b'a'; FILL]).await;
 	assert!(
 		matches!(commit.as_ref().map_err(Error::poisoned_by), Err(Error::DatabaseStopped(_))),
 		"{commit:?}"
@@ -216,7 +219,7 @@ async fn a_failed_manifest_write_in_the_flush_before_a_direct_write_stops_the_da
 
 	// The group poisoned the database: a commit after it does not start, and recovery does not
 	// find it.
-	let later = commit_one(Arc::clone(&tree), "later".to_string(), vec![b'l'; 40]).await;
+	let later = commit_one(Arc::clone(&tree), "later".to_string(), vec![b'l'; FILL]).await;
 	match &later {
 		Err(Error::DatabasePoisoned(cause)) => {
 			assert!(matches!(**cause, Error::DatabaseStopped(_)), "{later:?}")
@@ -277,7 +280,7 @@ async fn a_commit_to_a_database_poisoned_by_an_uncertain_manifest_write_does_not
 	);
 	assert!(severity >= ErrorSeverity::FatalError, "{severity:?}");
 
-	let poisoned = commit_one(Arc::clone(&tree), "after".to_string(), vec![b'r'; 40])
+	let poisoned = commit_one(Arc::clone(&tree), "after".to_string(), vec![b'r'; FILL])
 		.await
 		.expect_err("a poisoned database fails a commit");
 	assert!(

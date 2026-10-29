@@ -940,14 +940,22 @@ async fn a_batch_that_overflows_the_memtable_in_the_middle_of_a_group_is_applied
 	let capacity = tree.core.inner.active_memtable.read().unwrap().arena_capacity();
 	assert!(capacity >= SMALL_MEMTABLE, "the arena is as big as the memtable size");
 
-	let first_ops = vec![Op::Set(b"first".to_vec(), vec![0xA1; 10], 1)];
+	// The first batch holds more than the third may take, so that the second, which leaves room
+	// for the third in an empty memtable, does not fit after the first.
+	let first_ops = vec![Op::Set(b"first".to_vec(), vec![0xA1; 3000], 1)];
+	let third_ops = vec![Op::Set(b"third".to_vec(), vec![0xC3; 20], 3)];
 	let key = b"second".to_vec();
 	// What the group logs is encoded, so what is probed is too.
 	let first = copied_batch(&raw_batch(&first_ops, 0, 1));
-	let value_len = overflowing_value_len(&first, key.len()) - 2;
-	let second_ops = vec![Op::Set(key, vec![0xB2; value_len], 2)];
+	let third = copied_batch(&raw_batch(&third_ops, 0, 1)).memtable_size_estimate() as usize;
+	let value_len = overflowing_value_len(&first, key.len()) - third;
+	let second_ops = vec![Op::Set(key.clone(), vec![0xB2; value_len], 2)];
+	let after_first = MemTable::new(SMALL_MEMTABLE);
+	after_first.add(&first).unwrap();
+	let second = copied_batch(&raw_batch(&second_ops, 0, 2)).memtable_size_estimate();
+	assert!(!after_first.can_fit(second), "the second batch does not fit after the first");
 
-	let group = vec![first_ops, second_ops, vec![Op::Set(b"third".to_vec(), vec![0xC3; 20], 3)]];
+	let group = vec![first_ops, second_ops, third_ops];
 	let batches = stamped(&tree, &group);
 	tree.core.commit_pipeline.flush_group(&batches, true).await.unwrap();
 	publish_all(&tree);
@@ -1048,16 +1056,19 @@ async fn a_value_log_group_is_sized_after_its_values_are_replaced_by_pointers() 
 		publish_all(&tree);
 
 		let tables = tree.core.inner.level_manifest.read().unwrap().get_all_tables().len();
-		assert_eq!(
-			tables,
-			if vlog {
-				0
-			} else {
-				2
-			},
-			"vlog={vlog}: only without the value log is the huge value too big for a memtable, and \
-			 then it is written to a table after the memtable of the batches before it"
-		);
+		if vlog {
+			assert_eq!(
+				tables, 0,
+				"vlog={vlog}: with the value log nothing is too big for a memtable"
+			);
+		} else {
+			// The inline values of the batches before it fill more than one memtable.
+			assert!(
+				tables >= 2,
+				"vlog={vlog}: only without the value log is the huge value too big for a memtable, \
+				 and then it is written to a table after the memtables of the batches before it"
+			);
+		}
 		assert!(
 			!records_by_sequence(dir.path()).is_empty(),
 			"vlog={vlog}: control: the WAL holds the group"
@@ -1344,7 +1355,7 @@ fn add_owned_leaves_the_memtable_as_add_does() {
 	}
 
 	// The reservation was given back: all that is left of the arena can still be claimed.
-	let left = (by_add_owned.arena_capacity() - by_add_owned.size()) as u64;
+	let left = by_add_owned.room();
 	assert!(by_add_owned.can_fit(left));
 }
 
@@ -1387,7 +1398,7 @@ fn add_owned_leaves_a_batch_that_does_not_fit_untouched() {
 	assert_eq!(memtable.lsn(), lsn);
 	assert_eq!(contents(&memtable), kept);
 	assert_eq!(*memtable.range_deletions.read(), ranges);
-	assert!(memtable.can_fit((memtable.arena_capacity() - memtable.size()) as u64));
+	assert!(memtable.can_fit(memtable.room()));
 }
 
 /// `add_owned` trusts the size it is given. If that size was too small and the arena runs out
@@ -1431,7 +1442,7 @@ fn add_owned_reports_a_drifting_estimate_as_an_error_that_is_not_arena_full() {
 	assert_eq!(memtable.lsn(), 0, "the sequence number is only published for a whole batch");
 	assert_eq!(contents(&memtable).len(), failed);
 	// The reservation is given back all the same.
-	assert!(memtable.can_fit((memtable.arena_capacity() - memtable.size()) as u64));
+	assert!(memtable.can_fit(memtable.room()));
 }
 
 // ---------------------------------------------------------------------------

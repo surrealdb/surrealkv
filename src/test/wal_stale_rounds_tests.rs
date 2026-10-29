@@ -75,19 +75,27 @@ where
 	F: Future<Output = ()> + Send + 'static,
 {
 	let (tx, rx) = mpsc::channel();
-	std::thread::spawn(move || {
-		let mut builder = if multi_thread {
-			let mut builder = tokio::runtime::Builder::new_multi_thread();
-			builder.worker_threads(4);
-			builder
-		} else {
-			tokio::runtime::Builder::new_current_thread()
-		};
-		let runtime = builder.enable_all().build().unwrap();
-		let outcome =
-			std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(scenario)));
-		let _ = tx.send(outcome);
-	});
+	// Named after the test, so that over a pool the scenario has the test's own (`tfs`), not
+	// the pool of whichever test asked for one last.
+	let name = std::thread::current().name().map(str::to_string);
+	let builder =
+		name.map_or_else(std::thread::Builder::new, |name| std::thread::Builder::new().name(name));
+	builder
+		.spawn(move || {
+			let mut builder = if multi_thread {
+				let mut builder = tokio::runtime::Builder::new_multi_thread();
+				builder.worker_threads(4);
+				builder
+			} else {
+				tokio::runtime::Builder::new_current_thread()
+			};
+			let runtime = builder.enable_all().build().unwrap();
+			let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+				runtime.block_on(scenario)
+			}));
+			let _ = tx.send(outcome);
+		})
+		.expect("the scenario thread starts");
 	match rx.recv_timeout(DEADLINE) {
 		Ok(Ok(())) => {}
 		Ok(Err(panic)) => std::panic::resume_unwind(panic),
