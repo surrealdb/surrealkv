@@ -1,8 +1,10 @@
-//! Tests that a compaction does not fill the block cache with the blocks of the tables it merges.
+//! Tests that the block cache does not fill with the blocks of the tables that a compaction merges.
 //!
 //! Those tables are deleted when the compaction finishes, and their blocks are keyed by table
-//! instance, so nothing reads them from the cache again. Put there, they would only take the
-//! place of blocks that readers use, and under a steady write load keep the cache at its capacity.
+//! instance, so nothing reads them from the cache again. Kept there, they would only take the
+//! place of blocks that readers use, and under a steady write load keep the cache at its capacity:
+//! a compaction does not put the blocks it reads into the cache, and drops the entries that
+//! readers put there for the tables it merged.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -68,6 +70,30 @@ fn a_scan_without_cache_fill_leaves_the_cache_as_it_was() {
 	assert_eq!(again.data_hits, 0);
 	assert_eq!(again.data_misses, stats.data_misses);
 	assert_eq!(again.data_inserts, 0);
+}
+
+#[test]
+fn removed_tables_leave_the_cache_and_the_others_stay() {
+	let opts = Arc::new(Options::default());
+	let file = write_table(&opts);
+	let a = Table::new(1, Arc::clone(&opts), Arc::new(file.clone()), file.len() as u64).unwrap();
+	let b = Table::new(2, Arc::clone(&opts), Arc::new(file.clone()), file.len() as u64).unwrap();
+	assert_eq!(scan(&a, true), KEYS);
+	assert_eq!(scan(&b, true), KEYS);
+	let both = opts.block_cache.weight();
+
+	opts.block_cache.remove_tables(&[a.cache_id()]);
+	assert!(opts.block_cache.weight() < both);
+
+	opts.block_cache.reset_stats();
+	assert_eq!(scan(&b, true), KEYS);
+	let stats = opts.block_cache.get_stats();
+	assert_eq!(stats.data_misses, 0, "the blocks of the table that stays were removed");
+	opts.block_cache.reset_stats();
+	assert_eq!(scan(&a, true), KEYS);
+	let stats = opts.block_cache.get_stats();
+	assert_eq!(stats.data_hits, 0, "the blocks of the removed table are still there");
+	assert_eq!(opts.block_cache.weight(), both);
 }
 
 #[test]
@@ -141,6 +167,35 @@ async fn a_compaction_puts_no_data_block_into_the_cache() {
 
 	// Readers still fill it.
 	let txn = tree.begin().unwrap();
+	tree.core.opts.block_cache.reset_stats();
 	assert_eq!(txn.get(b"key00007").unwrap(), Some(format!("new-{}", "x".repeat(64)).into_bytes()));
 	assert!(tree.core.opts.block_cache.get_stats().data_inserts > 0);
+}
+
+#[test(tokio::test)]
+async fn a_compaction_drops_the_entries_of_the_tables_it_merged() {
+	let dir = TempDir::new("compaction_cache_drop").unwrap();
+	let tree = quiet(dir.path()).await;
+	let cache = &tree.core.opts.block_cache;
+
+	// Readers fill the cache from a table in level 1.
+	put(&tree, "old").await;
+	tree.compact_range(None, None, &no_flush_target(1)).unwrap();
+	let opened = cache.weight();
+	let txn = tree.begin().unwrap();
+	for i in 0..KEYS {
+		txn.get(format!("key{i:05}").as_bytes()).unwrap().unwrap();
+	}
+	drop(txn);
+	let read = cache.weight();
+	assert!(read > opened, "the reads put blocks into the cache");
+
+	// A compaction merges that table with newer versions of its keys.
+	put(&tree, "new").await;
+	tree.compact_range(None, None, &no_flush_target(2)).unwrap();
+	assert!(
+		cache.weight() <= opened,
+		"the cache kept entries of the merged table: {} bytes, {opened} before the reads",
+		cache.weight()
+	);
 }

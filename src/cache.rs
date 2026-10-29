@@ -132,6 +132,26 @@ impl BlockCache {
 		self.data.clear();
 	}
 
+	/// Drops the blocks, index and filter partitions of the table instances `ids` (see
+	/// `next_instance_id`), which a compaction does for the tables it merged: once they are out of
+	/// the manifest, no new reader opens them, and their entries would only take the place of the
+	/// entries of live tables until the cache evicted them.
+	///
+	/// A reader that still holds one of the tables can put its blocks back; they are evicted as any
+	/// other entry is.
+	pub(crate) fn remove_tables(&self, ids: &[u64]) {
+		if ids.is_empty() {
+			return;
+		}
+		self.data.retain(|key, _| key.kind == KIND_VLOG || !ids.contains(&key.id));
+	}
+
+	/// Returns the number of bytes the entries of the cache weigh.
+	#[cfg(test)]
+	pub(crate) fn weight(&self) -> u64 {
+		self.data.weight()
+	}
+
 	/// Returns the capacity of the cache in bytes.
 	#[cfg(test)]
 	pub(crate) fn capacity(&self) -> u64 {

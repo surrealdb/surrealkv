@@ -1128,6 +1128,12 @@ impl Table {
 		}
 	}
 
+	/// The identity under which the table keeps its entries in the block cache, see
+	/// `BlockCache::remove_tables`.
+	pub(crate) fn cache_id(&self) -> u64 {
+		self.cache_id
+	}
+
 	/// Reads a data block, using cache if available.
 	pub(crate) fn read_block(&self, location: &BlockHandle) -> Result<Arc<Block>> {
 		// Check cache first
