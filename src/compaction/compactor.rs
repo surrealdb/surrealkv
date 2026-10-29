@@ -128,13 +128,19 @@ impl Compactor {
 		}
 	}
 
-	pub(crate) fn compact(&self) -> Result<()> {
+	/// Runs the compaction the strategy picks, if any. Returns whether it moved tables into a
+	/// lower level, after which the strategy may have more to do. A merge within the bottom level
+	/// does not count: it can be picked again for as long as that level is over its target.
+	pub(crate) fn compact(&self) -> Result<bool> {
 		let levels_guard = self.options.level_manifest.write()?;
 		let choice = self.strategy.pick_levels(&levels_guard)?;
 
 		match choice {
-			CompactionChoice::Merge(input) => self.merge_tables(levels_guard, &input),
-			CompactionChoice::Skip => Ok(()),
+			CompactionChoice::Merge(input) => {
+				let moved_down = input.target_level > input.source_level;
+				self.merge_tables(levels_guard, &input).map(|()| moved_down)
+			}
+			CompactionChoice::Skip => Ok(false),
 		}
 	}
 

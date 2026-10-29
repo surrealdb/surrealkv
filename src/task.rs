@@ -29,17 +29,11 @@ pub(crate) struct TaskManager {
 	/// Flag to signal tasks to stop
 	stop_flag: Arc<AtomicBool>,
 
-	/// Notification for memtable compaction task
-	memtable_notify: Arc<Notify>,
+	/// Wakes the memtable flush task
+	memtable: Arc<TaskSignal>,
 
-	/// Notification for level compaction task
-	level_notify: Arc<Notify>,
-
-	/// Flag indicating if memtable compaction is running
-	memtable_running: Arc<AtomicBool>,
-
-	/// Flag indicating if level compaction is running
-	level_running: Arc<AtomicBool>,
+	/// Wakes the level compaction task
+	level: Arc<TaskSignal>,
 
 	/// Task handles for cleanup
 	task_handles: Mutex<Option<Vec<rt::JoinHandle<()>>>>,
@@ -49,6 +43,50 @@ pub(crate) struct TaskManager {
 	/// has such a wait, and a database on `std` has none of this: no allocation at open and no
 	/// lock at close.
 	stop_notify: Option<Arc<Notify>>,
+}
+
+/// Wakes a background task, and keeps a wakeup that comes while the task runs.
+///
+/// A task runs in passes. A wakeup while no pass runs wakes the task; a wakeup during a pass is
+/// recorded and asks for one more pass once this one ends, since the pass may have looked at the
+/// state before the work the wakeup is for was there. Wakeups are coalesced, never dropped: a
+/// dropped one can leave writers stalled for good, because a writer that is stalled makes no
+/// flush that would wake the task again.
+#[derive(Default)]
+pub(crate) struct TaskSignal {
+	notify: Notify,
+	/// Whether a pass runs
+	running: AtomicBool,
+	/// Whether a wakeup came since the running pass began
+	pending: AtomicBool,
+}
+
+impl TaskSignal {
+	pub(crate) fn wake(&self) {
+		// `pending` is set before `running` is read, and a pass that ends clears `running` before
+		// it reads `pending`: either the pass sees the wakeup, or the wakeup sees no pass and
+		// wakes the task.
+		self.pending.store(true, Ordering::SeqCst);
+		if !self.running.load(Ordering::SeqCst) {
+			self.notify.notify_one();
+		}
+	}
+
+	/// Begins a pass: it serves the wakeups that came before it.
+	fn begin(&self) {
+		self.running.store(true, Ordering::SeqCst);
+		self.pending.store(false, Ordering::SeqCst);
+	}
+
+	/// Ends a pass. Returns whether a wakeup came during it, which asks for another pass.
+	fn end(&self) -> bool {
+		self.running.store(false, Ordering::SeqCst);
+		self.pending.swap(false, Ordering::SeqCst)
+	}
+
+	pub(crate) fn is_running(&self) -> bool {
+		self.running.load(Ordering::Acquire)
+	}
 }
 
 /// How a wait for the spare files of a pool ended, for a task.
@@ -94,8 +132,8 @@ async fn await_spares(
 impl fmt::Debug for TaskManager {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("TaskManager")
-			.field("memtable_running", &self.memtable_running.load(Ordering::Acquire))
-			.field("level_running", &self.level_running.load(Ordering::Acquire))
+			.field("memtable_running", &self.memtable.is_running())
+			.field("level_running", &self.level.is_running())
 			.finish()
 	}
 }
@@ -107,10 +145,8 @@ impl TaskManager {
 		write_stall: Arc<WriteStallController>,
 	) -> Self {
 		let stop_flag = Arc::new(AtomicBool::new(false));
-		let memtable_notify = Arc::new(Notify::new());
-		let level_notify = Arc::new(Notify::new());
-		let memtable_running = Arc::new(AtomicBool::new(false));
-		let level_running = Arc::new(AtomicBool::new(false));
+		let memtable = Arc::new(TaskSignal::default());
+		let level = Arc::new(TaskSignal::default());
 		let task_handles = Mutex::new(Some(Vec::new()));
 		// Everything that only a pool needs is done behind this, so that the tasks of a database on
 		// `std` do exactly what they did.
@@ -121,9 +157,8 @@ impl TaskManager {
 		{
 			let core = Arc::clone(&core);
 			let stop_flag = Arc::clone(&stop_flag);
-			let notify = Arc::clone(&memtable_notify);
-			let running = Arc::clone(&memtable_running);
-			let level_notify = Arc::clone(&level_notify);
+			let signal = Arc::clone(&memtable);
+			let level = Arc::clone(&level);
 			let write_stall = Arc::clone(&write_stall);
 			let stop_notify = stop_notify.clone();
 
@@ -131,123 +166,130 @@ impl TaskManager {
 				let error_handler = core.error_handler();
 				'task: loop {
 					// Wait for notification
-					notify.notified().await;
+					signal.notify.notified().await;
 
-					if stop_flag.load(Ordering::SeqCst) {
-						break;
-					}
+					'pass: loop {
+						if stop_flag.load(Ordering::SeqCst) {
+							break 'task;
+						}
 
-					running.store(true, Ordering::SeqCst);
-					tracing::debug!("Memtable flush task starting");
+						signal.begin();
+						tracing::debug!("Memtable flush task starting");
 
-					// Flush ALL pending immutable memtables in a loop
-					let mut flush_count = 0;
-					let mut retry_wait = COMPACTION_RETRY_MIN;
-					loop {
-						// A pool has a fixed number of files: the flush waits until it has the ones
-						// it creates, and a failure of the unit during which the pool refused a
-						// creation is not taken for a permanent one (see
-						// `set_error_after_exhaustion`).
-						let exhaustions = if pooled {
-							core.pool_exhaustions()
-						} else {
-							0
-						};
-						let spares = match pooled.then(|| core.spares_for_flush()).flatten() {
-							Some(wait) if core.has_pending_immutables() => {
-								await_spares(wait, &stop_flag, stop_notify.as_deref()).await
-							}
-							_ => Spares::Ready,
-						};
-						let result = match spares {
-							Spares::Ready => core.compact_memtable(),
-							Spares::Stopped => {
-								running.store(false, Ordering::SeqCst);
-								break 'task;
-							}
-							Spares::Failed(e) => Err(e),
-						};
-						match result {
-							Ok(()) => {
-								flush_count += 1;
-								retry_wait = FLUSH_RETRY_MIN;
-								// A flush that succeeds ends the failure of the one before it
-								error_handler.recover(BackgroundErrorReason::MemtablaFlush);
-								write_stall.signal_work_done();
-								if pooled {
-									core.after_background_unit();
+						// Flush ALL pending immutable memtables in a loop
+						let mut flush_count = 0;
+						let mut retry_wait = COMPACTION_RETRY_MIN;
+						loop {
+							// A pool has a fixed number of files: the flush waits until it has the
+							// ones it creates, and a failure of the unit during which the pool
+							// refused a creation is not taken for a permanent one (see
+							// `set_error_after_exhaustion`).
+							let exhaustions = if pooled {
+								core.pool_exhaustions()
+							} else {
+								0
+							};
+							let spares = match pooled.then(|| core.spares_for_flush()).flatten() {
+								Some(wait) if core.has_pending_immutables() => {
+									await_spares(wait, &stop_flag, stop_notify.as_deref()).await
 								}
-								// Gives the event loop of a browser its turn between two flushes: a
-								// worker has no other thread to serve what is waiting.
-								rt::relax().await;
-								// Check if there are more immutables to flush
-								if !core.has_pending_immutables() {
-									break;
-								}
-							}
-							Err(e) => {
-								tracing::error!("Memtable compaction task error: {e:?}");
-								let severity = error_handler.set_error_after_exhaustion(
-									e.clone(),
-									BackgroundErrorReason::MemtablaFlush,
-									pooled && core.exhausted_since(exhaustions),
-								);
-								// A database a commit group stopped refuses every flush for good,
-								// so there is nothing to retry.
-								if severity >= ErrorSeverity::FatalError
-									|| error_handler.commit_group_error().is_some()
-								{
-									write_stall.signal_shutdown();
-									break;
-								}
-								// The memtable stays queued and the manifest is as it was.
-								// Commits fail meanwhile if the error stops writes, and the
-								// writers stalled on the flush are let go.
-								write_stall.signal_failure();
-								// A key that does not fit, or bytes that did not authenticate,
-								// will not be any better the next time: the memtable stays
-								// queued, writes stay stopped, and nothing is attempted again
-								// until something asks for a flush.
-								if !BackgroundErrorHandler::retries(
-									&e,
-									severity,
-									BackgroundErrorReason::MemtablaFlush,
-								) {
-									break;
-								}
-								// Otherwise the flush is run again until it succeeds. A key
-								// provider that was away may have to be asked for its keys again
-								// first, which is slow, and is done here and not on the commit
-								// path.
-								if matches!(&e, Error::Encryption(_)) {
-									if let Err(prepare_error) = core.prepare_keys() {
-										tracing::debug!(
-											"The keys could not be prepared again: {prepare_error:?}"
-										);
-									}
-								}
-								let _ = rt::timeout(retry_wait, notify.notified()).await;
-								if stop_flag.load(Ordering::SeqCst) {
-									running.store(false, Ordering::SeqCst);
+								_ => Spares::Ready,
+							};
+							let result = match spares {
+								Spares::Ready => core.compact_memtable(),
+								Spares::Stopped => {
+									signal.end();
 									break 'task;
 								}
-								retry_wait = (retry_wait * 2).min(FLUSH_RETRY_MAX);
+								Spares::Failed(e) => Err(e),
+							};
+							match result {
+								Ok(()) => {
+									flush_count += 1;
+									retry_wait = FLUSH_RETRY_MIN;
+									// A flush that succeeds ends the failure of the one before it
+									error_handler.recover(BackgroundErrorReason::MemtablaFlush);
+									write_stall.signal_work_done();
+									if pooled {
+										core.after_background_unit();
+									}
+									// Gives the event loop of a browser its turn between two
+									// flushes: a worker has no other thread to serve what is
+									// waiting.
+									rt::relax().await;
+									// Check if there are more immutables to flush
+									if !core.has_pending_immutables() {
+										break;
+									}
+								}
+								Err(e) => {
+									tracing::error!("Memtable compaction task error: {e:?}");
+									let severity = error_handler.set_error_after_exhaustion(
+										e.clone(),
+										BackgroundErrorReason::MemtablaFlush,
+										pooled && core.exhausted_since(exhaustions),
+									);
+									// A database a commit group stopped refuses every flush for
+									// good, so there is nothing to retry.
+									if severity >= ErrorSeverity::FatalError
+										|| error_handler.commit_group_error().is_some()
+									{
+										write_stall.signal_shutdown();
+										break;
+									}
+									// The memtable stays queued and the manifest is as it was.
+									// Commits fail meanwhile if the error stops writes, and the
+									// writers stalled on the flush are let go.
+									write_stall.signal_failure();
+									// A key that does not fit, or bytes that did not authenticate,
+									// will not be any better the next time: the memtable stays
+									// queued, writes stay stopped, and nothing is attempted again
+									// until something asks for a flush.
+									if !BackgroundErrorHandler::retries(
+										&e,
+										severity,
+										BackgroundErrorReason::MemtablaFlush,
+									) {
+										break;
+									}
+									// Otherwise the flush is run again until it succeeds. A key
+									// provider that was away may have to be asked for its keys
+									// again first, which is slow, and is done here and not on the
+									// commit path.
+									if matches!(&e, Error::Encryption(_)) {
+										if let Err(prepare_error) = core.prepare_keys() {
+											tracing::debug!(
+											"The keys could not be prepared again: {prepare_error:?}"
+										);
+										}
+									}
+									let _ = rt::timeout(retry_wait, signal.notify.notified()).await;
+									if stop_flag.load(Ordering::SeqCst) {
+										signal.end();
+										break 'task;
+									}
+									retry_wait = (retry_wait * 2).min(FLUSH_RETRY_MAX);
+								}
 							}
 						}
-					}
 
-					if flush_count > 0 {
-						tracing::debug!(
-							"Memtable flush task completed: flushed {} memtables",
-							flush_count
-						);
-						// Trigger level compaction after successful flushes
-						level_notify.notify_one();
-					} else {
-						tracing::debug!("Memtable flush task: no immutables to flush");
-					}
+						if flush_count > 0 {
+							tracing::debug!(
+								"Memtable flush task completed: flushed {} memtables",
+								flush_count
+							);
+							// Trigger level compaction after successful flushes
+							level.wake();
+						} else {
+							tracing::debug!("Memtable flush task: no immutables to flush");
+						}
 
-					running.store(false, Ordering::SeqCst);
+						// A wakeup during the pass is for a memtable that was queued meanwhile,
+						// unless the pass flushed it already.
+						if !(signal.end() && core.has_pending_immutables()) {
+							break 'pass;
+						}
+					}
 				}
 			});
 			task_handles.lock().unwrap().as_mut().unwrap().push(handle);
@@ -257,104 +299,124 @@ impl TaskManager {
 		{
 			let core = Arc::clone(&core);
 			let stop_flag = Arc::clone(&stop_flag);
-			let notify = Arc::clone(&level_notify);
-			let running = Arc::clone(&level_running);
+			let signal = Arc::clone(&level);
 			let write_stall = Arc::clone(&write_stall);
 			let stop_notify = stop_notify.clone();
 
 			let handle = rt::spawn(async move {
 				'task: loop {
 					// Wait for notification
-					notify.notified().await;
+					signal.notify.notified().await;
 
-					if stop_flag.load(Ordering::SeqCst) {
-						break;
-					}
-
-					running.store(true, Ordering::SeqCst);
-					tracing::debug!("Level compaction task starting");
-
-					// Use leveled compaction strategy
-					let strategy: Arc<dyn CompactionStrategy> =
-						Arc::new(Strategy::from_options(Arc::clone(&opts)));
-					let error_handler = core.error_handler();
-					let mut retry_wait = COMPACTION_RETRY_MIN;
-					loop {
-						// See the flush task. The outputs of a compaction are created only while
-						// the pool has more files than the commit path
-						// keeps back, so the wait is for those and the ones
-						// that the compaction itself needs.
-						let exhaustions = if pooled {
-							core.pool_exhaustions()
-						} else {
-							0
-						};
-						let spares = match pooled.then(|| core.spares_for_compaction()).flatten() {
-							Some(wait) => {
-								await_spares(wait, &stop_flag, stop_notify.as_deref()).await
-							}
-							None => Spares::Ready,
-						};
-						let result = match spares {
-							Spares::Ready => core.compact(Arc::clone(&strategy)),
-							Spares::Stopped => {
-								running.store(false, Ordering::SeqCst);
-								break 'task;
-							}
-							Spares::Failed(e) => Err(e),
-						};
-						if pooled {
-							core.compaction_ran(&result);
+					'pass: loop {
+						if stop_flag.load(Ordering::SeqCst) {
+							break 'task;
 						}
-						match result {
-							Ok(()) => {
-								tracing::debug!("Level compaction completed successfully");
-								// A compaction that works ends the wait of the one before it for a
-								// key provider. Any other failure of a compaction stays on record.
-								error_handler.recover_soft(BackgroundErrorReason::Compaction);
-								error_handler.recover_soft(BackgroundErrorReason::ManifestWrite);
-								write_stall.signal_work_done();
-								if pooled {
-									core.after_background_unit();
-								}
-								rt::relax().await;
-								break;
-							}
-							Err(e) => {
-								tracing::error!("Level compaction task error: {e:?}");
-								let severity = error_handler.set_error_after_exhaustion(
-									e.clone(),
-									BackgroundErrorReason::Compaction,
-									pooled && core.exhausted_since(exhaustions),
-								);
-								if !BackgroundErrorHandler::retries(
-									&e,
-									severity,
-									BackgroundErrorReason::Compaction,
-								) || error_handler.commit_group_error().is_some()
-								{
-									write_stall.signal_shutdown();
-									break;
-								}
-								// A key provider that is away: nothing was changed, so the
-								// compaction is picked again after the wait that a failed flush
-								// makes, and the writers stalled on it are let go meanwhile.
-								write_stall.signal_failure();
-								if let Err(prepare_error) = core.prepare_keys() {
-									tracing::debug!(
-										"The keys could not be prepared again: {prepare_error:?}"
-									);
-								}
-								let _ = rt::timeout(retry_wait, notify.notified()).await;
-								if stop_flag.load(Ordering::SeqCst) {
-									running.store(false, Ordering::SeqCst);
+
+						signal.begin();
+						tracing::debug!("Level compaction task starting");
+
+						// Use leveled compaction strategy
+						let strategy: Arc<dyn CompactionStrategy> =
+							Arc::new(Strategy::from_options(Arc::clone(&opts)));
+						let error_handler = core.error_handler();
+						let mut retry_wait = COMPACTION_RETRY_MIN;
+						loop {
+							// See the flush task. The outputs of a compaction are created only
+							// while the pool has more files than the commit path
+							// keeps back, so the wait is for those and the ones
+							// that the compaction itself needs.
+							let exhaustions = if pooled {
+								core.pool_exhaustions()
+							} else {
+								0
+							};
+							let spares =
+								match pooled.then(|| core.spares_for_compaction()).flatten() {
+									Some(wait) => {
+										await_spares(wait, &stop_flag, stop_notify.as_deref()).await
+									}
+									None => Spares::Ready,
+								};
+							let result = match spares {
+								Spares::Ready => core.compact(Arc::clone(&strategy)),
+								Spares::Stopped => {
+									signal.end();
 									break 'task;
 								}
-								retry_wait = (retry_wait * 2).min(COMPACTION_RETRY_MAX);
+								Spares::Failed(e) => Err(e),
+							};
+							if pooled {
+								core.compaction_ran(&result);
+							}
+							match result {
+								Ok(merged) => {
+									tracing::debug!("Level compaction completed successfully");
+									// A compaction that works ends the wait of the one before it
+									// for a key provider. Any other failure of a compaction stays
+									// on record.
+									error_handler.recover_soft(BackgroundErrorReason::Compaction);
+									error_handler
+										.recover_soft(BackgroundErrorReason::ManifestWrite);
+									write_stall.signal_work_done();
+									if pooled {
+										core.after_background_unit();
+									}
+									rt::relax().await;
+									// One merge is not all there is to do: the strategy picks the
+									// level with the highest score, which need not be level 0, and
+									// writers stalled on level 0 make no flush that would wake this
+									// task again. So the task merges until the strategy finds
+									// nothing that moves tables down: a merge within the bottom
+									// level can be picked again for as long as that level is over
+									// its target, and is left to the next wakeup.
+									if !merged {
+										break;
+									}
+									if stop_flag.load(Ordering::SeqCst) {
+										signal.end();
+										break 'task;
+									}
+									retry_wait = COMPACTION_RETRY_MIN;
+								}
+								Err(e) => {
+									tracing::error!("Level compaction task error: {e:?}");
+									let severity = error_handler.set_error_after_exhaustion(
+										e.clone(),
+										BackgroundErrorReason::Compaction,
+										pooled && core.exhausted_since(exhaustions),
+									);
+									if !BackgroundErrorHandler::retries(
+										&e,
+										severity,
+										BackgroundErrorReason::Compaction,
+									) || error_handler.commit_group_error().is_some()
+									{
+										write_stall.signal_shutdown();
+										break;
+									}
+									// A key provider that is away: nothing was changed, so the
+									// compaction is picked again after the wait that a failed flush
+									// makes, and the writers stalled on it are let go meanwhile.
+									write_stall.signal_failure();
+									if let Err(prepare_error) = core.prepare_keys() {
+										tracing::debug!(
+										"The keys could not be prepared again: {prepare_error:?}"
+									);
+									}
+									let _ = rt::timeout(retry_wait, signal.notify.notified()).await;
+									if stop_flag.load(Ordering::SeqCst) {
+										signal.end();
+										break 'task;
+									}
+									retry_wait = (retry_wait * 2).min(COMPACTION_RETRY_MAX);
+								}
 							}
 						}
+						if !signal.end() {
+							break 'pass;
+						}
 					}
-					running.store(false, Ordering::SeqCst);
 				}
 			});
 			task_handles.lock().unwrap().as_mut().unwrap().push(handle);
@@ -362,10 +424,8 @@ impl TaskManager {
 
 		Self {
 			stop_flag,
-			memtable_notify,
-			level_notify,
-			memtable_running,
-			level_running,
+			memtable,
+			level,
 			task_handles,
 			stop_notify,
 		}
@@ -379,17 +439,11 @@ impl TaskManager {
 	}
 
 	pub(crate) fn wake_up_memtable(&self) {
-		// Only notify if not already running
-		if !self.memtable_running.load(Ordering::Acquire) {
-			self.memtable_notify.notify_one();
-		}
+		self.memtable.wake();
 	}
 
 	pub(crate) fn wake_up_level(&self) {
-		// Only notify if not already running
-		if !self.level_running.load(Ordering::Acquire) {
-			self.level_notify.notify_one();
-		}
+		self.level.wake();
 	}
 
 	/// Ends the background tasks without waiting for them, the way a crash does, so that a tree
@@ -413,17 +467,15 @@ impl TaskManager {
 
 		// Wake up any waiting tasks so they can check the stop flag and exit, and the ones that
 		// wait for the spare files of a pool, which may never come.
-		self.memtable_notify.notify_one();
-		self.level_notify.notify_one();
+		self.memtable.notify.notify_one();
+		self.level.notify.notify_one();
 		if let Some(notify) = &self.stop_notify {
 			notify.notify_waiters();
 		}
 
 		// Wait for any in-progress compactions to complete (no timeout - wait
 		// indefinitely)
-		while self.memtable_running.load(Ordering::Acquire)
-			|| self.level_running.load(Ordering::Acquire)
-		{
+		while self.memtable.is_running() || self.level.is_running() {
 			// Yield to other tasks and wait a short time before checking again
 			rt::sleep(Duration::from_millis(50)).await;
 		}
@@ -457,7 +509,7 @@ mod tests {
 		WriteStallCountProvider,
 	};
 	use crate::task::TaskManager;
-	use crate::{BackgroundErrorReason, Error, ErrorSeverity, Options};
+	use crate::{BackgroundErrorReason, Error, ErrorSeverity, Options, WriteStallReason};
 
 	struct NoopStallProvider;
 
@@ -468,6 +520,30 @@ mod tests {
 				l0_files: 0,
 			}
 		}
+	}
+
+	/// Counts level 0 at the stall limit while the mock has merges left to run, the way a level 0
+	/// that the merges would empty does.
+	struct BacklogStallProvider(Arc<MockCoreInner>);
+
+	impl WriteStallCountProvider for BacklogStallProvider {
+		fn get_stall_counts(&self) -> StallCounts {
+			let backlog = self.0.level_backlog.load(Ordering::SeqCst);
+			StallCounts {
+				immutable_memtables: 0,
+				l0_files: if backlog > 0 {
+					12
+				} else {
+					0
+				},
+			}
+		}
+	}
+
+	fn backlog_write_stall(core: &Arc<MockCoreInner>) -> Arc<WriteStallController> {
+		let provider: Arc<dyn WriteStallCountProvider> =
+			Arc::new(BacklogStallProvider(Arc::clone(core)));
+		Arc::new(WriteStallController::new(provider, StallThresholds::new(2, 12)))
 	}
 
 	fn test_write_stall() -> Arc<WriteStallController> {
@@ -505,6 +581,9 @@ mod tests {
 		level_failures: AtomicUsize,
 		/// Whether a failed `compact` is fatal
 		level_failure_is_fatal: AtomicBool,
+		/// The merges the strategy would still pick: a call of `compact` that succeeds runs one
+		/// of them, and reports that it merged tables while there was one when it picked
+		level_backlog: AtomicUsize,
 		error_handler: Arc<BackgroundErrorHandler>,
 	}
 
@@ -532,6 +611,7 @@ mod tests {
 				prepares: AtomicUsize::new(0),
 				level_failures: AtomicUsize::new(0),
 				level_failure_is_fatal: AtomicBool::new(false),
+				level_backlog: AtomicUsize::new(0),
 				error_handler: Arc::new(BackgroundErrorHandler::new()),
 			}
 		}
@@ -596,7 +676,10 @@ mod tests {
 			Ok(())
 		}
 
-		fn compact(&self, _strategy: Arc<dyn CompactionStrategy>) -> Result<()> {
+		fn compact(&self, _strategy: Arc<dyn CompactionStrategy>) -> Result<bool> {
+			// The strategy picks before the merge runs, as the compactor does under the manifest
+			// lock: a merge that is added meanwhile is not seen by this call.
+			let picked = self.level_backlog.load(Ordering::SeqCst) > 0;
 			let start = std::time::Instant::now();
 			while start.elapsed() < Duration::from_millis(self.level_delay_ms) {
 				std::hint::spin_loop();
@@ -632,7 +715,10 @@ mod tests {
 
 			// Only increment counter on success
 			self.level_compactions.fetch_add(1, Ordering::SeqCst);
-			Ok(())
+			if picked {
+				self.level_backlog.fetch_sub(1, Ordering::SeqCst);
+			}
+			Ok(picked)
 		}
 
 		fn error_handler(&self) -> Arc<BackgroundErrorHandler> {
@@ -772,6 +858,89 @@ mod tests {
 		task_manager.stop().await;
 	}
 
+	/// One wakeup runs every merge the strategy finds, not only the first: the merge that would
+	/// let the writers stalled on level 0 go may not be the one with the highest score, and once
+	/// they are stalled no flush comes to wake the task again.
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_level_wakeup_runs_every_merge() {
+		let core = Arc::new(MockCoreInner::with_delays(5, 5));
+		core.level_backlog.store(3, Ordering::SeqCst);
+		let write_stall = backlog_write_stall(&core);
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			Arc::new(Options::default()),
+			Arc::clone(&write_stall),
+		);
+
+		let stalled = Arc::clone(&write_stall);
+		let writer = tokio::spawn(async move { stalled.check().await });
+		task_manager.wake_up_level();
+
+		let cleared = time::timeout(Duration::from_secs(5), writer).await;
+		assert!(cleared.is_ok(), "the writer stayed stalled with merges left to run");
+		assert!(cleared.unwrap().unwrap().is_ok());
+		assert_eq!(core.level_backlog.load(Ordering::SeqCst), 0);
+
+		task_manager.stop().await;
+	}
+
+	/// A wakeup that comes while a compaction runs is kept, not dropped: the compaction picked
+	/// before the work that the wakeup is for was there.
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_level_wakeup_during_compaction_is_kept() {
+		let core = Arc::new(MockCoreInner::with_delays(5, 200));
+		let write_stall = backlog_write_stall(&core);
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			Arc::new(Options::default()),
+			Arc::clone(&write_stall),
+		);
+
+		// A compaction that finds nothing to do starts, and level 0 fills while it runs.
+		task_manager.wake_up_level();
+		while !task_manager.level.is_running() {
+			time::sleep(Duration::from_millis(1)).await;
+		}
+		core.level_backlog.store(1, Ordering::SeqCst);
+		task_manager.wake_up_level();
+
+		let stalled = Arc::clone(&write_stall);
+		let writer = tokio::spawn(async move { stalled.check().await });
+		let cleared = time::timeout(Duration::from_secs(5), writer).await;
+		assert!(cleared.is_ok(), "the wakeup during the compaction was lost");
+		assert!(cleared.unwrap().unwrap().is_ok());
+		assert_eq!(core.level_backlog.load(Ordering::SeqCst), 0);
+
+		task_manager.stop().await;
+	}
+
+	/// A stalled writer asks for the compaction that ends its stall, so the stall ends even when
+	/// no wakeup reached the task at all.
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_stalled_writer_wakes_level_compaction() {
+		let core = Arc::new(MockCoreInner::with_delays(5, 5));
+		core.level_backlog.store(2, Ordering::SeqCst);
+		let write_stall = backlog_write_stall(&core);
+		let task_manager = Arc::new(TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			Arc::new(Options::default()),
+			Arc::clone(&write_stall),
+		));
+		let tasks = Arc::downgrade(&task_manager);
+		write_stall.set_rearm(move |reason| {
+			if let (Some(tasks), WriteStallReason::L0FileLimit) = (tasks.upgrade(), reason) {
+				tasks.wake_up_level();
+			}
+		});
+
+		let cleared = time::timeout(Duration::from_secs(5), write_stall.check()).await;
+		assert!(cleared.is_ok(), "the stalled writer did not wake the compaction");
+		assert!(cleared.unwrap().unwrap().is_some(), "the writer was stalled");
+		assert_eq!(core.level_backlog.load(Ordering::SeqCst), 0);
+
+		task_manager.stop().await;
+	}
+
 	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_already_running_tasks() {
 		let opts = Arc::new(Options::default());
@@ -786,7 +955,7 @@ mod tests {
 
 		// Wake up memtable and immediately try again while it's still running
 		task_manager.wake_up_memtable();
-		task_manager.wake_up_memtable(); // This should be ignored as task is already running
+		task_manager.wake_up_memtable(); // Kept, but there is no memtable left for another pass
 
 		// Wait for first task to complete but not the second (if it were scheduled)
 		time::sleep(Duration::from_millis(150)).await;
@@ -797,13 +966,18 @@ mod tests {
 		// Do the same test with level compaction
 		time::sleep(Duration::from_millis(150)).await; // Ensure previous level compaction is done
 
+		// Wakeups during a compaction are kept and coalesced into one more pass
 		task_manager.wake_up_level();
-		task_manager.wake_up_level(); // This should be ignored
+		while !task_manager.level.is_running() {
+			time::sleep(Duration::from_millis(1)).await;
+		}
+		task_manager.wake_up_level();
+		task_manager.wake_up_level();
 
-		time::sleep(Duration::from_millis(150)).await;
+		time::sleep(Duration::from_millis(400)).await;
 
-		// 1 from memtable + 1 directly triggered = 2
-		assert_eq!(core.level_compactions.load(Ordering::SeqCst), 2);
+		// 1 from memtable + 1 directly triggered + 1 for the wakeups during it = 3
+		assert_eq!(core.level_compactions.load(Ordering::SeqCst), 3);
 
 		task_manager.stop().await;
 	}
@@ -1402,7 +1576,7 @@ mod tests {
 			wait_for(|| core.error_handler.is_db_stopped()).await;
 			// A wake-up is ignored while the task is still running, which it is for a moment after
 			// it recorded the failure.
-			wait_for(|| !task_manager.memtable_running.load(Ordering::Acquire)).await;
+			wait_for(|| !task_manager.memtable.is_running()).await;
 
 			*core.memtable_error.lock().unwrap() = None;
 			task_manager.wake_up_memtable();
@@ -1517,11 +1691,11 @@ mod tests {
 		assert!(write_stall.check().await.is_err());
 
 		core.fail_level.store(false, Ordering::SeqCst);
-		wait_for(|| !task_manager.level_running.load(Ordering::Acquire)).await;
+		wait_for(|| !task_manager.level.is_running()).await;
 		task_manager.wake_up_level();
 		wait_for(|| core.level_compactions.load(Ordering::SeqCst) == 1).await;
 		// The compaction has returned, so the task has decided what its success ends.
-		wait_for(|| !task_manager.level_running.load(Ordering::Acquire)).await;
+		wait_for(|| !task_manager.level.is_running()).await;
 		assert!(core.error_handler.is_db_stopped(), "a compaction that works does not end it");
 		assert!(core.error_handler.check_error().is_err());
 		task_manager.stop().await;

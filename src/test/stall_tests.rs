@@ -563,3 +563,99 @@ fn test_pacing_does_not_need_the_time_driver() {
 		});
 	}
 }
+
+/// Writers stalled on level 0 are let go, however the compactions are scheduled. The levels are
+/// small, so a level below level 0 often has the highest score and is merged first, and level 0
+/// stalls at the size that triggers its compaction. Each flush used to run one merge, and a
+/// stalled writer makes no flush: once the merge that a flush ran was not the one of level 0, the
+/// writers stayed stalled for good.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn test_writers_stalled_on_level0_make_progress() {
+	const WRITERS: usize = 16;
+	const COMMITS: usize = 1500;
+
+	let temp_dir = tempfile::tempdir().unwrap();
+	let mut opts = crate::Options::new();
+	opts.level0_max_files = 4;
+	opts.max_bytes_for_level = 64 * 1024;
+	let tree: Tree = TreeBuilder::with_options(opts)
+		.with_path(temp_dir.path().to_path_buf())
+		.with_level_count(4)
+		.with_max_memtable_size(16 * 1024)
+		.with_memtable_stall_threshold(4)
+		.with_l0_stall_threshold(4)
+		.build()
+		.unwrap();
+	let tree = Arc::new(tree);
+
+	let mut handles = vec![];
+	for writer in 0..WRITERS {
+		let tree = Arc::clone(&tree);
+		handles.push(tokio::spawn(async move {
+			for i in 0..COMMITS {
+				// Spread every writer over the whole key space, so that tables overlap
+				let key = format!("key{:06}_{writer:02}", (i * 7919) % COMMITS);
+				let mut txn = tree.begin().unwrap();
+				txn.set(key.as_bytes(), &[writer as u8; 200]).unwrap();
+				txn.commit().await.unwrap();
+			}
+		}));
+	}
+	let all = async {
+		for handle in handles {
+			handle.await.unwrap();
+		}
+	};
+	assert!(
+		time::timeout(Duration::from_secs(120), all).await.is_ok(),
+		"the writers stayed stalled"
+	);
+
+	let txn = tree.begin().unwrap();
+	for writer in 0..WRITERS {
+		let key = format!("key{:06}_{writer:02}", 0);
+		assert_eq!(txn.get(key.as_bytes()).unwrap().as_deref(), Some(&[writer as u8; 200][..]));
+	}
+	drop(txn);
+	let tree = Arc::try_unwrap(tree).unwrap_or_else(|_| panic!("the tree is still shared"));
+	tree.close().await.unwrap();
+}
+
+/// A writer stalled on level 0 asks for the compaction and waits for it without a tokio timer:
+/// a runtime built without the time driver, which is what `tokio::runtime::Builder` gives unless
+/// `enable_time` or `enable_all` is called, would panic in the commit path on one.
+#[test]
+fn test_stalled_writer_waits_without_the_time_driver() {
+	let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+	runtime.block_on(async {
+		let provider = Arc::new(MockStallCountProvider::new(0, 12));
+		let controller = Arc::new(WriteStallController::new(
+			Arc::clone(&provider) as Arc<dyn WriteStallCountProvider>,
+			default_thresholds(),
+		));
+		let asked = Arc::new(AtomicUsize::new(0));
+		let counter = Arc::clone(&asked);
+		controller.set_rearm(move |reason| {
+			assert_eq!(reason, WriteStallReason::L0FileLimit);
+			counter.fetch_add(1, Ordering::SeqCst);
+		});
+
+		let stalled = Arc::clone(&controller);
+		let writer = tokio::spawn(async move { stalled.check().await });
+		while asked.load(Ordering::SeqCst) == 0 {
+			tokio::task::yield_now().await;
+		}
+		// The compaction the writer asked for ends the stall.
+		provider.set_counts(0, 0);
+		controller.signal_work_done();
+
+		let info = writer.await.expect("the stalled writer panicked").unwrap();
+		assert!(matches!(
+			info,
+			Some(WriteStallInfo {
+				reason: WriteStallReason::L0FileLimit,
+				..
+			})
+		));
+	});
+}

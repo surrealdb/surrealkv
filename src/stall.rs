@@ -1,13 +1,16 @@
 //! Write stall controller for backpressure management.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::Notify;
 
 use crate::error::{Error, Result, WriteStallReason};
 use crate::rt::{pace, Instant};
+
+/// Asks the background tasks for the work that ends a stall of the given reason.
+type Rearm = Box<dyn Fn(WriteStallReason) + Send + Sync>;
 
 /// Current counts of resources that can trigger write stalls.
 #[derive(Debug, Clone, Copy)]
@@ -85,6 +88,9 @@ pub struct WriteStallController {
 
 	/// Static thresholds configured at startup
 	thresholds: StallThresholds,
+
+	/// Asks for a flush or a compaction for a stalled writer, once the tasks exist
+	rearm: OnceLock<Rearm>,
 }
 
 impl WriteStallController {
@@ -96,7 +102,15 @@ impl WriteStallController {
 			failures: AtomicU64::new(0),
 			provider,
 			thresholds,
+			rearm: OnceLock::new(),
 		}
+	}
+
+	/// Sets what a stalled writer calls to ask for the work that ends its stall, such as the
+	/// compaction of level 0. A writer asks each time it begins to wait, so a stall never depends
+	/// on a wakeup that came, or was lost, before it.
+	pub fn set_rearm(&self, rearm: impl Fn(WriteStallReason) + Send + Sync + 'static) {
+		let _ = self.rearm.set(Box::new(rearm));
 	}
 
 	/// Check stall conditions and wait if stalled. Called before each write.
@@ -195,7 +209,13 @@ impl WriteStallController {
 				tracing::warn!("Write stall: {:?} ({} >= {})", reason, value, threshold);
 			}
 
-			// Wait
+			// Ask for the work that ends the stall, then wait for a sign of it. Every flush and
+			// compaction gives one, after which the writer looks again and, still stalled, asks
+			// again. The wait needs no timer, so that a runtime built without the time driver does
+			// not panic in the commit path.
+			if let Some(rearm) = self.rearm.get() {
+				rearm(reason);
+			}
 			notified.await;
 		}
 	}
