@@ -162,10 +162,12 @@ impl Compactor {
 		let to_merge: Vec<_> =
 			input.tables_to_merge.iter().filter_map(|&id| tables.get(&id).cloned()).collect();
 
-		// Keep tables alive while iterators borrow from them
+		// Keep tables alive while iterators borrow from them. The input tables are deleted once
+		// the merge is done, so the blocks read for it stay out of the block cache.
 		let iterators: Vec<BoxedLSMIterator<'_>> = to_merge
 			.iter()
 			.filter_map(|table| table.iter(None).ok())
+			.map(|iter| iter.without_cache_fill())
 			.map(|iter| Box::new(iter) as BoxedLSMIterator<'_>)
 			.collect();
 

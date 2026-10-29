@@ -84,6 +84,8 @@ pub(crate) struct BlockCache {
 	#[cfg(test)]
 	data_misses: AtomicU64,
 	#[cfg(test)]
+	data_inserts: AtomicU64,
+	#[cfg(test)]
 	index_hits: AtomicU64,
 	#[cfg(test)]
 	index_misses: AtomicU64,
@@ -105,6 +107,8 @@ impl BlockCache {
 			data_hits: AtomicU64::new(0),
 			#[cfg(test)]
 			data_misses: AtomicU64::new(0),
+			#[cfg(test)]
+			data_inserts: AtomicU64::new(0),
 			#[cfg(test)]
 			index_hits: AtomicU64::new(0),
 			#[cfg(test)]
@@ -136,6 +140,8 @@ impl BlockCache {
 
 	/// Inserts a data block into the cache.
 	pub(crate) fn insert_data_block(&self, table_id: u64, offset: u64, block: Arc<Block>) {
+		#[cfg(test)]
+		self.data_inserts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 		self.data.insert((KIND_DATA, table_id, offset).into(), Item::Data(block));
 	}
 
@@ -278,6 +284,7 @@ impl BlockCache {
 		CacheStats {
 			data_hits: self.data_hits.load(std::sync::atomic::Ordering::Relaxed),
 			data_misses: self.data_misses.load(std::sync::atomic::Ordering::Relaxed),
+			data_inserts: self.data_inserts.load(std::sync::atomic::Ordering::Relaxed),
 			index_hits: self.index_hits.load(std::sync::atomic::Ordering::Relaxed),
 			index_misses: self.index_misses.load(std::sync::atomic::Ordering::Relaxed),
 			vlog_hits: self.vlog_hits.load(std::sync::atomic::Ordering::Relaxed),
@@ -294,6 +301,7 @@ impl BlockCache {
 	pub(crate) fn reset_stats(&self) {
 		self.data_hits.store(0, std::sync::atomic::Ordering::Relaxed);
 		self.data_misses.store(0, std::sync::atomic::Ordering::Relaxed);
+		self.data_inserts.store(0, std::sync::atomic::Ordering::Relaxed);
 		self.index_hits.store(0, std::sync::atomic::Ordering::Relaxed);
 		self.index_misses.store(0, std::sync::atomic::Ordering::Relaxed);
 		self.vlog_hits.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -309,6 +317,8 @@ impl BlockCache {
 pub(crate) struct CacheStats {
 	pub data_hits: u64,
 	pub data_misses: u64,
+	/// The data blocks put into the cache.
+	pub data_inserts: u64,
 	pub index_hits: u64,
 	pub index_misses: u64,
 	pub vlog_hits: u64,
