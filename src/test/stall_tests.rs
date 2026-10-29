@@ -620,3 +620,42 @@ async fn test_writers_stalled_on_level0_make_progress() {
 	let tree = Arc::try_unwrap(tree).unwrap_or_else(|_| panic!("the tree is still shared"));
 	tree.close().await.unwrap();
 }
+
+/// A writer stalled on level 0 asks for the compaction and waits for it without a tokio timer:
+/// a runtime built without the time driver, which is what `tokio::runtime::Builder` gives unless
+/// `enable_time` or `enable_all` is called, would panic in the commit path on one.
+#[test]
+fn test_stalled_writer_waits_without_the_time_driver() {
+	let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+	runtime.block_on(async {
+		let provider = Arc::new(MockStallCountProvider::new(0, 12));
+		let controller = Arc::new(WriteStallController::new(
+			Arc::clone(&provider) as Arc<dyn WriteStallCountProvider>,
+			default_thresholds(),
+		));
+		let asked = Arc::new(AtomicUsize::new(0));
+		let counter = Arc::clone(&asked);
+		controller.set_rearm(move |reason| {
+			assert_eq!(reason, WriteStallReason::L0FileLimit);
+			counter.fetch_add(1, Ordering::SeqCst);
+		});
+
+		let stalled = Arc::clone(&controller);
+		let writer = tokio::spawn(async move { stalled.check().await });
+		while asked.load(Ordering::SeqCst) == 0 {
+			tokio::task::yield_now().await;
+		}
+		// The compaction the writer asked for ends the stall.
+		provider.set_counts(0, 0);
+		controller.signal_work_done();
+
+		let info = writer.await.expect("the stalled writer panicked").unwrap();
+		assert!(matches!(
+			info,
+			Some(WriteStallInfo {
+				reason: WriteStallReason::L0FileLimit,
+				..
+			})
+		));
+	});
+}

@@ -7,11 +7,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use crate::error::{Error, Result, WriteStallReason};
-use crate::rt::{self, pace, Instant};
-
-/// How long a stalled writer waits for a sign of progress before it asks again for the work that
-/// ends its stall. Such a sign normally comes first; this bounds a stall whose wakeup was lost.
-const STALL_REARM_INTERVAL: Duration = Duration::from_secs(1);
+use crate::rt::{pace, Instant};
 
 /// Asks the background tasks for the work that ends a stall of the given reason.
 type Rearm = Box<dyn Fn(WriteStallReason) + Send + Sync>;
@@ -213,11 +209,14 @@ impl WriteStallController {
 				tracing::warn!("Write stall: {:?} ({} >= {})", reason, value, threshold);
 			}
 
-			// Ask for the work that ends the stall, then wait for a sign of it, or ask again.
+			// Ask for the work that ends the stall, then wait for a sign of it. Every flush and
+			// compaction gives one, after which the writer looks again and, still stalled, asks
+			// again. The wait needs no timer, so that a runtime built without the time driver does
+			// not panic in the commit path.
 			if let Some(rearm) = self.rearm.get() {
 				rearm(reason);
 			}
-			let _ = rt::timeout(STALL_REARM_INTERVAL, notified).await;
+			notified.await;
 		}
 	}
 
