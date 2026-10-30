@@ -162,10 +162,12 @@ impl Compactor {
 		let to_merge: Vec<_> =
 			input.tables_to_merge.iter().filter_map(|&id| tables.get(&id).cloned()).collect();
 
-		// Keep tables alive while iterators borrow from them
+		// Keep tables alive while iterators borrow from them. The input tables are deleted once
+		// the merge is done, so the blocks read for it stay out of the block cache.
 		let iterators: Vec<BoxedLSMIterator<'_>> = to_merge
 			.iter()
 			.filter_map(|table| table.iter(None).ok())
+			.map(|iter| iter.without_cache_fill())
 			.map(|iter| Box::new(iter) as BoxedLSMIterator<'_>)
 			.collect();
 
@@ -217,6 +219,11 @@ impl Compactor {
 		let _ = self.reach(CompactionStage::ManifestWritten);
 
 		self.cleanup_old_tables(input);
+
+		// The merged tables are out of the manifest: their entries in the block cache would only
+		// take the place of the entries of live tables until the cache evicted them.
+		let merged: Vec<u64> = to_merge.iter().map(|table| table.cache_id()).collect();
+		self.options.lopts.block_cache.remove_tables(&merged);
 
 		#[cfg(test)]
 		let _ = self.reach(CompactionStage::InputsRemoved);

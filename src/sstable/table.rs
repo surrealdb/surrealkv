@@ -1128,6 +1128,12 @@ impl Table {
 		}
 	}
 
+	/// The identity under which the table keeps its entries in the block cache, see
+	/// `BlockCache::remove_tables`.
+	pub(crate) fn cache_id(&self) -> u64 {
+		self.cache_id
+	}
+
 	/// Reads a data block, using cache if available.
 	pub(crate) fn read_block(&self, location: &BlockHandle) -> Result<Arc<Block>> {
 		// Check cache first
@@ -1153,6 +1159,26 @@ impl Table {
 		);
 
 		Ok(b)
+	}
+
+	/// Reads a data block, from the cache if it holds it, but does not put a block it reads from
+	/// disk into the cache.
+	///
+	/// For a read that passes over the whole table once, as a compaction does: the tables it
+	/// reads are deleted when it finishes, so their blocks would fill the cache with entries that
+	/// nothing reads again, and evict the blocks that readers use.
+	pub(crate) fn read_block_no_fill(&self, location: &BlockHandle) -> Result<Arc<Block>> {
+		if let Some(block) =
+			self.opts.block_cache.get_data_block(self.cache_id, location.offset() as u64)
+		{
+			return Ok(block);
+		}
+		let b = self.source.read_block(
+			BlockKind::Data,
+			location,
+			Arc::clone(&self.opts.internal_comparator),
+		)?;
+		Ok(Arc::new(b))
 	}
 
 	/// Reads a data block with a custom comparator, using the history cache.
@@ -1647,6 +1673,10 @@ pub(crate) struct TableIterator<'a> {
 	/// bound: then a step needs no check of that bound.
 	upper_holds: bool,
 	lower_holds: bool,
+
+	/// Whether the data blocks that the iterator reads from disk go into the block cache, see
+	/// `without_cache_fill`.
+	fill_cache: bool,
 }
 
 impl<'a> TableIterator<'a> {
@@ -1662,6 +1692,7 @@ impl<'a> TableIterator<'a> {
 			custom_comparator: None,
 			upper_holds: false,
 			lower_holds: false,
+			fill_cache: true,
 		}
 		.with_bounds_checked())
 	}
@@ -1686,8 +1717,16 @@ impl<'a> TableIterator<'a> {
 			custom_comparator: Some(comparator),
 			upper_holds: false,
 			lower_holds: false,
+			fill_cache: true,
 		}
 		.with_bounds_checked())
+	}
+
+	/// Reads the data blocks that the cache does not hold from disk without putting them into the
+	/// cache, see `Table::read_block_no_fill`. Blocks that the cache holds are still read from it.
+	pub(crate) fn without_cache_fill(mut self) -> Self {
+		self.fill_cache = false;
+		self
 	}
 
 	/// Notes which bounds of the range every point key of the table satisfies: those between its
@@ -1732,8 +1771,10 @@ impl<'a> TableIterator<'a> {
 		// Load data block - use custom comparator if set, otherwise use cached version
 		let block = if let Some(ref comparator) = self.custom_comparator {
 			self.table.read_block_with_comparator(&handle, Arc::clone(comparator))?
-		} else {
+		} else if self.fill_cache {
 			self.table.read_block(&handle)?
+		} else {
+			self.table.read_block_no_fill(&handle)?
 		};
 		if let Some(ref mut iter) = self.second_level {
 			iter.reset_with_block(&block, self.custom_comparator.as_ref())?;
