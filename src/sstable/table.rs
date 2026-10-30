@@ -73,10 +73,12 @@
 use std::cmp::Ordering;
 use std::io::Write;
 use std::ops::Bound;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use snap::raw::max_compress_len;
 
+use crate::cache::BlockCache;
 use crate::compression::CompressionSelector;
 use crate::error::{Error, Result};
 use crate::sstable::block::{
@@ -923,6 +925,9 @@ pub(crate) struct Table {
 	/// The key of this instance's blocks in the block cache: unlike `id`, never given to another
 	/// table, see `BlockSource::cache_id`.
 	cache_id: u64,
+	/// Drops the instance's entries from the block cache when the last clone of a retired table
+	/// goes, see `Table::retire`.
+	cache_release: Arc<CacheRelease>,
 	/// Reads the footer and the blocks of the table's file.
 	pub(crate) source: BlockSource,
 	pub file_size: u64,
@@ -946,6 +951,22 @@ pub(crate) struct Table {
 	/// of `LSMV2`, which every writer of this engine produces, has the property right: 0 means
 	/// that it points into no file. See `LevelManifest::load_table`.
 	pub(crate) vlog_pointers_unknown: bool,
+}
+
+/// Removes the entries of a retired table from the block cache when the last clone of the table
+/// is dropped, see `Table::retire`.
+struct CacheRelease {
+	cache_id: u64,
+	cache: Arc<BlockCache>,
+	retired: AtomicBool,
+}
+
+impl Drop for CacheRelease {
+	fn drop(&mut self) {
+		if *self.retired.get_mut() {
+			self.cache.remove_tables(&[self.cache_id]);
+		}
+	}
 }
 
 /// Per-file bloom filter reader, dispatched on which meta-index entry the
@@ -1065,6 +1086,11 @@ impl Table {
 		Ok(Table {
 			id,
 			cache_id,
+			cache_release: Arc::new(CacheRelease {
+				cache_id,
+				cache: Arc::clone(&opts.block_cache),
+				retired: AtomicBool::new(false),
+			}),
 			source,
 			file_size,
 			opts,
@@ -1132,6 +1158,14 @@ impl Table {
 	/// `BlockCache::remove_tables`.
 	pub(crate) fn cache_id(&self) -> u64 {
 		self.cache_id
+	}
+
+	/// Marks the table as merged away by a compaction: when the last reader that still holds it
+	/// lets it go, its entries leave the block cache. A reader that began before the compaction
+	/// can put blocks of the table into the cache after the compaction removed the ones that were
+	/// there, and nothing would read those again.
+	pub(crate) fn retire(&self) {
+		self.cache_release.retired.store(true, std::sync::atomic::Ordering::Release);
 	}
 
 	/// Reads a data block, using cache if available.

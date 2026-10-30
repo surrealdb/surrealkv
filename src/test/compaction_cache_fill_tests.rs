@@ -4,7 +4,8 @@
 //! instance, so nothing reads them from the cache again. Kept there, they would only take the
 //! place of blocks that readers use, and under a steady write load keep the cache at its capacity:
 //! a compaction does not put the blocks it reads into the cache, and drops the entries that
-//! readers put there for the tables it merged.
+//! readers put there for the tables it merged, also those that a reader which still holds one of
+//! them puts back after the compaction.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -196,6 +197,75 @@ async fn a_compaction_drops_the_entries_of_the_tables_it_merged() {
 	assert!(
 		cache.weight() <= opened,
 		"the cache kept entries of the merged table: {} bytes, {opened} before the reads",
+		cache.weight()
+	);
+}
+
+#[test]
+fn a_retired_table_leaves_the_cache_with_its_last_clone() {
+	let opts = Arc::new(Options::default());
+	let file = write_table(&opts);
+	let table = Arc::new(
+		Table::new(1, Arc::clone(&opts), Arc::new(file.clone()), file.len() as u64).unwrap(),
+	);
+	let clone = (*table).clone();
+
+	// A compaction merges the table away, and a reader that still holds it reads on.
+	table.retire();
+	opts.block_cache.remove_tables(&[table.cache_id()]);
+	assert_eq!(scan(&clone, true), KEYS);
+	assert!(opts.block_cache.weight() > 0);
+
+	drop(table);
+	assert!(opts.block_cache.weight() > 0, "a clone still holds the table");
+	drop(clone);
+	assert_eq!(opts.block_cache.weight(), 0);
+}
+
+#[test]
+fn a_table_that_is_not_retired_keeps_its_entries_when_dropped() {
+	let opts = Arc::new(Options::default());
+	let file = write_table(&opts);
+	let table =
+		Table::new(1, Arc::clone(&opts), Arc::new(file.clone()), file.len() as u64).unwrap();
+	assert_eq!(scan(&table, true), KEYS);
+	let weight = opts.block_cache.weight();
+	drop(table);
+	assert_eq!(opts.block_cache.weight(), weight);
+}
+
+#[test(tokio::test)]
+async fn a_scan_across_a_compaction_leaves_no_entries_of_the_merged_table() {
+	let dir = TempDir::new("compaction_cache_late").unwrap();
+	let tree = quiet(dir.path()).await;
+	let cache = &tree.core.opts.block_cache;
+
+	put(&tree, "old").await;
+	tree.compact_range(None, None, &no_flush_target(1)).unwrap();
+	let opened = cache.weight();
+
+	// A scan of the table in level 1 begins, and a compaction merges the table while it runs.
+	let txn = tree.begin().unwrap();
+	let mut iter = txn.range(&b"key"[..], &b"key~"[..]).unwrap();
+	iter.seek_first().unwrap();
+	assert!(iter.valid());
+	put(&tree, "new").await;
+	tree.compact_range(None, None, &no_flush_target(2)).unwrap();
+
+	// The scan reads on, and puts blocks of the merged table into the cache.
+	let mut rows = 0;
+	while iter.valid() {
+		rows += 1;
+		iter.next().unwrap();
+	}
+	assert_eq!(rows, KEYS);
+	assert!(cache.weight() > opened, "the scan read blocks of the merged table");
+
+	drop(iter);
+	drop(txn);
+	assert!(
+		cache.weight() <= opened,
+		"the cache kept entries of the merged table: {} bytes, {opened} before the scan",
 		cache.weight()
 	);
 }

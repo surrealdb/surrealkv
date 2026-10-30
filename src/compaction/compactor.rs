@@ -221,8 +221,12 @@ impl Compactor {
 		self.cleanup_old_tables(input);
 
 		// The merged tables are out of the manifest: their entries in the block cache would only
-		// take the place of the entries of live tables until the cache evicted them.
+		// take the place of the entries of live tables until the cache evicted them. A reader that
+		// still holds one can put blocks of it back, which leave when the last holder lets it go.
 		let merged: Vec<u64> = to_merge.iter().map(|table| table.cache_id()).collect();
+		for table in &to_merge {
+			table.retire();
+		}
 		self.options.lopts.block_cache.remove_tables(&merged);
 
 		#[cfg(test)]
