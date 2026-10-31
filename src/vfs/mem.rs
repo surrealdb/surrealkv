@@ -426,11 +426,12 @@ impl MemState {
 		self.handle(&file, name == LOCK_NAME)
 	}
 
-	/// The operations of every file that were not flushed, in the order they were made.
-	fn unflushed(files: &BTreeMap<String, Arc<MemFile>>) -> Vec<(u64, String, Op)> {
+	/// The operations of every file that were not flushed, in the order they were made, read from
+	/// locks that [`lock_every_file`](Self::lock_every_file) already holds.
+	fn unflushed(guards: &[(String, parking_lot::MutexGuard<'_, FileInner>)]) -> Vec<(u64, String, Op)> {
 		let mut all = Vec::new();
-		for (name, file) in files {
-			for (seq, op) in &file.inner.lock().pending {
+		for (name, inner) in guards {
+			for (seq, op) in &inner.pending {
 				all.push((*seq, name.clone(), op.clone()));
 			}
 		}
@@ -438,9 +439,26 @@ impl MemState {
 		all
 	}
 
+	/// Locks every file's state at once, and keeps every lock until the caller is done with them.
+	///
+	/// A crash has to read every file as of one moment: a flush of file B, on another thread,
+	/// between the moment a snapshot reads file A and the moment it reads file B, would let the
+	/// image show B's flush with no matching sign of it in A - an effect with no cause, which no
+	/// real crash can produce (one fsync, once it returns, is never partly undone by a later,
+	/// unrelated one on another file). Locking one file at a time, as this used to, leaves exactly
+	/// that gap open between any two files. Taking every lock before reading any of them closes
+	/// it: nothing can flush anywhere until the whole image is built and every lock here is
+	/// dropped.
+	fn lock_every_file(
+		files: &BTreeMap<String, Arc<MemFile>>,
+	) -> Vec<(String, parking_lot::MutexGuard<'_, FileInner>)> {
+		files.iter().map(|(name, file)| (name.clone(), file.inner.lock())).collect()
+	}
+
 	fn crash(&self, mode: CrashMode) -> MemRaw {
 		let files = self.files.lock();
-		let unflushed = Self::unflushed(&files);
+		let guards = Self::lock_every_file(&files);
+		let unflushed = Self::unflushed(&guards);
 		// Which operations survive, and in what form.
 		let mut kept: Vec<(u64, String, Op)> = Vec::new();
 		match mode {
@@ -505,9 +523,9 @@ impl MemState {
 				// over it, which a browser never does: the write is lost, and the old bytes stay.
 				// The line between the two is the durable length, which a truncation that is not
 				// flushed lowers for every write after it.
-				let mut reach: BTreeMap<&str, u64> = files
+				let mut reach: BTreeMap<&str, u64> = guards
 					.iter()
-					.map(|(name, file)| (name.as_str(), file.inner.lock().durable.len() as u64))
+					.map(|(name, inner)| (name.as_str(), inner.durable.len() as u64))
 					.collect();
 				for (seq, name, op) in &unflushed {
 					let reach = reach.entry(name.as_str()).or_default();
@@ -553,7 +571,7 @@ impl MemState {
 			}
 		}
 
-		self.image_of(&files, &kept)
+		self.image_of(&guards, &kept)
 	}
 
 	/// A crash that says what happens to each unflushed operation, in the order they were made.
@@ -561,8 +579,9 @@ impl MemState {
 	/// modes of [`CrashMode`] are some of them.
 	fn crash_by(&self, fate: &dyn Fn(usize) -> Fate) -> MemRaw {
 		let files = self.files.lock();
+		let guards = Self::lock_every_file(&files);
 		let mut kept: Vec<(u64, String, Op)> = Vec::new();
-		for (index, (seq, name, op)) in Self::unflushed(&files).into_iter().enumerate() {
+		for (index, (seq, name, op)) in Self::unflushed(&guards).into_iter().enumerate() {
 			match (fate(index), op) {
 				(Fate::Kept, op) => kept.push((seq, name, op)),
 				(
@@ -587,22 +606,24 @@ impl MemState {
 				(Fate::Torn(_), Op::SetLen(_)) | (Fate::Lost, _) => {}
 			}
 		}
-		self.image_of(&files, &kept)
+		self.image_of(&guards, &kept)
 	}
 
 	/// A backend whose files are the durable bytes of these with the operations of `kept` applied,
-	/// in the order they are given.
+	/// in the order they are given. `guards` are the locks [`lock_every_file`](Self::lock_every_file)
+	/// already took: every file's `durable` bytes here are as of the one moment that none of them
+	/// could be flushed, not as of whenever each one happened to be visited.
 	fn image_of(
 		&self,
-		files: &BTreeMap<String, Arc<MemFile>>,
+		guards: &[(String, parking_lot::MutexGuard<'_, FileInner>)],
 		kept: &[(u64, String, Op)],
 	) -> MemRaw {
 		let image = MemState::new(self.cfg);
 		let mut total = 0u64;
 		{
 			let mut out = image.files.lock();
-			for (name, file) in files.iter() {
-				let mut bytes = file.inner.lock().durable.clone();
+			for (name, inner) in guards {
+				let mut bytes = inner.durable.clone();
 				for (_, op_name, op) in kept {
 					if op_name == name {
 						// A bound that the original passed cannot fail here; if it does the op
@@ -812,7 +833,9 @@ impl MemRaw {
 
 	/// The number of operations, over all the files, that a crash may still lose.
 	pub(crate) fn unflushed_ops(&self) -> usize {
-		MemState::unflushed(&self.state.files.lock()).len()
+		let files = self.state.files.lock();
+		let guards = MemState::lock_every_file(&files);
+		MemState::unflushed(&guards).len()
 	}
 
 	/// Sets the content of a file, durably, creating it: how a test builds a state that the pool
@@ -850,7 +873,9 @@ impl MemRaw {
 	/// number of bytes (a truncation has none), which is what a test needs to enumerate the
 	/// crashes of [`MemRaw::crash_by`].
 	pub(crate) fn unflushed_shape(&self) -> Vec<(String, Option<usize>)> {
-		MemState::unflushed(&self.state.files.lock())
+		let files = self.state.files.lock();
+		let guards = MemState::lock_every_file(&files);
+		MemState::unflushed(&guards)
 			.into_iter()
 			.map(|(_, name, op)| {
 				let len = match op {
@@ -1207,6 +1232,54 @@ mod tests {
 		file.set_len(0).unwrap();
 		file.set_len(4).unwrap();
 		assert_eq!(read_all(&raw, "a"), [0, 0, 0, 0]);
+	}
+
+	#[test]
+	fn a_crash_never_shows_a_later_file_ahead_of_an_earlier_one_in_the_same_pass() {
+		const FILES: usize = 24;
+		let raw = MemRaw::new();
+		let files: Vec<MemRawFile> = (0..FILES).map(|i| create(&raw, &format!("f{i:02}"))).collect();
+		for f in &files {
+			write_all(f, 0, &0u64.to_be_bytes());
+			f.flush().unwrap();
+		}
+
+		let stop = Arc::new(AtomicBool::new(false));
+		let worker = {
+			let stop = Arc::clone(&stop);
+			std::thread::spawn(move || {
+				let mut i = 1u64;
+				while !stop.load(Ordering::Relaxed) {
+					for f in &files {
+						write_all(f, 0, &i.to_be_bytes());
+						f.flush().unwrap();
+					}
+					i += 1;
+				}
+			})
+		};
+
+		for _ in 0..50_000 {
+			let image = raw.crash(CrashMode::LoseUnsynced);
+			let values: Vec<u64> = (0..FILES)
+				.map(|idx| {
+					u64::from_be_bytes(image.image(&format!("f{idx:02}")).unwrap().try_into().unwrap())
+				})
+				.collect();
+			for w in 1..FILES {
+				assert!(
+					values[w] <= values[w - 1],
+					"the crash image shows f{w:02}={} ahead of f{:02}={}: a later file's flush \
+					 (which always comes after the one before it, with nothing in between) \
+					 survived the crash while the earlier one's did not",
+					values[w],
+					w - 1,
+					values[w - 1]
+				);
+			}
+		}
+		stop.store(true, Ordering::Relaxed);
+		worker.join().unwrap();
 	}
 
 	#[test]
