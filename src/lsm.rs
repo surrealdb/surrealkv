@@ -1589,7 +1589,8 @@ impl CoreInner {
 	/// Used by Tree::flush() and checkpoint for forced/sync flush.
 	/// Blocks until they are all in tables, including one that another flush had started. Ones
 	/// rotated meanwhile are left to the background task: waiting for them too would keep a
-	/// checkpoint of a tree under steady writes from ever finishing.
+	/// checkpoint of a tree under steady writes from ever finishing. This function does not wake
+	/// that task. `Tree::flush`, `compact_range` and `create_checkpoint` do, when any remain.
 	pub(crate) fn flush_all_immutables_sync(&self) -> Result<()> {
 		let Some(newest) = self.immutable_memtables.read()?.iter().next_back().map(|e| e.table_id)
 		else {
@@ -2730,14 +2731,16 @@ impl Core {
 			Arc::clone(&opts),
 			Arc::clone(&write_stall),
 		));
-		// A writer stalled on level 0 asks for its compaction: a stalled writer makes no flush that
-		// would. A writer stalled on the memtables needs no such thing, as every memtable that is
-		// queued wakes the flush task, which flushes until the queue is empty. The tasks hold the
-		// controller, so it holds them weakly.
+		// A stalled writer makes no flush of its own, so it asks for the work that ends the stall.
+		// A memtable queued by a sync flush is not always followed by a wake, and the flush task
+		// stays asleep until one comes. The tasks hold the controller, so it holds them weakly.
 		let tasks = Arc::downgrade(&task_manager);
 		write_stall.set_rearm(move |reason| {
-			if let (WriteStallReason::L0FileLimit, Some(tasks)) = (reason, tasks.upgrade()) {
-				tasks.wake_up_level();
+			if let Some(tasks) = tasks.upgrade() {
+				match reason {
+					WriteStallReason::MemtableLimit => tasks.wake_up_memtable(),
+					WriteStallReason::L0FileLimit => tasks.wake_up_level(),
+				}
 			}
 		});
 
@@ -3644,9 +3647,12 @@ impl Tree {
 		let result = checkpoint.create_checkpoint(checkpoint_dir);
 
 		// The checkpoint flushed memtables on this thread, which the background tasks did not
-		// see: the level-0 tables it added may need compacting, and writers may be waiting for
-		// either.
+		// see: the level-0 tables it added may need compacting. A rotation after that flush's
+		// snapshot is still queued, so the memtable task is woken when any remain.
 		if let Some(task_manager) = self.core.task_manager.lock().unwrap().as_ref() {
+			if self.core.inner.has_pending_immutables() {
+				task_manager.wake_up_memtable();
+			}
 			task_manager.wake_up_level();
 		}
 		self.core.write_stall.signal_work_done();
@@ -3935,8 +3941,15 @@ impl Tree {
 			}
 		}
 
-		// Step 2: Flush all immutable memtables synchronously
-		self.core.inner.flush_all_immutables_sync()?;
+		// Step 2: Flush the memtables queued at entry. A rotation after that snapshot
+		// stays queued, so the flush task is woken when any remain.
+		let flushed = self.core.inner.flush_all_immutables_sync();
+		if self.core.inner.has_pending_immutables() {
+			if let Some(task_manager) = self.core.task_manager.lock().unwrap().as_ref() {
+				task_manager.wake_up_memtable();
+			}
+		}
+		flushed?;
 
 		// Step 3: Signal stall controller that work completed
 		self.core.write_stall.signal_work_done();
@@ -3991,7 +4004,15 @@ impl Tree {
 			if has_data {
 				inner.rotate_memtable()?;
 			}
-			inner.flush_all_immutables_sync()?;
+			// Same snapshot as `Tree::flush`: a later rotation stays queued, so the flush
+			// task is woken when any remain.
+			let flushed = inner.flush_all_immutables_sync();
+			if inner.has_pending_immutables() {
+				if let Some(task_manager) = self.core.task_manager.lock().unwrap().as_ref() {
+					task_manager.wake_up_memtable();
+				}
+			}
+			flushed?;
 		}
 
 		let last = inner.opts.level_count.saturating_sub(1);
