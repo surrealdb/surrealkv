@@ -3648,9 +3648,10 @@ impl Tree {
 
 		// The checkpoint flushed memtables on this thread, which the background tasks did not
 		// see: the level-0 tables it added may need compacting. A rotation after that flush's
-		// snapshot is still queued, so the memtable task is woken when any remain.
+		// snapshot is still queued, so the memtable task is woken when any remain, unless the
+		// checkpoint failed: a failed flush woken again is a background error.
 		if let Some(task_manager) = self.core.task_manager.lock().unwrap().as_ref() {
-			if self.core.inner.has_pending_immutables() {
+			if result.is_ok() && self.core.inner.has_pending_immutables() {
 				task_manager.wake_up_memtable();
 			}
 			task_manager.wake_up_level();
@@ -3942,14 +3943,15 @@ impl Tree {
 		}
 
 		// Step 2: Flush the memtables queued at entry. A rotation after that snapshot
-		// stays queued, so the flush task is woken when any remain.
-		let flushed = self.core.inner.flush_all_immutables_sync();
+		// stays queued, so the flush task is woken when any remain. A failed flush wakes
+		// nothing: the task would repeat it and record a background error the caller already
+		// has.
+		self.core.inner.flush_all_immutables_sync()?;
 		if self.core.inner.has_pending_immutables() {
 			if let Some(task_manager) = self.core.task_manager.lock().unwrap().as_ref() {
 				task_manager.wake_up_memtable();
 			}
 		}
-		flushed?;
 
 		// Step 3: Signal stall controller that work completed
 		self.core.write_stall.signal_work_done();
@@ -4005,14 +4007,13 @@ impl Tree {
 				inner.rotate_memtable()?;
 			}
 			// Same snapshot as `Tree::flush`: a later rotation stays queued, so the flush
-			// task is woken when any remain.
-			let flushed = inner.flush_all_immutables_sync();
+			// task is woken when any remain, unless the flush failed.
+			inner.flush_all_immutables_sync()?;
 			if inner.has_pending_immutables() {
 				if let Some(task_manager) = self.core.task_manager.lock().unwrap().as_ref() {
 					task_manager.wake_up_memtable();
 				}
 			}
-			flushed?;
 		}
 
 		let last = inner.opts.level_count.saturating_sub(1);

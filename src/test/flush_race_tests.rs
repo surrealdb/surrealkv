@@ -12,6 +12,7 @@ use tempdir::TempDir;
 use test_log::test;
 use tokio::time::timeout;
 
+use super::tfs;
 use crate::batch::Batch;
 use crate::{CompactRangeOptions, Durability, Options, Tree};
 
@@ -243,6 +244,9 @@ async fn compact_range_wakes_memtables_rotated_after_its_flush() {
 /// have to fall below the stall threshold without a later commit.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn checkpoint_wakes_memtables_rotated_after_its_flush() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("flush_race_checkpoint").unwrap();
 	let checkpoint = TempDir::new("flush_race_checkpoint_dest").unwrap();
 	let tree = Arc::new(Tree::new(Arc::new(options(dir.path()))).unwrap());
@@ -295,7 +299,9 @@ async fn one_immutable_does_not_park_a_commit() {
 	match timeout(Duration::from_secs(10), commit_value(&tree, b"after", b"value")).await {
 		Ok(Ok(())) => {}
 		Ok(Err(e)) => panic!("commit failed at the stall threshold: {e}"),
-		Err(_) => panic!("commit parked once two memtables were queued ({})", note_stall_state(&tree)),
+		Err(_) => {
+			panic!("commit parked once two memtables were queued ({})", note_stall_state(&tree))
+		}
 	}
 	assert!(
 		saw_stall.load(Ordering::SeqCst),

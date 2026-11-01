@@ -1849,6 +1849,10 @@ mod get_for_update_tests {
 		txn2.commit().await.unwrap();
 	}
 
+	#[allow(
+		clippy::await_holding_lock,
+		reason = "the flush lock is held across the commit on purpose, to stall it"
+	)]
 	#[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 	async fn cancelled_commit_success_on_retry() {
 		let temp_dir = create_temp_directory();

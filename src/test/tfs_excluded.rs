@@ -8,6 +8,7 @@ use super::tfs::{rule, Rule, Why};
 /// The skip table.
 pub(crate) static EXCLUDED: &[Rule] = &[
 	rule("test::checkpoint_concurrency_tests::", Why::Checkpoint),
+	rule("test::flush_race_tests::checkpoint_wakes_memtables_rotated_after_its_flush", Why::Checkpoint),
 	rule("test::encryption_background_tests::", Why::Encryption),
 	rule("test::encryption_checkpoint_tests::", Why::Checkpoint),
 	rule("test::encryption_checkpoint_wal_tests::", Why::Checkpoint),
