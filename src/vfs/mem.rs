@@ -428,7 +428,9 @@ impl MemState {
 
 	/// The operations of every file that were not flushed, in the order they were made, read from
 	/// locks that [`lock_every_file`](Self::lock_every_file) already holds.
-	fn unflushed(guards: &[(String, parking_lot::MutexGuard<'_, FileInner>)]) -> Vec<(u64, String, Op)> {
+	fn unflushed(
+		guards: &[(String, parking_lot::MutexGuard<'_, FileInner>)],
+	) -> Vec<(u64, String, Op)> {
 		let mut all = Vec::new();
 		for (name, inner) in guards {
 			for (seq, op) in &inner.pending {
@@ -445,10 +447,9 @@ impl MemState {
 	/// between the moment a snapshot reads file A and the moment it reads file B, would let the
 	/// image show B's flush with no matching sign of it in A - an effect with no cause, which no
 	/// real crash can produce (one fsync, once it returns, is never partly undone by a later,
-	/// unrelated one on another file). Locking one file at a time, as this used to, leaves exactly
-	/// that gap open between any two files. Taking every lock before reading any of them closes
-	/// it: nothing can flush anywhere until the whole image is built and every lock here is
-	/// dropped.
+	/// unrelated one on another file). Taking every lock before reading any of them closes that gap
+	/// between any two files: nothing can flush anywhere until the whole image is built and every
+	/// lock here is dropped.
 	fn lock_every_file(
 		files: &BTreeMap<String, Arc<MemFile>>,
 	) -> Vec<(String, parking_lot::MutexGuard<'_, FileInner>)> {
@@ -610,9 +611,10 @@ impl MemState {
 	}
 
 	/// A backend whose files are the durable bytes of these with the operations of `kept` applied,
-	/// in the order they are given. `guards` are the locks [`lock_every_file`](Self::lock_every_file)
-	/// already took: every file's `durable` bytes here are as of the one moment that none of them
-	/// could be flushed, not as of whenever each one happened to be visited.
+	/// in the order they are given. `guards` are the locks
+	/// [`lock_every_file`](Self::lock_every_file) already took: every file's `durable` bytes here
+	/// are as of the one moment that none of them could be flushed, not as of whenever each one
+	/// happened to be visited.
 	fn image_of(
 		&self,
 		guards: &[(String, parking_lot::MutexGuard<'_, FileInner>)],
@@ -1238,7 +1240,8 @@ mod tests {
 	fn a_crash_never_shows_a_later_file_ahead_of_an_earlier_one_in_the_same_pass() {
 		const FILES: usize = 24;
 		let raw = MemRaw::new();
-		let files: Vec<MemRawFile> = (0..FILES).map(|i| create(&raw, &format!("f{i:02}"))).collect();
+		let files: Vec<MemRawFile> =
+			(0..FILES).map(|i| create(&raw, &format!("f{i:02}"))).collect();
 		for f in &files {
 			write_all(f, 0, &0u64.to_be_bytes());
 			f.flush().unwrap();
@@ -1263,7 +1266,9 @@ mod tests {
 			let image = raw.crash(CrashMode::LoseUnsynced);
 			let values: Vec<u64> = (0..FILES)
 				.map(|idx| {
-					u64::from_be_bytes(image.image(&format!("f{idx:02}")).unwrap().try_into().unwrap())
+					u64::from_be_bytes(
+						image.image(&format!("f{idx:02}")).unwrap().try_into().unwrap(),
+					)
 				})
 				.collect();
 			for w in 1..FILES {
