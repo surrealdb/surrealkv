@@ -95,6 +95,8 @@ pub mod encryption_typed_errors_tests;
 #[cfg(test)]
 pub mod failed_open_tests;
 #[cfg(test)]
+pub mod flush_race_tests;
+#[cfg(test)]
 pub mod flusher_alloc_diet_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod format_gate_tests;

@@ -1849,7 +1849,11 @@ mod get_for_update_tests {
 		txn2.commit().await.unwrap();
 	}
 
-	#[test(tokio::test)]
+	#[allow(
+		clippy::await_holding_lock,
+		reason = "the flush lock is held across the commit on purpose, to stall it"
+	)]
+	#[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 	async fn cancelled_commit_success_on_retry() {
 		let temp_dir = create_temp_directory();
 		let store = TreeBuilder::new()
@@ -1857,7 +1861,10 @@ mod get_for_update_tests {
 			.with_memtable_stall_threshold(2)
 			.build()
 			.unwrap();
-		// Force commit to wait before writing.
+		// Force commit to wait before writing. A stalled writer wakes the flush task,
+		// which would drop these empty memtables and let the commit through. The flush
+		// lock is held so that task cannot clear the stall until the commit is cancelled.
+		// Two workers: the flush blocks one of them on the lock.
 		{
 			let mut immutables = store.core.inner.immutable_memtables.write().unwrap();
 			immutables.add(1, 0, Arc::new(crate::memtable::MemTable::new(1024)));
@@ -1871,7 +1878,9 @@ mod get_for_update_tests {
 		assert!(txn.get_for_update(&locked).unwrap().is_none());
 		txn.set(&written, b"value").unwrap();
 
+		let flush = store.core.inner.flush_lock.lock();
 		let result = tokio::time::timeout(std::time::Duration::from_millis(20), txn.commit()).await;
+		drop(flush);
 		assert!(result.is_err(), "the deliberately stalled commit should time out");
 
 		// A cancelled commit must close the transaction.
