@@ -405,9 +405,11 @@ fn a_removed_file_with_an_unsynced_tail_comes_back_with_its_synced_part_or_not_a
 
 #[test]
 fn the_older_manifest_that_a_mount_cleans_is_never_the_one_that_is_read() {
-	// A crash that lost the free header of the old manifest leaves two slots that name it, and
-	// the mount cleans the one with the lower sequence number: the crash images of that mount are
-	// mounted too.
+	// The old manifest's free header is now flushed at the point it is superseded (see
+	// `do_replace_atomic`), not left for a later, unrelated flush to catch: a crash that loses
+	// everything unflushed no longer finds two slots that name the path, so there is no loser
+	// left for a mount to clean. What this test still has to show is that the manifest read back
+	// is always the newer one, never the one it superseded.
 	let checked = enumerate_mount(
 		&|| {
 			let (fs, raw) = memory_pool();
@@ -418,7 +420,7 @@ fn the_older_manifest_that_a_mount_cleans_is_never_the_one_that_is_read() {
 			let image = raw.crash(CrashMode::LoseUnsynced);
 			let (probe, report) =
 				PoolFs::mount_sync(image.snapshot(), PoolConfig::memory()).unwrap();
-			assert_eq!(report.losers_cleaned, 1, "the old manifest is a loser");
+			assert_eq!(report.losers_cleaned, 0, "the old manifest was already durably freed");
 			drop(probe);
 			image
 		},
@@ -1212,4 +1214,113 @@ mod slots_over_crashes {
 		})
 		.await;
 	}
+}
+
+#[test]
+fn a_removed_file_never_comes_back_as_the_value_it_superseded() {
+	// replace_atomic(M, "one"), replace_atomic(M, "two"), remove_file(M). The old slot's free
+	// write (from the second replace) and the newer slot's free write (from the remove) are both
+	// unflushed. A crash that loses the old slot's free write but keeps the newer slot's leaves
+	// only the old slot claiming M, with no competing slot to compare a sequence number against.
+	let checked = enumerate(&Scenario {
+		prepare: &|| memory_pool(),
+		run: &|fs| {
+			let mut acks = Vec::new();
+			if fs.replace_atomic(p("/d/MANIFEST"), &[STALE; 200]).is_ok() {
+				acks.push("wrote_one");
+			}
+			if fs.replace_atomic(p("/d/MANIFEST"), &[b'N'; 120]).is_ok() {
+				acks.push("wrote_two");
+			}
+			if fs.remove_file(p("/d/MANIFEST")).is_ok() {
+				acks.push("removed");
+			}
+			acks
+		},
+		check: &|fs, acks, context| {
+			if acks.contains(&"wrote_one")
+				&& acks.contains(&"wrote_two")
+				&& acks.contains(&"removed")
+			{
+				assert_ne!(
+					read(fs, "/d/MANIFEST").as_deref(),
+					Some(&[STALE; 200][..]),
+					"{context}: the removed file came back as the value it superseded"
+				);
+			}
+		},
+	});
+	assert!(checked > 10, "{checked}");
+}
+
+#[test]
+fn a_rename_whose_header_write_failed_is_not_made_durable_by_a_later_sync() {
+	// The header write of a rename lands its whole page but still reports an error. rename()
+	// returns Err and does not revert (it only reverts on a flush failure). The caller, believing
+	// the rename did not happen, keeps using the file under its old name and syncs it: that flush
+	// is a barrier over every earlier write to the slot, including the one the failed rename left
+	// behind unflushed.
+	let (fs, raw) = memory_pool();
+	put(&fs, "/d/a", b"content");
+
+	raw.write_then_fail(4096);
+	let rename_result = fs.rename(p("/d/a"), p("/d/b"));
+	assert!(rename_result.is_err(), "the armed write should have failed the rename");
+
+	let file = fs.open_append_existing(p("/d/a")).expect("the old name still resolves");
+	file.append(b"more").unwrap();
+	file.sync().unwrap();
+
+	let image = raw.crash(CrashMode::LoseUnsynced);
+	let (mounted, _) = PoolFs::mount_sync(image.clone(), PoolConfig::memory()).expect("mount");
+	mounted.create_dir_all(p("/d")).unwrap();
+	assert!(
+		read(&mounted, "/d/b").is_none(),
+		"a rename that returned an error became durable under its new name"
+	);
+	assert!(read(&mounted, "/d/a").is_some(), "the file under its old name is gone");
+}
+
+#[test]
+fn a_removed_file_never_comes_back_as_the_value_a_rename_superseded() {
+	// The same shape as replace_atomic, but with a rename over an existing name: rename src1 onto
+	// M (M holds "one"), rename src2 onto M (supersedes, M now holds "two"), remove_file(M). The
+	// old slot's free write (from the second rename, which overwrites M) and the newer slot's
+	// free write (from the remove) are both candidates to be lost independently. The two sources
+	// are made and synced in `prepare`, uninterrupted: only the rename/rename/remove sequence
+	// itself is what the crash-point sweep is over.
+	let checked = enumerate(&Scenario {
+		prepare: &|| {
+			let (fs, raw) = memory_pool();
+			put(&fs, "/d/src1", &[STALE; 200]);
+			put(&fs, "/d/src2", &[b'N'; 120]);
+			(fs, raw)
+		},
+		run: &|fs| {
+			let mut acks = Vec::new();
+			if fs.rename(p("/d/src1"), p("/d/M")).is_ok() {
+				acks.push("named_one");
+			}
+			if fs.rename(p("/d/src2"), p("/d/M")).is_ok() {
+				acks.push("named_two");
+			}
+			if fs.remove_file(p("/d/M")).is_ok() {
+				acks.push("removed");
+			}
+			acks
+		},
+		check: &|fs, acks, context| {
+			if acks.contains(&"named_one")
+				&& acks.contains(&"named_two")
+				&& acks.contains(&"removed")
+			{
+				assert_ne!(
+					read(fs, "/d/M").as_deref(),
+					Some(&[STALE; 200][..]),
+					"{context}: the removed file came back as the value a rename superseded"
+				);
+			}
+		},
+	});
+	assert!(checked > 10, "{checked}");
 }
