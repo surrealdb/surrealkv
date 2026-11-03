@@ -209,3 +209,58 @@ async fn manifest_referencing_zero_byte_sst_fails_cleanly() {
 		Err(other) => panic!("expected LoadManifestFail, got: {other}"),
 	}
 }
+
+/// Test for https://github.com/surrealdb/surrealkv/issues/428 on the 0.21 line.
+///
+/// A commit is appended to the active WAL segment before its memtable insert.
+/// When that insert finds the arena full, the memtable rotates and the batch
+/// lands in the new memtable while its record stays in the old segment. Once
+/// the old memtable is flushed, `log_number` moves past that segment, so after
+/// an unclean shutdown the batch is gone even with `Durability::Immediate`.
+///
+/// NOTE: must stay on the default current-thread runtime (no `multi_thread`),
+/// and there must be no `.await` between `drop(tree)` and reopen, so that the
+/// best-effort async close spawned by `Drop` is never polled.
+#[test(tokio::test)]
+async fn unclean_shutdown_must_not_lose_the_commit_that_rotates_the_memtable() {
+	let temp_dir = TempDir::new("test").unwrap();
+	let opts = Arc::new(Options {
+		path: temp_dir.path().to_path_buf(),
+		// Small arena: many rotations, each triggered by a commit's insert.
+		max_memtable_size: 64 * 1024,
+		// Crash semantics: nothing may be flushed on drop/close.
+		flush_on_close: false,
+		..Default::default()
+	});
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let mut acknowledged = Vec::new();
+	for i in 0..1000u32 {
+		let key = format!("key_{i:05}");
+		let mut txn = tree.begin().unwrap();
+		txn.set_durability(crate::Durability::Immediate);
+		txn.set(key.as_bytes(), &[b'v'; 256]).unwrap();
+		txn.commit().await.unwrap();
+		acknowledged.push(key);
+	}
+
+	// Flush every rotated-out memtable, as the background flush would, which
+	// retires their WAL segments.
+	tree.core.inner.flush_all_immutables_sync().unwrap();
+	let log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+	assert!(log_number > 0, "expected memtable rotations to retire WAL segments");
+
+	// Simulate the crash: release the lock (so reopen works) and drop the
+	// tree without a clean close().
+	{
+		let mut lockfile = tree.core.inner.lockfile.lock().unwrap();
+		lockfile.release().unwrap();
+	}
+	drop(tree);
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let txn = tree.begin().unwrap();
+	let missing: Vec<&String> =
+		acknowledged.iter().filter(|key| txn.get(key.as_bytes()).unwrap().is_none()).collect();
+	assert!(missing.is_empty(), "acknowledged commits lost after unclean shutdown: {missing:?}");
+}
