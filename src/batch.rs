@@ -27,6 +27,12 @@ pub(crate) struct Batch {
 	// the pipeline overwrites it before the batch is written to WAL.
 	pub(crate) starting_seq_num: u64,
 	pub(crate) size: u64, // Total size of all records (not serialized)
+	// WAL segment holding this batch's record, stamped by the commit env's
+	// `write()` (not serialized). `apply()` uses it to keep the record and
+	// the memtable entries in the same segment (surrealkv#428 backport).
+	pub(crate) wal_segment: Option<u64>,
+	// Whether the commit asked for a synced WAL write (not serialized).
+	pub(crate) sync: bool,
 }
 
 impl Default for Batch {
@@ -43,6 +49,8 @@ impl Batch {
 			version: BATCH_VERSION,
 			starting_seq_num,
 			size: 0,
+			wal_segment: None,
+			sync: false,
 		}
 	}
 
@@ -299,6 +307,8 @@ impl Batch {
 			valueptrs,
 			starting_seq_num: seq_num,
 			size: 0, // Decoded batches don't track size
+			wal_segment: None,
+			sync: false,
 		})
 	}
 }
