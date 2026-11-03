@@ -270,7 +270,7 @@ impl CoreInner {
 		&self,
 		memtable: Arc<MemTable>,
 		table_id: u64,
-		wal_number: u64,
+		log_number: u64,
 	) -> Result<Arc<Table>> {
 		let collect_bptree = self.versioned_index.is_some();
 
@@ -316,13 +316,12 @@ impl CoreInner {
 		// Step 3: Prepare atomic changeset
 		let mut changeset = ManifestChangeSet::default();
 		changeset.new_tables.push((0, Arc::clone(&table)));
-		changeset.log_number = Some(wal_number + 1);
+		changeset.log_number = Some(log_number);
 
 		log::debug!(
-			"Changeset prepared: table_id={}, log_number={} (WAL #{:020} flushed)",
+			"Changeset prepared: table_id={}, log_number={}",
 			table_id,
-			wal_number + 1,
-			wal_number
+			log_number
 		);
 
 		// Step 4: Apply changeset atomically
@@ -336,7 +335,7 @@ impl CoreInner {
 			let error = Error::Other(format!(
 				"Failed to atomically update manifest: table_id={}, log_number={}: {}",
 				table_id,
-				wal_number + 1,
+				log_number,
 				e
 			));
 			self.error_handler.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
@@ -354,7 +353,7 @@ impl CoreInner {
 		log::info!(
 			"Manifest updated atomically: table_id={}, log_number={}, last_sequence={}",
 			table_id,
-			wal_number + 1,
+			log_number,
 			manifest.get_last_sequence()
 		);
 
@@ -477,7 +476,7 @@ impl CoreInner {
 		let table = self.flush_immutable_to_sst(
 			Arc::clone(&entry.memtable),
 			entry.table_id,
-			entry.wal_number,
+			entry.wal_number + 1,
 		)?;
 
 		// Schedule async WAL cleanup
@@ -605,7 +604,7 @@ impl CoreInner {
 		let table = self.flush_immutable_to_sst(
 			Arc::clone(&flushed_memtable),
 			table_id,
-			wal_that_was_flushed,
+			wal_that_was_flushed + 1,
 		)?;
 
 		Ok(Some(table))
@@ -670,7 +669,7 @@ impl CoreInner {
 			self.flush_immutable_to_sst(
 				Arc::clone(&entry.memtable),
 				entry.table_id,
-				entry.wal_number,
+				entry.wal_number + 1,
 			)?;
 
 			flushed_count += 1;
@@ -943,6 +942,8 @@ impl CommitEnv for LsmCommitEnv {
 		if sync {
 			wal_guard.sync()?;
 		}
+		processed_batch.wal_segment = Some(wal_guard.get_active_log_number());
+		processed_batch.sync = sync;
 		drop(wal_guard);
 
 		Ok(processed_batch)
@@ -960,30 +961,61 @@ impl CommitEnv for LsmCommitEnv {
 	/// `apply()` outside its `write_mutex`, so concurrent calls to this
 	/// function on the same active memtable are routine.
 	fn apply(&self, batch: &Batch) -> Result<()> {
-		// Try to add to current memtable
-		let result = {
-			let active_memtable = self.core.active_memtable.read()?;
-			active_memtable.add(batch)
-		};
-
-		match result {
-			Ok(()) => Ok(()),
-			Err(Error::ArenaFull) => {
-				// Arena is full - rotate memtable and retry
-				log::debug!("apply: arena full, rotating memtable");
-
-				self.core.rotate_memtable()?;
-
-				// Schedule background flush
-				if let Some(ref task_manager) = self.task_manager {
-					task_manager.wake_up_memtable();
-				}
-
-				// Retry on new memtable - must succeed
+		// surrealkv#428 backport. `write()` appended this batch to WAL segment
+		// `batch.wal_segment`, but `apply()` runs outside `write_mutex`, so a
+		// rotation (ours on ArenaFull, or a concurrent committer's) can leave the
+		// active memtable on a newer segment. Flushing the older memtable then
+		// retires the record's segment while its entries live only in memory, and
+		// an unclean shutdown loses an acknowledged commit. Holding the active
+		// memtable read lock blocks rotation (which needs the write lock), so the
+		// active WAL segment equals the memtable's while we re-append and insert.
+		// Replay skips the duplicate record by its starting sequence number.
+		let mut record_segment = batch.wal_segment;
+		let mut rotated = false;
+		loop {
+			let result = {
 				let active_memtable = self.core.active_memtable.read()?;
+				let memtable_segment = active_memtable.get_wal_number();
+				if let Some(segment) = record_segment {
+					if segment != memtable_segment {
+						let enc_bytes = batch.encode()?;
+						let mut wal_guard = self.core.wal.write();
+						let active_segment = wal_guard.get_active_log_number();
+						if active_segment != memtable_segment {
+							return Err(Error::Other(format!(
+								"WAL segment {active_segment} does not match active memtable segment {memtable_segment}"
+							)));
+						}
+						wal_guard.append(&enc_bytes)?;
+						if batch.sync {
+							wal_guard.sync()?;
+						}
+						drop(wal_guard);
+						log::debug!(
+							"apply: re-appended batch seq={} from WAL #{} to WAL #{}",
+							batch.starting_seq_num,
+							segment,
+							memtable_segment
+						);
+						record_segment = Some(memtable_segment);
+					}
+				}
 				active_memtable.add(batch)
+			};
+
+			match result {
+				Ok(()) => return Ok(()),
+				Err(Error::ArenaFull) if !rotated => {
+					// Arena is full - rotate memtable and retry once
+					log::debug!("apply: arena full, rotating memtable");
+					self.core.rotate_memtable()?;
+					if let Some(ref task_manager) = self.task_manager {
+						task_manager.wake_up_memtable();
+					}
+					rotated = true;
+				}
+				Err(e) => return Err(e),
 			}
-			Err(e) => Err(e),
 		}
 	}
 
@@ -1128,9 +1160,12 @@ impl Core {
 		let memtable_count = memtables.len();
 		if memtable_count > 1 {
 			log::info!("Recovery: flushing {} intermediate memtables to SST", memtable_count - 1);
-			for (memtable, wal_number) in memtables.iter().take(memtable_count - 1) {
+			// A WAL segment can be split over several memtables on replay, so a
+			// flushed memtable may only advance log_number to the segment of the
+			// memtable after it (upstream #423).
+			for (i, (memtable, _)) in memtables.iter().enumerate().take(memtable_count - 1) {
 				if !memtable.is_empty() {
-					flush_memtable(Arc::clone(memtable), *wal_number)?;
+					flush_memtable(Arc::clone(memtable), memtables[i + 1].1)?;
 				}
 			}
 		}
@@ -1212,14 +1247,14 @@ impl Core {
 			"Database startup",
 			opts.wal_recovery_mode,
 			opts.max_memtable_size,
-			|memtable, wal_number| {
+			|memtable, log_number| {
 				// Flush intermediate memtable to SST during recovery
 				let table_id = inner.level_manifest.read()?.next_table_id();
-				inner.flush_immutable_to_sst(Arc::clone(&memtable), table_id, wal_number)?;
+				inner.flush_immutable_to_sst(Arc::clone(&memtable), table_id, log_number)?;
 				log::info!(
-					"Recovery: flushed memtable to SST table_id={}, wal_number={}",
+					"Recovery: flushed memtable to SST table_id={}, log_number={}",
 					table_id,
-					wal_number
+					log_number
 				);
 				Ok(())
 			},
@@ -1614,18 +1649,18 @@ impl Tree {
 			"Database restore",
 			self.core.inner.opts.wal_recovery_mode,
 			self.core.inner.opts.max_memtable_size,
-			|memtable, wal_number| {
+			|memtable, log_number| {
 				// Flush intermediate memtable to SST during recovery
 				let table_id = self.core.inner.level_manifest.read()?.next_table_id();
 				self.core.inner.flush_immutable_to_sst(
 					Arc::clone(&memtable),
 					table_id,
-					wal_number,
+					log_number,
 				)?;
 				log::info!(
-					"Restore: flushed memtable to SST table_id={}, wal_number={}",
+					"Restore: flushed memtable to SST table_id={}, log_number={}",
 					table_id,
-					wal_number
+					log_number
 				);
 				Ok(())
 			},

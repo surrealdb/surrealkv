@@ -121,6 +121,10 @@ pub(crate) fn replay_wal(
 	let mut total_batches_replayed = 0;
 	let mut segments_processed = 0;
 
+	// `apply()` may re-append a batch that a memtable rotation overtook to the
+	// newer segment (surrealkv#428 backport); replay each starting sequence once.
+	let mut replayed_batches: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
 	// Collect memtables - one per WAL segment
 	let mut memtables: Vec<(Arc<MemTable>, u64)> = Vec::new();
 
@@ -162,6 +166,14 @@ pub(crate) fn replay_wal(
 				Ok((record_data, offset)) => {
 					last_valid_offset = offset as usize;
 					let batch = Batch::decode(record_data)?;
+					if !batch.is_empty() && !replayed_batches.insert(batch.starting_seq_num) {
+						log::debug!(
+							"Skipping re-appended batch seq_num={} in WAL #{:020}",
+							batch.starting_seq_num,
+							segment_id
+						);
+						continue;
+					}
 					let batch_highest_seq_num = batch.get_highest_seq_num();
 
 					if batch_highest_seq_num > max_seq_num {
