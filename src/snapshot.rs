@@ -129,6 +129,7 @@ impl SnapshotTracker {
 
 // ===== Iterator State =====
 /// Holds references to all LSM tree components needed for iteration.
+#[derive(Clone)]
 pub(crate) struct IterState {
 	/// The active memtable receiving current writes
 	pub active: Arc<MemTable>,
@@ -201,6 +202,13 @@ fn collect_iter_state(core: &Core) -> Result<IterState> {
 		immutable,
 		levels,
 	})
+}
+
+/// The memtables and tables a snapshot reads many keys from, captured once.
+pub(crate) struct ReadView {
+	state: IterState,
+	/// The range deletions of the tables, `(start, end, seq)`, of the snapshot's time or before
+	table_range_deletions: Vec<(Key, Key, u64)>,
 }
 
 // ===== Snapshot Implementation =====
@@ -366,6 +374,103 @@ impl Snapshot {
 						}
 						return Ok(Some((val, seq_num)));
 					}
+				}
+			}
+		}
+
+		Ok(None)
+	}
+
+	/// Captures the memtables and tables once, to read many keys through
+	/// [`Snapshot::get_in_view`] without taking the tree's locks again for each.
+	///
+	/// The view is an `Arc` copy of the state, so no lock is held while the keys are read, and a
+	/// flush or a compaction that runs meanwhile does not wait for the reader.
+	pub(crate) fn read_view(&self) -> Result<ReadView> {
+		let state = collect_iter_state(&self.core)?;
+		// The range deletions of the tables that this snapshot reads, found once instead of by
+		// a walk over every table for each key
+		let mut table_range_deletions = Vec::new();
+		for level in &state.levels {
+			for table in &level.tables {
+				if table.has_range_deletions() {
+					table_range_deletions.extend(
+						table
+							.range_deletions
+							.read()
+							.iter()
+							.filter(|r| r.2 <= self.seq_num)
+							.cloned(),
+					);
+				}
+			}
+		}
+		Ok(ReadView {
+			state,
+			table_range_deletions,
+		})
+	}
+
+	/// Gets a single key as [`Snapshot::get`] does, from a view captured by
+	/// [`Snapshot::read_view`].
+	pub(crate) fn get_in_view(
+		&self,
+		view: &ReadView,
+		key: &[u8],
+	) -> crate::Result<Option<(Value, u64)>> {
+		let mut max_range_delete_seq: Option<u64> = None;
+		let mut cover = |start: &Key, end: &Key, seq: u64| {
+			if seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
+				max_range_delete_seq = Some(max_range_delete_seq.map_or(seq, |s| s.max(seq)));
+			}
+		};
+
+		// A found version answers unless a delete or a range delete hides it
+		let answer = |trailer: u64, val: Value, rseq: Option<u64>| {
+			if crate::is_delete_kind(crate::trailer_to_kind(trailer)) {
+				return None;
+			}
+			let seq_num = crate::trailer_to_seq_num(trailer);
+			if rseq.is_some_and(|rseq| seq_num <= rseq) {
+				return None;
+			}
+			Some((val, seq_num))
+		};
+
+		// 1. The active memtable, then 2. the immutable ones, newest first
+		for memtable in std::iter::once(&view.state.active).chain(view.state.immutable.iter().rev())
+		{
+			if memtable.has_range_deletions() {
+				for (start, end, seq) in memtable.range_deletions.read().iter() {
+					cover(start, end, *seq);
+				}
+			}
+			if let Some((trailer, val)) = memtable.get_raw(key, Some(self.seq_num)) {
+				return Ok(answer(trailer, val, max_range_delete_seq));
+			}
+		}
+
+		// 3. The tables
+		for (start, end, seq) in &view.table_range_deletions {
+			cover(start, end, *seq);
+		}
+		let key_encoded = SmallKeyBuf::from_internal_parts(key, self.seq_num, InternalKeyKind::Set);
+		for (level_idx, level) in view.state.levels.0.iter().enumerate() {
+			if level_idx == 0 {
+				// Level 0: Tables can overlap, check newest to oldest
+				for table in level.tables.iter() {
+					if !table.is_user_key_in_range(key) {
+						continue;
+					}
+					if let Some((trailer, val)) = table.get_encoded(key, key_encoded.as_slice())? {
+						return Ok(answer(trailer, val, max_range_delete_seq));
+					}
+				}
+			} else if let Some(table) =
+				level.find_table_for_user_key(key, &self.core.opts.comparator)
+			{
+				if let Some((trailer, val)) = table.get_encoded(key, key_encoded.as_slice())? {
+					return Ok(answer(trailer, val, max_range_delete_seq));
 				}
 			}
 		}
@@ -571,14 +676,23 @@ impl Snapshot {
 		if !self.core.opts.enable_versioning {
 			return Err(Error::InvalidArgument("Versioning not enabled".to_string()));
 		}
+		self.version_at_in(key, timestamp, self.collect_iter_state()?)
+	}
 
+	/// [`Snapshot::version_at`] over a state the caller captured, so that many keys read one
+	/// capture of the tree instead of one each.
+	pub(crate) fn version_at_in(
+		&self,
+		key: &[u8],
+		timestamp: u64,
+		iter_state: IterState,
+	) -> Result<Option<SnapshotVersion>> {
 		let mut upper = key.to_vec();
 		upper.push(0);
 		let range = crate::user_range_to_internal_range(
 			Bound::Included(key),
 			Bound::Excluded(upper.as_slice()),
 		);
-		let iter_state = self.collect_iter_state()?;
 		let range_deletions = iter_state.range_deletions(Some(key));
 		let mut merge = KMergeIterator::new_from(iter_state, range);
 		// After every version of the key: the next key's first entry, or the end. Going back from

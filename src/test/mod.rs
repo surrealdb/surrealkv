@@ -189,6 +189,7 @@ pub mod scrub_encryption_tests;
 #[cfg(test)]
 pub mod sfs;
 #[cfg(test)]
+pub mod get_many_tests;
 pub mod snapshot_tests;
 #[cfg(test)]
 pub mod sstable_encryption_tests;
