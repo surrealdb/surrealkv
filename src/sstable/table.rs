@@ -1504,10 +1504,9 @@ impl Table {
 		};
 
 		if InternalKey::user_key_from_encoded(found_key) == user_key {
-			Ok(Some((
-				InternalKey::trailer_from_encoded(found_key),
-				BlockValue::new(Arc::clone(&data_block), value_bytes),
-			)))
+			let trailer = InternalKey::trailer_from_encoded(found_key);
+			let range = BlockValue::range_in(&data_block, value_bytes);
+			Ok(Some((trailer, BlockValue::new(data_block, range))))
 		} else {
 			Ok(None)
 		}

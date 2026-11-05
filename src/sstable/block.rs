@@ -283,15 +283,20 @@ pub(crate) struct BlockValue {
 }
 
 impl BlockValue {
-	/// The value bytes, which must be a sub-slice of the data of `block`.
-	pub(crate) fn new(block: Arc<Block>, value: &[u8]) -> Self {
+	/// Where `value`, a sub-slice of the data of `block`, lies in it.
+	pub(crate) fn range_in(block: &Block, value: &[u8]) -> (usize, usize) {
 		let base = block.block.as_slice().as_ptr() as usize;
 		let start = value.as_ptr() as usize - base;
 		debug_assert!(start + value.len() <= block.block.as_slice().len());
+		(start, start + value.len())
+	}
+
+	/// The bytes of `block` in `range`, as [`BlockValue::range_in`] gives it.
+	pub(crate) fn new(block: Arc<Block>, range: (usize, usize)) -> Self {
 		Self {
 			block,
-			start,
-			end: start + value.len(),
+			start: range.0,
+			end: range.1,
 		}
 	}
 
