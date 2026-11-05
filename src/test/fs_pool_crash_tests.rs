@@ -1272,7 +1272,7 @@ fn a_rename_whose_header_write_failed_is_not_made_durable_by_a_later_sync() {
 	file.sync().unwrap();
 
 	let image = raw.crash(CrashMode::LoseUnsynced);
-	let (mounted, _) = PoolFs::mount_sync(image.clone(), PoolConfig::memory()).expect("mount");
+	let (mounted, _) = PoolFs::mount_sync(image, PoolConfig::memory()).expect("mount");
 	mounted.create_dir_all(p("/d")).unwrap();
 	assert!(
 		read(&mounted, "/d/b").is_none(),
