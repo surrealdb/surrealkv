@@ -66,16 +66,23 @@ async fn main() {
 	let keep_every = env("KEEP_EVERY", 12) as u64;
 	let kept = AtomicU64::new(0);
 	let bytes = AtomicU64::new(0);
-	let t = Instant::now();
+	let distinct = env("DISTINCT", 200);
+	let ready = std::sync::Barrier::new(threads + 1);
+	let mut t = Instant::now();
 	std::thread::scope(|scope| {
 		for n in 0..threads {
-			let (tree, kept, bytes) = (&tree, &kept, &bytes);
+			let (tree, kept, bytes, ready) = (&tree, &kept, &bytes, &ready);
 			scope.spawn(move || {
 				let mut rng = fastrand::Rng::with_seed(n as u64);
 				let mut local = (0u64, 0u64);
-				for _ in 0..batches {
-					let keys: Vec<Vec<u8>> =
-						(0..batch).map(|_| key(rng.u64(0..records))).collect();
+				// The keys are made before the timed window and reused in turn: making them
+				// is a lot of small allocations, which would be most of what is measured
+				let sets: Vec<Vec<Vec<u8>>> = (0..distinct)
+					.map(|_| (0..batch).map(|_| key(rng.u64(0..records))).collect())
+					.collect();
+				ready.wait();
+				for round in 0..batches {
+					let keys = &sets[round % distinct];
 					let tx = tree.begin().unwrap();
 					// A record is kept when its id, stored in its first bytes, says so
 					let keep = |v: &[u8]| {
@@ -83,7 +90,7 @@ async fn main() {
 					};
 					if borrowed {
 						let mut kept_values: Vec<Vec<u8>> = Vec::new();
-						tx.get_many_with(&keys, |_, v| {
+						tx.get_many_with(keys, |_, v| {
 							if let Some(v) = v.filter(|v| keep(v)) {
 								kept_values.push(v.to_vec());
 							}
@@ -92,7 +99,7 @@ async fn main() {
 						local.0 += kept_values.len() as u64;
 						local.1 += kept_values.iter().map(|v| v.len() as u64).sum::<u64>();
 					} else {
-						let values = tx.get_many(&keys).unwrap();
+						let values = tx.get_many(keys).unwrap();
 						for v in values.into_iter().flatten().filter(|v| keep(v)) {
 							local.0 += 1;
 							local.1 += v.len() as u64;
@@ -103,6 +110,9 @@ async fn main() {
 				bytes.fetch_add(local.1, Ordering::Relaxed);
 			});
 		}
+		// The clock starts when every thread has its keys
+		ready.wait();
+		t = Instant::now();
 	});
 	let wall = t.elapsed();
 	let reads = (threads * batch * batches) as f64;
