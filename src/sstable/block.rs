@@ -274,6 +274,37 @@ pub(crate) struct Block {
 	comparator: Arc<dyn Comparator>,
 }
 
+/// A value inside a data block, held by the block's `Arc` so that the bytes stay valid for as
+/// long as it lives, whether or not the cache still holds the block.
+pub(crate) struct BlockValue {
+	block: Arc<Block>,
+	start: usize,
+	end: usize,
+}
+
+impl BlockValue {
+	/// Where `value`, a sub-slice of the data of `block`, lies in it.
+	pub(crate) fn range_in(block: &Block, value: &[u8]) -> (usize, usize) {
+		let base = block.block.as_slice().as_ptr() as usize;
+		let start = value.as_ptr() as usize - base;
+		debug_assert!(start + value.len() <= block.block.as_slice().len());
+		(start, start + value.len())
+	}
+
+	/// The bytes of `block` in `range`, as [`BlockValue::range_in`] gives it.
+	pub(crate) fn new(block: Arc<Block>, range: (usize, usize)) -> Self {
+		Self {
+			block,
+			start: range.0,
+			end: range.1,
+		}
+	}
+
+	pub(crate) fn as_slice(&self) -> &[u8] {
+		&self.block.block.as_slice()[self.start..self.end]
+	}
+}
+
 impl Block {
 	/// Creates a new Block from raw data.
 	///

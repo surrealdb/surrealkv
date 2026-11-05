@@ -86,6 +86,7 @@ use crate::sstable::block::{
 	BlockData,
 	BlockHandle,
 	BlockIterator,
+	BlockValue,
 	BlockWriter,
 	SmallKeyBuf,
 };
@@ -1439,6 +1440,18 @@ impl Table {
 		user_key: &[u8],
 		key_encoded: &[u8],
 	) -> Result<Option<(u64, Value)>> {
+		Ok(self
+			.get_encoded_ref(user_key, key_encoded)?
+			.map(|(trailer, value)| (trailer, value.as_slice().to_vec())))
+	}
+
+	/// [`Table::get_encoded`] that hands back the value where the block holds it, held by the
+	/// block, instead of a copy.
+	pub(crate) fn get_encoded_ref(
+		&self,
+		user_key: &[u8],
+		key_encoded: &[u8],
+	) -> Result<Option<(u64, BlockValue)>> {
 		if self.holds_only_range_deletions() {
 			return Ok(None);
 		}
@@ -1491,7 +1504,9 @@ impl Table {
 		};
 
 		if InternalKey::user_key_from_encoded(found_key) == user_key {
-			Ok(Some((InternalKey::trailer_from_encoded(found_key), value_bytes.to_vec())))
+			let trailer = InternalKey::trailer_from_encoded(found_key);
+			let range = BlockValue::range_in(&data_block, value_bytes);
+			Ok(Some((trailer, BlockValue::new(data_block, range))))
 		} else {
 			Ok(None)
 		}

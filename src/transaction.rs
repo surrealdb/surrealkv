@@ -626,6 +626,109 @@ impl Transaction {
 		self.get_with_options(key, &ReadOptions::default())
 	}
 
+	/// Gets the values of many keys, one entry per key in the order given.
+	///
+	/// Every entry is what [`Transaction::get`] answers for its key, but the memtables and
+	/// tables are captured once for the whole batch instead of through the locks of the tree for
+	/// each key.
+	pub fn get_many<K>(&self, keys: &[K]) -> Result<Vec<Option<Value>>>
+	where
+		K: IntoBytes,
+	{
+		let mut values = Vec::with_capacity(keys.len());
+		self.get_many_with(keys, |_, value| values.push(value.map(<[u8]>::to_vec)))?;
+		Ok(values)
+	}
+
+	/// Gets the values of many keys and hands each to `f` as `(index in keys, value)`, in the
+	/// order of the keys, without copying the value out of where the tree holds it.
+	///
+	/// The value is what [`Transaction::get`] answers for the key, and is valid only inside the
+	/// call to `f`. A key that is missing, or deleted, is `None`. An error stops the batch, after
+	/// the keys that `f` was already called for.
+	pub fn get_many_with<K, F>(&self, keys: &[K], mut f: F) -> Result<()>
+	where
+		K: IntoBytes,
+		F: FnMut(usize, Option<&[u8]>),
+	{
+		// If the transaction is closed, return an error.
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		for key in keys {
+			// If the key is empty, return an error.
+			if key.as_slice().is_empty() {
+				return Err(Error::EmptyKey);
+			}
+			// Do not allow reads if it is a write-only transaction
+			if self.mode.is_write_only() {
+				return Err(Error::TransactionWriteOnly);
+			}
+		}
+
+		let mut view = None;
+		for (index, key) in keys.iter().enumerate() {
+			self.lookup_with(key.as_slice(), &mut view, |value| f(index, value))?;
+		}
+		Ok(())
+	}
+
+	/// Gets a value for a key as [`Transaction::get`] does and hands it to `f`, without copying
+	/// it out of where the tree holds it. The value is valid only inside the call to `f`.
+	pub fn get_with<K, R, F>(&self, key: K, f: F) -> Result<R>
+	where
+		K: IntoBytes,
+		F: FnOnce(Option<&[u8]>) -> R,
+	{
+		// If the transaction is closed, return an error.
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		// If the key is empty, return an error.
+		if key.as_slice().is_empty() {
+			return Err(Error::EmptyKey);
+		}
+		// Do not allow reads if it is a write-only transaction
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
+		self.lookup_with(key.as_slice(), &mut None, f)
+	}
+
+	/// Answers one key that passed the checks of a read as [`Transaction::get_with_options`]
+	/// does: the write set over the snapshot. The snapshot is captured into `view` by the first
+	/// key that needs it, for the keys after it.
+	fn lookup_with<R>(
+		&self,
+		key: &[u8],
+		view: &mut Option<crate::snapshot::ReadView>,
+		f: impl FnOnce(Option<&[u8]>) -> R,
+	) -> Result<R> {
+		// RYOW semantics: the write set answers before the snapshot
+		let range_delete_entry = self.pending_range_delete(key);
+		if let Some(last_entry) = self.write_set.get(key).and_then(|entries| entries.last()) {
+			let hidden = range_delete_entry.is_some_and(|r| r.seqno > last_entry.seqno);
+			return Ok(f(match (&last_entry.value, hidden || last_entry.is_tombstone()) {
+				(Some(v), false) => Some(v.as_slice()),
+				_ => None,
+			}));
+		} else if range_delete_entry.is_some() {
+			return Ok(f(None));
+		}
+		// The value is not in the write set, so it is in the snapshot
+		let snapshot = self.snapshot.as_ref().unwrap();
+		if view.is_none() {
+			*view = Some(snapshot.read_view()?);
+		}
+		match snapshot.get_in_view_ref(view.as_ref().unwrap(), key)? {
+			Some((stored, _)) => {
+				let value = self.core.resolve_value_ref(stored.as_slice())?;
+				Ok(f(Some(&value)))
+			}
+			None => Ok(f(None)),
+		}
+	}
+
 	/// Gets a value for a key if it exists, and registers the key for
 	/// commit-time conflict validation.
 	///
@@ -677,12 +780,19 @@ impl Transaction {
 	where
 		K: IntoBytes,
 	{
+		self.check_versioned_read(key.as_slice())?;
+		self.get_at_checked(key.as_slice(), timestamp, None)
+	}
+
+	/// The checks every read of a key makes before it looks, as [`Transaction::get_at`] orders
+	/// them.
+	fn check_versioned_read(&self, key: &[u8]) -> Result<()> {
 		// If the transaction is closed, return an error.
 		if self.closed {
 			return Err(Error::TransactionClosed);
 		}
 		// If the key is empty, return an error.
-		if key.as_slice().is_empty() {
+		if key.is_empty() {
 			return Err(Error::EmptyKey);
 		}
 
@@ -696,15 +806,79 @@ impl Transaction {
 		if !self.core.opts.enable_versioning {
 			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
 		}
+		Ok(())
+	}
 
+	/// Gets the values of many keys as of `timestamp`, one entry per key in the order given.
+	///
+	/// Every entry is what [`Transaction::get_at`] answers for its key, but the memtables and
+	/// tables are captured once for the whole batch instead of once for each key.
+	pub fn get_many_at<K>(&self, keys: &[K], timestamp: u64) -> Result<Vec<Option<Value>>>
+	where
+		K: IntoBytes,
+	{
+		let mut values = Vec::with_capacity(keys.len());
+		self.get_many_at_with(keys, timestamp, |_, value| values.push(value.map(<[u8]>::to_vec)))?;
+		Ok(values)
+	}
+
+	/// Gets the values of many keys as of `timestamp` and hands each to `f` as `(index in keys,
+	/// value)`, in the order of the keys.
+	///
+	/// The value is what [`Transaction::get_at`] answers for the key, and is valid only inside
+	/// the call to `f`. A version is read through the iterators of the tree, which hand out
+	/// copies, so unlike [`Transaction::get_many_with`] this does not save the copy of the value.
+	pub fn get_many_at_with<K, F>(&self, keys: &[K], timestamp: u64, mut f: F) -> Result<()>
+	where
+		K: IntoBytes,
+		F: FnMut(usize, Option<&[u8]>),
+	{
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		for key in keys {
+			self.check_versioned_read(key.as_slice())?;
+		}
+		// A transaction with no snapshot answers each key with its own error
+		let state = match (&self.snapshot, keys.is_empty()) {
+			(Some(snapshot), false) => Some(snapshot.collect_iter_state()?),
+			_ => None,
+		};
+		for (index, key) in keys.iter().enumerate() {
+			let value = self.get_at_checked(key.as_slice(), timestamp, state.as_ref())?;
+			f(index, value.as_deref());
+		}
+		Ok(())
+	}
+
+	/// Gets a value for a key as [`Transaction::get_at`] does and hands it to `f`. The value is
+	/// valid only inside the call to `f`; a version is read as a copy, so this saves none.
+	pub fn get_at_with<K, R, F>(&self, key: K, timestamp: u64, f: F) -> Result<R>
+	where
+		K: IntoBytes,
+		F: FnOnce(Option<&[u8]>) -> R,
+	{
+		self.check_versioned_read(key.as_slice())?;
+		let value = self.get_at_checked(key.as_slice(), timestamp, None)?;
+		Ok(f(value.as_deref()))
+	}
+
+	/// [`Transaction::get_at`] for a key that passed [`Transaction::check_versioned_read`], from
+	/// the tree state the caller captured if it gives one.
+	fn get_at_checked(
+		&self,
+		key: &[u8],
+		timestamp: u64,
+		state: Option<&crate::snapshot::IterState>,
+	) -> Result<Option<Value>> {
 		// RYOW: the version of the write set that answers at `timestamp`, as it would once
 		// committed. A write of the transaction at a time that has not come is not a candidate,
 		// and one to be stamped with the time of its commit is after every time that has passed.
-		let range_delete = self.pending_range_delete(key.as_slice());
+		let range_delete = self.pending_range_delete(key);
 		// What the snapshot holds for the key is hidden by a delete of the transaction
 		let mut snapshot_hidden = range_delete.is_some();
 		let mut best: Option<&Entry> = None;
-		for entry in self.write_set.get(key.as_slice()).into_iter().flatten() {
+		for entry in self.write_set.get(key).into_iter().flatten() {
 			// A range delete of the transaction that came after the write hides it
 			if range_delete.is_some_and(|r| r.seqno > entry.seqno) {
 				continue;
@@ -729,7 +903,10 @@ impl Transaction {
 		// What the snapshot holds of the key, as of the time
 		let stored = match &self.snapshot {
 			Some(_) if snapshot_hidden => None,
-			Some(snapshot) => snapshot.version_at(key.as_slice(), timestamp)?,
+			Some(snapshot) => match state {
+				Some(state) => snapshot.version_at_in(key, timestamp, state.clone())?,
+				None => snapshot.version_at(key, timestamp)?,
+			},
 			None => return Err(Error::NoSnapshot),
 		};
 

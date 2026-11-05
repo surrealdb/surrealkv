@@ -119,6 +119,8 @@ pub mod fs_probe;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod fs_std_tests;
 #[cfg(test)]
+pub mod get_many_tests;
+#[cfg(test)]
 pub mod group_fail_stop_edge_tests;
 #[cfg(test)]
 pub mod group_fail_stop_tests;
