@@ -10,7 +10,7 @@ use crate::iter::BoxedLSMIterator;
 use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
-use crate::sstable::block::SmallKeyBuf;
+use crate::sstable::block::{BlockValue, SmallKeyBuf};
 use crate::sstable::table::Table;
 use crate::vlog::ValueLocation;
 use crate::{
@@ -202,6 +202,22 @@ fn collect_iter_state(core: &Core) -> Result<IterState> {
 		immutable,
 		levels,
 	})
+}
+
+/// An encoded value as a read finds it: in the arena of a memtable, which the view holds, or in
+/// a data block, which the value holds.
+pub(crate) enum StoredValue<'v> {
+	Memtable(&'v [u8]),
+	Block(BlockValue),
+}
+
+impl StoredValue<'_> {
+	pub(crate) fn as_slice(&self) -> &[u8] {
+		match self {
+			Self::Memtable(value) => value,
+			Self::Block(value) => value.as_slice(),
+		}
+	}
 }
 
 /// The memtables and tables a snapshot reads many keys from, captured once.
@@ -412,12 +428,12 @@ impl Snapshot {
 	}
 
 	/// Gets a single key as [`Snapshot::get`] does, from a view captured by
-	/// [`Snapshot::read_view`].
-	pub(crate) fn get_in_view(
+	/// [`Snapshot::read_view`], with the encoded value where it is held instead of a copy of it.
+	pub(crate) fn get_in_view_ref<'v>(
 		&self,
-		view: &ReadView,
+		view: &'v ReadView,
 		key: &[u8],
-	) -> crate::Result<Option<(Value, u64)>> {
+	) -> crate::Result<Option<(StoredValue<'v>, u64)>> {
 		let mut max_range_delete_seq: Option<u64> = None;
 		let mut cover = |start: &Key, end: &Key, seq: u64| {
 			if seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
@@ -426,7 +442,7 @@ impl Snapshot {
 		};
 
 		// A found version answers unless a delete or a range delete hides it
-		let answer = |trailer: u64, val: Value, rseq: Option<u64>| {
+		let answer = |trailer: u64, val: StoredValue<'v>, rseq: Option<u64>| {
 			if crate::is_delete_kind(crate::trailer_to_kind(trailer)) {
 				return None;
 			}
@@ -445,8 +461,8 @@ impl Snapshot {
 					cover(start, end, *seq);
 				}
 			}
-			if let Some((trailer, val)) = memtable.get_raw(key, Some(self.seq_num)) {
-				return Ok(answer(trailer, val, max_range_delete_seq));
+			if let Some((trailer, val)) = memtable.get_raw_ref(key, Some(self.seq_num)) {
+				return Ok(answer(trailer, StoredValue::Memtable(val), max_range_delete_seq));
 			}
 		}
 
@@ -462,15 +478,17 @@ impl Snapshot {
 					if !table.is_user_key_in_range(key) {
 						continue;
 					}
-					if let Some((trailer, val)) = table.get_encoded(key, key_encoded.as_slice())? {
-						return Ok(answer(trailer, val, max_range_delete_seq));
+					if let Some((trailer, val)) =
+						table.get_encoded_ref(key, key_encoded.as_slice())?
+					{
+						return Ok(answer(trailer, StoredValue::Block(val), max_range_delete_seq));
 					}
 				}
 			} else if let Some(table) =
 				level.find_table_for_user_key(key, &self.core.opts.comparator)
 			{
-				if let Some((trailer, val)) = table.get_encoded(key, key_encoded.as_slice())? {
-					return Ok(answer(trailer, val, max_range_delete_seq));
+				if let Some((trailer, val)) = table.get_encoded_ref(key, key_encoded.as_slice())? {
+					return Ok(answer(trailer, StoredValue::Block(val), max_range_delete_seq));
 				}
 			}
 		}

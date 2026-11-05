@@ -635,6 +635,22 @@ impl Transaction {
 	where
 		K: IntoBytes,
 	{
+		let mut values = Vec::with_capacity(keys.len());
+		self.get_many_with(keys, |_, value| values.push(value.map(<[u8]>::to_vec)))?;
+		Ok(values)
+	}
+
+	/// Gets the values of many keys and hands each to `f` as `(index in keys, value)`, in the
+	/// order of the keys, without copying the value out of where the tree holds it.
+	///
+	/// The value is what [`Transaction::get`] answers for the key, and is valid only inside the
+	/// call to `f`. A key that is missing, or deleted, is `None`. An error stops the batch, after
+	/// the keys that `f` was already called for.
+	pub fn get_many_with<K, F>(&self, keys: &[K], mut f: F) -> Result<()>
+	where
+		K: IntoBytes,
+		F: FnMut(usize, Option<&[u8]>),
+	{
 		// If the transaction is closed, return an error.
 		if self.closed {
 			return Err(Error::TransactionClosed);
@@ -650,34 +666,67 @@ impl Transaction {
 			}
 		}
 
-		let mut values = Vec::with_capacity(keys.len());
 		let mut view = None;
-		for key in keys {
-			let key = key.as_slice();
-			// RYOW semantics: the write set answers before the snapshot, as in `get`
-			let range_delete_entry = self.pending_range_delete(key);
-			if let Some(last_entry) = self.write_set.get(key).and_then(|entries| entries.last()) {
-				let hidden = range_delete_entry.is_some_and(|r| r.seqno > last_entry.seqno);
-				values.push(match (&last_entry.value, hidden || last_entry.is_tombstone()) {
-					(Some(v), false) => Some(v.clone()),
-					_ => None,
-				});
-				continue;
-			} else if range_delete_entry.is_some() {
-				values.push(None);
-				continue;
-			}
-			// The value is not in the write set, so it is in the snapshot
-			let snapshot = self.snapshot.as_ref().unwrap();
-			if view.is_none() {
-				view = Some(snapshot.read_view()?);
-			}
-			values.push(match snapshot.get_in_view(view.as_ref().unwrap(), key)? {
-				Some(val) => Some(self.core.resolve_owned_value(val.0)?),
-				None => None,
-			});
+		for (index, key) in keys.iter().enumerate() {
+			self.lookup_with(key.as_slice(), &mut view, |value| f(index, value))?;
 		}
-		Ok(values)
+		Ok(())
+	}
+
+	/// Gets a value for a key as [`Transaction::get`] does and hands it to `f`, without copying
+	/// it out of where the tree holds it. The value is valid only inside the call to `f`.
+	pub fn get_with<K, R, F>(&self, key: K, f: F) -> Result<R>
+	where
+		K: IntoBytes,
+		F: FnOnce(Option<&[u8]>) -> R,
+	{
+		// If the transaction is closed, return an error.
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		// If the key is empty, return an error.
+		if key.as_slice().is_empty() {
+			return Err(Error::EmptyKey);
+		}
+		// Do not allow reads if it is a write-only transaction
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
+		self.lookup_with(key.as_slice(), &mut None, f)
+	}
+
+	/// Answers one key that passed the checks of a read as [`Transaction::get_with_options`]
+	/// does: the write set over the snapshot. The snapshot is captured into `view` by the first
+	/// key that needs it, for the keys after it.
+	fn lookup_with<R>(
+		&self,
+		key: &[u8],
+		view: &mut Option<crate::snapshot::ReadView>,
+		f: impl FnOnce(Option<&[u8]>) -> R,
+	) -> Result<R> {
+		// RYOW semantics: the write set answers before the snapshot
+		let range_delete_entry = self.pending_range_delete(key);
+		if let Some(last_entry) = self.write_set.get(key).and_then(|entries| entries.last()) {
+			let hidden = range_delete_entry.is_some_and(|r| r.seqno > last_entry.seqno);
+			return Ok(f(match (&last_entry.value, hidden || last_entry.is_tombstone()) {
+				(Some(v), false) => Some(v.as_slice()),
+				_ => None,
+			}));
+		} else if range_delete_entry.is_some() {
+			return Ok(f(None));
+		}
+		// The value is not in the write set, so it is in the snapshot
+		let snapshot = self.snapshot.as_ref().unwrap();
+		if view.is_none() {
+			*view = Some(snapshot.read_view()?);
+		}
+		match snapshot.get_in_view_ref(view.as_ref().unwrap(), key)? {
+			Some((stored, _)) => {
+				let value = self.core.resolve_value_ref(stored.as_slice())?;
+				Ok(f(Some(&value)))
+			}
+			None => Ok(f(None)),
+		}
 	}
 
 	/// Gets a value for a key if it exists, and registers the key for
@@ -768,6 +817,22 @@ impl Transaction {
 	where
 		K: IntoBytes,
 	{
+		let mut values = Vec::with_capacity(keys.len());
+		self.get_many_at_with(keys, timestamp, |_, value| values.push(value.map(<[u8]>::to_vec)))?;
+		Ok(values)
+	}
+
+	/// Gets the values of many keys as of `timestamp` and hands each to `f` as `(index in keys,
+	/// value)`, in the order of the keys.
+	///
+	/// The value is what [`Transaction::get_at`] answers for the key, and is valid only inside
+	/// the call to `f`. A version is read through the iterators of the tree, which hand out
+	/// copies, so unlike [`Transaction::get_many_with`] this does not save the copy of the value.
+	pub fn get_many_at_with<K, F>(&self, keys: &[K], timestamp: u64, mut f: F) -> Result<()>
+	where
+		K: IntoBytes,
+		F: FnMut(usize, Option<&[u8]>),
+	{
 		if self.closed {
 			return Err(Error::TransactionClosed);
 		}
@@ -779,9 +844,23 @@ impl Transaction {
 			(Some(snapshot), false) => Some(snapshot.collect_iter_state()?),
 			_ => None,
 		};
-		keys.iter()
-			.map(|key| self.get_at_checked(key.as_slice(), timestamp, state.as_ref()))
-			.collect()
+		for (index, key) in keys.iter().enumerate() {
+			let value = self.get_at_checked(key.as_slice(), timestamp, state.as_ref())?;
+			f(index, value.as_deref());
+		}
+		Ok(())
+	}
+
+	/// Gets a value for a key as [`Transaction::get_at`] does and hands it to `f`. The value is
+	/// valid only inside the call to `f`; a version is read as a copy, so this saves none.
+	pub fn get_at_with<K, R, F>(&self, key: K, timestamp: u64, f: F) -> Result<R>
+	where
+		K: IntoBytes,
+		F: FnOnce(Option<&[u8]>) -> R,
+	{
+		self.check_versioned_read(key.as_slice())?;
+		let value = self.get_at_checked(key.as_slice(), timestamp, None)?;
+		Ok(f(value.as_deref()))
 	}
 
 	/// [`Transaction::get_at`] for a key that passed [`Transaction::check_versioned_read`], from

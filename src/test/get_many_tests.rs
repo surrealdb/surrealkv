@@ -326,3 +326,154 @@ async fn get_many_at_fails_as_get_at_does() {
 	assert!(matches!(tx.get_many_at(&keys, 10), Err(Error::InvalidArgument(_))));
 	assert!(matches!(tx.get_at(key(1), 10), Err(Error::InvalidArgument(_))));
 }
+
+// ===== Borrowed reads =====
+
+fn many_with(tx: &crate::Transaction, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+	let mut out = Vec::new();
+	tx.get_many_with(keys, |i, v| {
+		assert_eq!(i, out.len(), "called in the order of the keys");
+		out.push(v.map(<[u8]>::to_vec));
+	})
+	.unwrap();
+	out
+}
+
+fn many_at_with(tx: &crate::Transaction, keys: &[Vec<u8>], at: u64) -> Vec<Option<Vec<u8>>> {
+	let mut out = Vec::new();
+	tx.get_many_at_with(keys, at, |i, v| {
+		assert_eq!(i, out.len());
+		out.push(v.map(<[u8]>::to_vec));
+	})
+	.unwrap();
+	out
+}
+
+fn one_with(tx: &crate::Transaction, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+	keys.iter().map(|k| tx.get_with(k.as_slice(), |v| v.map(<[u8]>::to_vec)).unwrap()).collect()
+}
+
+fn assert_borrowed_match(tx: &crate::Transaction, keys: &[Vec<u8>], versioned: bool) {
+	let owned = per_key(tx, keys);
+	assert_eq!(many_with(tx, keys), owned);
+	assert_eq!(one_with(tx, keys), owned);
+	if versioned {
+		for at in TIMES {
+			let owned = per_key_at(tx, keys, at);
+			assert_eq!(many_at_with(tx, keys, at), owned, "at {at}");
+			let one: Vec<_> = keys
+				.iter()
+				.map(|k| tx.get_at_with(k.as_slice(), at, |v| v.map(<[u8]>::to_vec)).unwrap())
+				.collect();
+			assert_eq!(one, owned, "at {at}");
+		}
+	}
+}
+
+#[test(tokio::test)]
+async fn borrowed_reads_answer_as_owned_reads_for_every_layer() {
+	let (tree, _dir) = layered_tree().await;
+	assert_borrowed_match(&tree.begin().unwrap(), &probe_keys(), false);
+	// With a sealed memtable that is not flushed yet, and versions
+	let (tree, _dir) = layered_versioned_tree().await;
+	assert_borrowed_match(&tree.begin().unwrap(), &probe_keys(), true);
+}
+
+#[test(tokio::test)]
+async fn borrowed_reads_read_the_write_set_over_the_snapshot() {
+	let (tree, _dir) = layered_versioned_tree().await;
+	let mut tx = tree.begin().unwrap();
+	tx.set(key(1), b"own".to_vec()).unwrap();
+	tx.delete(key(5)).unwrap();
+	tx.set_at(key(11), b"own-11".to_vec(), 12).unwrap();
+	tx.soft_delete(key(13)).unwrap();
+	tx.delete_range(key(90), key(95)).unwrap();
+	tx.set(key(92), b"own-92".to_vec()).unwrap();
+	tx.delete_range(key(42), key(44)).unwrap();
+	assert_borrowed_match(&tx, &probe_keys(), true);
+}
+
+#[test(tokio::test)]
+async fn borrowed_reads_hold_through_a_flush_and_a_compaction() {
+	let (tree, _dir) = layered_versioned_tree().await;
+	let tx = tree.begin().unwrap();
+	let keys = probe_keys();
+	let before = many_with(&tx, &keys);
+	flush_sealed(&tree);
+	commit(&tree, |tx| {
+		for i in 0..60 {
+			tx.set_at(key(i), b"later".to_vec(), 40).unwrap();
+		}
+	})
+	.await;
+	seal(&tree);
+	flush_sealed(&tree);
+	tree.compact_range(None, None, &CompactRangeOptions::default()).unwrap();
+	assert_eq!(many_with(&tx, &keys), before);
+	assert_eq!(one_with(&tx, &keys), before);
+	assert_borrowed_match(&tree.begin().unwrap(), &keys, true);
+}
+
+#[test(tokio::test)]
+async fn borrowed_reads_resolve_values_kept_in_the_value_log() {
+	let dir = TempDir::new("get_many_vlog").unwrap();
+	let tree = TreeBuilder::new()
+		.with_path(dir.path().to_path_buf())
+		.with_enable_vlog(true)
+		.with_vlog_value_threshold(16)
+		.build()
+		.unwrap();
+	commit(&tree, |tx| {
+		for i in 0..40 {
+			// Half of the values are over the threshold, so they are kept in the log
+			let value = if i % 2 == 0 {
+				vec![b'x'; 200 + i]
+			} else {
+				vec![b'y'; 4]
+			};
+			tx.set(key(i), value).unwrap();
+		}
+	})
+	.await;
+	let keys: Vec<_> = (0..45).map(key).collect();
+	// From the memtable, then from a table
+	assert_borrowed_match(&tree.begin().unwrap(), &keys, false);
+	tree.flush().unwrap();
+	let tx = tree.begin().unwrap();
+	assert_borrowed_match(&tx, &keys, false);
+	assert_eq!(many_with(&tx, &keys)[4], Some(vec![b'x'; 204]));
+}
+
+#[test(tokio::test)]
+async fn borrowed_reads_fail_as_owned_reads_do() {
+	let (tree, _dir) = layered_versioned_tree().await;
+	let keys = vec![key(1), key(2)];
+	let mut tx = tree.begin().unwrap();
+	tx.rollback();
+	assert!(matches!(tx.get_many_with(&keys, |_, _| ()), Err(Error::TransactionClosed)));
+	assert!(matches!(tx.get_with(key(1), |_| ()), Err(Error::TransactionClosed)));
+	assert!(matches!(tx.get_many_at_with(&keys, 10, |_, _| ()), Err(Error::TransactionClosed)));
+	assert!(matches!(tx.get_at_with(key(1), 10, |_| ()), Err(Error::TransactionClosed)));
+
+	let tx = tree.begin_with_mode(Mode::WriteOnly).unwrap();
+	assert!(matches!(tx.get_many_with(&keys, |_, _| ()), Err(Error::TransactionWriteOnly)));
+	assert!(matches!(tx.get_with(key(1), |_| ()), Err(Error::TransactionWriteOnly)));
+	assert!(matches!(tx.get_many_at_with(&keys, 10, |_, _| ()), Err(Error::TransactionWriteOnly)));
+	assert!(matches!(tx.get_at_with(key(1), 10, |_| ()), Err(Error::TransactionWriteOnly)));
+
+	let tx = tree.begin().unwrap();
+	let empty = vec![key(1), Vec::new()];
+	let mut seen = 0;
+	assert!(matches!(tx.get_many_with(&empty, |_, _| seen += 1), Err(Error::EmptyKey)));
+	// The keys are checked before any is read
+	assert_eq!(seen, 0);
+	assert!(matches!(tx.get_with(Vec::new(), |_| ()), Err(Error::EmptyKey)));
+	assert!(matches!(tx.get_many_at_with(&empty, 10, |_, _| ()), Err(Error::EmptyKey)));
+	assert!(matches!(tx.get_at_with(Vec::new(), 10, |_| ()), Err(Error::EmptyKey)));
+	tx.get_many_with::<Vec<u8>, _>(&[], |_, _| panic!("no keys")).unwrap();
+
+	let (plain, _plain_dir) = layered_tree().await;
+	let tx = plain.begin().unwrap();
+	assert!(matches!(tx.get_many_at_with(&keys, 10, |_, _| ()), Err(Error::InvalidArgument(_))));
+	assert!(matches!(tx.get_at_with(key(1), 10, |_| ()), Err(Error::InvalidArgument(_))));
+}

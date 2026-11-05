@@ -233,6 +233,12 @@ impl MemTable {
 	/// Looks up `key` at or below `seq_no`, returning `(trailer, value)` without allocating
 	/// a copy of `key`.
 	pub(crate) fn get_raw(&self, key: &[u8], seq_no: Option<u64>) -> Option<(u64, Value)> {
+		self.get_raw_ref(key, seq_no).map(|(trailer, value)| (trailer, value.to_vec()))
+	}
+
+	/// [`MemTable::get_raw`] that borrows the value from the arena, valid as long as the
+	/// memtable is.
+	pub(crate) fn get_raw_ref(&self, key: &[u8], seq_no: Option<u64>) -> Option<(u64, &[u8])> {
 		let max_seq = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
 		let max_trailer = (max_seq << 8) | 0xFF;
 
@@ -246,7 +252,11 @@ impl MemTable {
 			}
 		}
 
-		let point_res = self.map.get_version_le(key, max_trailer);
+		let point_res = self
+			.map
+			.get_entry(key)
+			.and_then(|entry| entry.get_version_le(max_trailer))
+			.map(|(trailer, value)| (trailer, value.as_slice()));
 
 		if let Some(rseq) = range_tombstone_seq {
 			if let Some((trailer, _)) = &point_res {
