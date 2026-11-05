@@ -119,6 +119,8 @@ pub mod fs_probe;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod fs_std_tests;
 #[cfg(test)]
+pub mod get_many_tests;
+#[cfg(test)]
 pub mod group_fail_stop_edge_tests;
 #[cfg(test)]
 pub mod group_fail_stop_tests;
@@ -189,7 +191,6 @@ pub mod scrub_encryption_tests;
 #[cfg(test)]
 pub mod sfs;
 #[cfg(test)]
-pub mod get_many_tests;
 pub mod snapshot_tests;
 #[cfg(test)]
 pub mod sstable_encryption_tests;
