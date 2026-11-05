@@ -85,9 +85,8 @@ async fn main() {
 					let keys = &sets[round % distinct];
 					let tx = tree.begin().unwrap();
 					// A record is kept when its id, stored in its first bytes, says so
-					let keep = |v: &[u8]| {
-						u64::from_le_bytes(v[..8].try_into().unwrap()) % keep_every == 0
-					};
+					let keep =
+						|v: &[u8]| u64::from_le_bytes(v[..8].try_into().unwrap()) % keep_every == 0;
 					if borrowed {
 						let mut kept_values: Vec<Vec<u8>> = Vec::new();
 						tx.get_many_with(keys, |_, v| {
