@@ -2167,11 +2167,15 @@ impl<R: Raw> PoolFs<R> {
 				path.display()
 			)));
 		}
-		// 5. The old slot is dead.
+		// 5. The old slot is dead. Flushed here, not left to a later, unrelated flush: if this
+		// slot's name is removed afterward (remove_file frees its slot without a flush of its own,
+		// by design), nothing durable is left to compare a revived claim from this old slot
+		// against.
 		let old = ns.files.insert(key, slot);
 		drop(ns);
 		if let Some(old) = old {
 			let _ = shared.write_header(&old, HeaderState::Free);
+			let _ = shared.flush_slot(&old);
 			shared.unlink(&old);
 		}
 		Ok(())
@@ -2311,7 +2315,15 @@ impl<R: Raw> Fs for PoolFs<R> {
 		}
 		// The commit point is the flush of this slot: before it the file is still `a` (a torn page
 		// fails its checksum and the old page names `a`), and after it the file is `b`.
-		shared.write_header(&slot, HeaderState::Named(b.clone()))?;
+		if let Err(e) = shared.write_header(&slot, HeaderState::Named(b.clone())) {
+			// The write can land its whole page and still report failure: the same danger as a
+			// flush failure below, since a mount reads the page by its checksum and sequence
+			// number, not by whether the call that wrote it returned Ok. The same defense applies:
+			// write `a` again, over the same target page (`write_header` picks it deterministically
+			// from the generation counters, which this failed call did not advance).
+			let _ = shared.write_header(&slot, HeaderState::Named(a));
+			return Err(e);
+		}
 		if let Err(e) = shared.flush_slot(&slot) {
 			// The header may have landed, and a mount may find the file under `b`: the rename
 			// failed, and the outcome is open. The header of `a` is written again, over the page
@@ -2328,9 +2340,13 @@ impl<R: Raw> Fs for PoolFs<R> {
 		let old = ns.files.insert(b, slot);
 		drop(ns);
 		if let Some(old) = old {
-			// After the flush: if this free header is lost, the mount sees two claimants of the
-			// path, and the one with the higher sequence number wins.
+			// Flushed here, not left to a later, unrelated flush: the two-claimants defense below
+			// only holds while both claimants are still around to compare sequence numbers. A
+			// remove of the new name after this rename, which frees its slot without a flush of
+			// its own by design, would otherwise leave nothing durable to compare this slot's
+			// revived claim against.
 			let _ = shared.write_header(&old, HeaderState::Free);
+			let _ = shared.flush_slot(&old);
 			shared.unlink(&old);
 		}
 		Ok(())
@@ -2900,12 +2916,17 @@ mod tests {
 			2,
 			"a replacement is two"
 		);
-		assert_eq!(flushes(&|| fs.replace_atomic(p("/d/M"), b"two").unwrap()), 2);
+		assert_eq!(
+			flushes(&|| fs.replace_atomic(p("/d/M"), b"two").unwrap()),
+			3,
+			"a replacement that supersedes an existing file also flushes its old slot's free header"
+		);
 		assert_eq!(fs.stats().dirty, 2, "the removed file and the first manifest are dead");
 		assert_eq!(
 			flushes(&|| assert_eq!(fs.maintain(1), 1)),
-			2,
-			"a clean of a slot that has bytes is two flushes: the free header, then the cut"
+			1,
+			"a clean of a slot that has bytes is one flush, the cut: the free header of a slot \
+			 that was superseded by a replacement is already flushed by the time it is dead"
 		);
 		assert_eq!(
 			flushes(&|| assert_eq!(fs.maintain(10), 1)),
