@@ -4067,24 +4067,13 @@ impl Tree {
 		// The levels are copied out so that no index partition is read under the manifest lock.
 		let levels: Vec<Arc<crate::levels::Level>> =
 			inner.level_manifest.read()?.levels.get_levels().clone();
-		let range = crate::user_range_to_internal_range(
-			start.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included),
-			end.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
-		);
+		// Every table is asked, not only those a binary search over a level finds: a level is
+		// sorted by the bytes of its keys, and the bounds are judged by the configured comparator,
+		// which may order keys otherwise. A table the range does not reach answers 0 from the
+		// metadata in memory, without reading its index.
 		let mut bytes = 0u64;
-		for (number, level) in levels.iter().enumerate() {
-			// Level 0 tables overlap one another; the tables of a deeper level are sorted by key
-			// and do not, so the ones a range reaches are found by binary search.
-			let tables = if number == 0 {
-				&level.tables[..]
-			} else {
-				let first = level.find_first_overlapping_table(&range);
-				let last = level.find_last_overlapping_table(&range);
-				level.tables.get(first..last).unwrap_or(&[])
-			};
-			for table in tables {
-				bytes = bytes.saturating_add(table.approximate_size(start, end)?);
-			}
+		for table in levels.iter().flat_map(|level| level.tables.iter()) {
+			bytes = bytes.saturating_add(table.approximate_size(start, end)?);
 		}
 		Ok(bytes)
 	}
