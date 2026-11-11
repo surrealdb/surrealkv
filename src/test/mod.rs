@@ -155,6 +155,7 @@ pub mod manifest_tests;
 #[cfg(test)]
 pub mod manifest_write_failure_tests;
 #[cfg(test)]
+pub mod manifest_write_readers_tests;
 pub mod manifest_write_retry_tests;
 #[cfg(test)]
 pub mod manifest_write_stop_tests;
