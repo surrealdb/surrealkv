@@ -158,10 +158,11 @@ pub trait CompactionOperations: Send + Sync {
 /// the encode of a change to its apply in memory (see `LevelManifest::encode_with_changeset`). It
 /// is held across the write and fsync of the file, which none of the three locks above is, so
 /// readers are not held up by it. A checkpoint holds it shared while it copies the manifest file,
-/// so checkpoints run side by side and no writer replaces the file under one. It comes after `flush_lock` and `compactions`, which the
-/// flushes and compactions that take it hold, and before `active_memtable`: nothing waits for it
-/// while holding `active_memtable`, `level_manifest` or `immutable_memtables`. Opening a tree and a restore write the manifest without
-/// it: nothing else writes then, and a restore holds `flush_lock` and `compactions` exclusively.
+/// so checkpoints run side by side and no writer replaces the file under one. It comes after
+/// `flush_lock` and `compactions`, which the flushes and compactions that take it hold, and before
+/// `active_memtable`: nothing waits for it while holding `active_memtable`, `level_manifest` or
+/// `immutable_memtables`. Opening a tree and a restore write the manifest without it: nothing else
+/// writes then, and a restore holds `flush_lock` and `compactions` exclusively.
 ///
 /// `rotations`, which serializes the rotations of the memtable and the WAL with a restore, comes
 /// before `active_memtable`, and after `flush_lock` and `compactions`, which a restore takes first

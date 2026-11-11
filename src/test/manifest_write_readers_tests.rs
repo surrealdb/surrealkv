@@ -180,9 +180,9 @@ fn read_while_parked(tree: &Arc<Tree>, keys: &[(&'static str, &'static str)], wh
 		let read: Vec<_> = names.iter().map(|key| get(&reader, key)).collect();
 		let _ = done_tx.send(read);
 	});
-	let read = done.recv_timeout(READ).unwrap_or_else(|_| {
-		panic!("{what}: a read waited for the manifest write to finish")
-	});
+	let read = done
+		.recv_timeout(READ)
+		.unwrap_or_else(|_| panic!("{what}: a read waited for the manifest write to finish"));
 	for ((key, value), read) in keys.iter().zip(read) {
 		assert_eq!(read.as_deref(), Some(value.as_bytes()), "{what}: wrong value for {key}");
 	}
@@ -219,9 +219,7 @@ async fn a_read_completes_while_a_flush_writes_the_manifest() {
 	put(&tree, "b", "2").await;
 	let tables = table_count(&tree);
 
-	with_parked_manifest_write(&tree, &fs, &[("a", "1"), ("b", "2")], "flush", |tree| {
-		tree.flush()
-	});
+	with_parked_manifest_write(&tree, &fs, &[("a", "1"), ("b", "2")], "flush", |tree| tree.flush());
 
 	assert_eq!(table_count(&tree), tables + 1, "the flushed table is not in the manifest");
 	assert_eq!(get(&tree, "a").as_deref(), Some(&b"1"[..]));
