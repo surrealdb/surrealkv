@@ -1647,6 +1647,74 @@ impl Table {
 	pub(crate) fn overlaps_with_range(&self, range: &InternalKeyRange) -> bool {
 		!self.is_before_range(range) && !self.is_after_range(range)
 	}
+
+	/// The bytes of the file attributed to the user keys of `[start, end)`, where `None` leaves a
+	/// bound open.
+	///
+	/// A table the range covers counts its whole file size, and one it does not reach counts 0,
+	/// both from the metadata in memory. A table that a bound falls inside counts the span of
+	/// its data blocks between the bounds, scaled up by the share of the file that its index,
+	/// filter and footer take. Each bound inside the table is found by seeking the index to the
+	/// data block that holds the first key at or after it, which reads one index partition
+	/// through the block cache. The span starts and ends on data block boundaries, so it is off
+	/// by up to one data block at each bound, and a range inside one data block counts 0.
+	///
+	/// A table that holds only range deletions has no key range and counts 0.
+	pub(crate) fn approximate_size(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<u64> {
+		let (Some(smallest), Some(largest)) = (&self.meta.smallest_point, &self.meta.largest_point)
+		else {
+			return Ok(0);
+		};
+		let cmp = &self.opts.comparator;
+		if start.is_some_and(|s| cmp.compare(&largest.user_key, s) == Ordering::Less)
+			|| end.is_some_and(|e| cmp.compare(&smallest.user_key, e) != Ordering::Less)
+		{
+			return Ok(0);
+		}
+		let start_inside =
+			start.filter(|s| cmp.compare(s, &smallest.user_key) == Ordering::Greater);
+		let end_inside = end.filter(|e| cmp.compare(e, &largest.user_key) != Ordering::Greater);
+		if start_inside.is_none() && end_inside.is_none() {
+			return Ok(self.file_size);
+		}
+		let data_end = self.data_end();
+		if data_end == 0 {
+			return Ok(0);
+		}
+		let lo = match start_inside {
+			Some(s) => self.approximate_offset_of(s, data_end)?,
+			None => 0,
+		};
+		let hi = match end_inside {
+			Some(e) => self.approximate_offset_of(e, data_end)?,
+			None => data_end,
+		};
+		let span = u128::from(hi.saturating_sub(lo));
+		Ok((span * u128::from(self.file_size) / u128::from(data_end)) as u64)
+	}
+
+	/// The offset of the data block that holds the first key of the table at or after
+	/// `user_key`, or `data_end` when every key of the table is before it.
+	fn approximate_offset_of(&self, user_key: &[u8], data_end: u64) -> Result<u64> {
+		let IndexType::Partitioned(index) = &self.index_block;
+		let target =
+			InternalKey::new(user_key.to_vec(), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Max)
+				.encode();
+		let mut iter = IndexIterator::new(index);
+		iter.seek(&target)?;
+		if !iter.valid() {
+			return Ok(data_end);
+		}
+		Ok((iter.block_handle()?.offset as u64).min(data_end))
+	}
+
+	/// The end of the data blocks in the file. The data blocks come first and the filter and the
+	/// index follow them, so this is the file size less those two, give or take the meta index
+	/// and the footer.
+	fn data_end(&self) -> u64 {
+		let props = &self.meta.properties;
+		self.file_size.saturating_sub(props.filter_size).saturating_sub(props.index_size)
+	}
 }
 
 // =============================================================================

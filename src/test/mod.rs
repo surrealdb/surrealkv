@@ -13,6 +13,8 @@ pub mod abandoned_session_tests;
 #[cfg(test)]
 pub mod alloc_limits_tests;
 #[cfg(test)]
+pub mod approximate_size_tests;
+#[cfg(test)]
 pub mod atomic_memtable_tests;
 #[cfg(test)]
 pub mod batch_tests;
@@ -40,7 +42,6 @@ pub mod close_race_tests;
 pub mod commit_pipeline_gate_tests;
 #[cfg(test)]
 pub mod commit_pipeline_tests;
-#[cfg(test)]
 pub mod compact_range_tests;
 #[cfg(test)]
 pub mod compaction_cache_fill_tests;

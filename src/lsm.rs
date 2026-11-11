@@ -4091,6 +4091,47 @@ impl Tree {
 		Ok(())
 	}
 
+	/// The approximate bytes on disk of the table files that hold the keys of `[start, end)`.
+	/// `None` leaves a bound open, so `approximate_size(None, None)` is the size of every table.
+	///
+	/// It reads the metadata of the tables of the current version, which is in memory, and does
+	/// not scan keys. A table inside the range counts its whole file, and a table that a bound
+	/// falls inside counts the share of its data blocks between the bounds, found by seeking its
+	/// index, which reads up to two index partitions through the block cache. So the answer is
+	/// off by up to one data block at each bound in each table that the bound cuts, and the
+	/// answers for adjacent ranges add up to the answer for their union, give or take that.
+	///
+	/// What the files hold is counted as it is stored: compressed, with every version and
+	/// tombstone that compaction has not dropped yet. It does not count the memtables, whose
+	/// writes are in the write-ahead log until a flush puts them in a table, nor the value log:
+	/// a value held there counts as the pointer to it that its table stores.
+	///
+	/// This may do blocking file I/O: call it from `spawn_blocking` in an async context.
+	///
+	/// # Errors
+	///
+	/// [`Error::InvalidArgument`] if `start` is greater than `end`.
+	pub fn approximate_size(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<u64> {
+		let inner = &self.core.inner;
+		if let (Some(start), Some(end)) = (start, end) {
+			if inner.opts.comparator.compare(start, end) == std::cmp::Ordering::Greater {
+				return Err(Error::InvalidArgument("approximate_size: start is after end".into()));
+			}
+		}
+		// The levels are copied out so that no index partition is read under the manifest lock.
+		let levels: Vec<Arc<crate::levels::Level>> =
+			inner.level_manifest.read()?.levels.get_levels().clone();
+		// Every table is asked, not only those a binary search over a level finds: a level is
+		// sorted by the bytes of its keys, and the bounds are judged by the configured comparator,
+		// which may order keys otherwise. A table the range does not reach answers 0 from the
+		// metadata in memory, without reading its index.
+		let mut bytes = 0u64;
+		for table in levels.iter().flat_map(|level| level.tables.iter()) {
+			bytes = bytes.saturating_add(table.approximate_size(start, end)?);
+		}
+		Ok(bytes)
+	}
+
 	#[cfg(test)]
 	pub(crate) fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()> {
 		self.core.inner.compact(strategy)?;
