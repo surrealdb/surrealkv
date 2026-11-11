@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::error::{Error, Result};
 use crate::iter::{BoxedLSMIterator, CompactionIterator, History};
-use crate::levels::{write_manifest_to_disk_in, LevelManifest, ManifestChangeSet};
+use crate::levels::{write_encoded_manifest_in, LevelManifest, ManifestChangeSet};
 use crate::lsm::{cleanup_vlog, CoreInner};
 use crate::memtable::{ImmutableMemtables, MemTable};
 use crate::snapshot::SnapshotTracker;
@@ -75,6 +75,8 @@ pub(crate) struct CompactionOptions {
 	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
 	pub(crate) vlog: Option<Arc<VLog>>,
 	pub(crate) manifest_uncertain: Arc<AtomicBool>,
+	/// The tree's `manifest_io`: held from the encode of the changeset to its apply in memory.
+	pub(crate) manifest_io: Arc<parking_lot::RwLock<()>>,
 	/// Snapshot tracker for snapshot-aware compaction.
 	///
 	/// During compaction, we query this to get the list of active snapshot
@@ -104,6 +106,7 @@ impl CompactionOptions {
 			immutable_memtables: Arc::clone(&tree.immutable_memtables),
 			vlog: tree.vlog.clone(),
 			manifest_uncertain: Arc::clone(&tree.manifest_uncertain),
+			manifest_io: Arc::clone(&tree.manifest_io),
 			snapshot_tracker: tree.snapshot_tracker.clone(),
 			visible_seq_num: Arc::clone(&tree.visible_seq_num),
 			#[cfg(test)]
@@ -507,42 +510,49 @@ impl Compactor {
 		new_tables: Vec<Arc<Table>>,
 		guard: &mut HiddenTablesGuard,
 	) -> Result<()> {
-		let mut manifest = self.options.level_manifest.write()?;
-		let _imm_guard = self.options.immutable_memtables.write();
+		// The changeset is made durable before it is applied, so that the manifest is never
+		// written under a lock that readers need (see `manifest_io`).
+		let _manifest_io = self.options.manifest_io.write();
+		let (path, content, changeset) = {
+			let manifest = self.options.level_manifest.read()?;
 
-		// Check for table ID collisions before adding the new tables
-		for table in &new_tables {
-			if input.tables_to_merge.contains(&table.id) {
-				return Err(crate::error::Error::TableIDCollision(table.id));
-			}
-		}
-
-		let mut changeset = ManifestChangeSet::default();
-
-		// Delete old tables
-		for (level_idx, level) in manifest.levels.get_levels().iter().enumerate() {
-			for &table_id in &input.tables_to_merge {
-				if level.tables.iter().any(|t| t.id == table_id) {
-					changeset.deleted_tables.insert((level_idx as u8, table_id));
+			// Check for table ID collisions before adding the new tables
+			for table in &new_tables {
+				if input.tables_to_merge.contains(&table.id) {
+					return Err(crate::error::Error::TableIDCollision(table.id));
 				}
 			}
-		}
 
-		// Add all compaction outputs in the same atomic changeset
-		for table in new_tables {
-			changeset.new_tables.push((input.target_level, table));
-		}
+			let mut changeset = ManifestChangeSet::default();
 
-		let rollback = manifest.apply_changeset(&changeset)?;
+			// Delete old tables
+			for (level_idx, level) in manifest.levels.get_levels().iter().enumerate() {
+				for &table_id in &input.tables_to_merge {
+					if level.tables.iter().any(|t| t.id == table_id) {
+						changeset.deleted_tables.insert((level_idx as u8, table_id));
+					}
+				}
+			}
 
-		// Write manifest to disk - if this fails, revert in-memory state
-		if let Err(e) = write_manifest_to_disk_in(&*self.options.lopts.fs, &manifest) {
-			manifest.revert_changeset(rollback);
+			// Add all compaction outputs in the same atomic changeset
+			for table in new_tables {
+				changeset.new_tables.push((input.target_level, table));
+			}
+
+			(manifest.path.clone(), manifest.encode_with_changeset(&changeset)?, changeset)
+		};
+
+		// Write manifest to disk - if this fails, the manifest in memory is left as it is
+		if let Err(e) = write_encoded_manifest_in(&*self.options.lopts.fs, &path, &content) {
 			if let Error::ManifestWriteUncertain(_) = &e {
 				self.options.manifest_uncertain.store(true, Ordering::Release);
 			}
 			return Err(e);
 		}
+
+		let mut manifest = self.options.level_manifest.write()?;
+		let _imm_guard = self.options.immutable_memtables.write();
+		manifest.apply_changeset(&changeset)?;
 
 		// Unhide tables before committing guard (they'll be removed from manifest anyway)
 		manifest.unhide_tables(&input.tables_to_merge);

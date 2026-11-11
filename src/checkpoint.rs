@@ -665,9 +665,10 @@ impl DatabaseCheckpoint {
 		// covered.
 		self.core.settle_manifest()?;
 
-		// Steps 2-6 read one version of the manifest: holding its lock keeps a flush or a
-		// compaction from adding or removing tables, or rewriting the manifest file, while the
-		// SSTables and the manifest are copied.
+		// Steps 2-6 read one version of the manifest: holding `manifest_io` keeps a flush or a
+		// compaction from rewriting the manifest file, and the manifest's lock from adding or
+		// removing tables, while the SSTables and the manifest are copied.
+		let manifest_io = self.core.manifest_io.read();
 		let levels_guard = self.core.level_manifest.read()?;
 
 		// A write that failed from the rename on since the settle sets the flag while it holds the
@@ -711,6 +712,7 @@ impl DatabaseCheckpoint {
 		// Step 6: Copy level manifest
 		let manifest_size = self.copy_level_manifest(checkpoint_path)?;
 		drop(levels_guard);
+		drop(manifest_io);
 
 		#[cfg(test)]
 		self.reach(CheckpointStage::ManifestReleased);

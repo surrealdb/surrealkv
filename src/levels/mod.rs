@@ -329,7 +329,10 @@ pub(crate) struct ManifestChangeSet {
 	pub log_number: Option<u64>,
 }
 
-/// Data needed to revert an applied changeset
+/// Data needed to revert an applied changeset. Only tests revert one: a writer applies a
+/// changeset to the manifest in memory once it is on disk (see
+/// [`LevelManifest::encode_with_changeset`]), so it has nothing to undo.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ChangeSetRollback {
 	/// Tables that were deleted (need to be re-added on revert)
 	pub deleted_tables: Vec<(u8, Arc<Table>)>,
@@ -990,7 +993,33 @@ impl LevelManifest {
 		Ok(rollback)
 	}
 
+	/// The bytes of this manifest with `changeset` applied, which [`write_encoded_manifest_in`]
+	/// writes, leaving this manifest as it is.
+	///
+	/// A writer makes a change durable before anything can read it: it encodes the change here
+	/// under the read lock, writes it with no lock of the manifest held, and applies the same
+	/// changeset to this manifest only once the write succeeded. The manifest in memory then never
+	/// lists a table, or a `log_number`, that the one on disk does not, and readers are not held
+	/// up by the fsync. Every writer holds the tree's `manifest_io` from this call until it has
+	/// applied the changeset, so no other change lands in between.
+	pub(crate) fn encode_with_changeset(&self, changeset: &ManifestChangeSet) -> Result<Vec<u8>> {
+		let mut staged = Self {
+			path: self.path.clone(),
+			levels: self.levels.clone(),
+			hidden_set: HiddenSet::new(),
+			next_table_id: Arc::clone(&self.next_table_id),
+			manifest_format_version: self.manifest_format_version,
+			snapshots: self.snapshots.clone(),
+			log_number: self.log_number,
+			last_sequence: self.last_sequence,
+			encryption: self.encryption.clone(),
+		};
+		staged.apply_changeset(changeset)?;
+		encode_manifest(&staged)
+	}
+
 	/// Revert a previously applied changeset using rollback data
+	#[cfg(test)]
 	pub(crate) fn revert_changeset(&mut self, rollback: ChangeSetRollback) {
 		// Restore last_sequence
 		self.last_sequence = rollback.prev_last_sequence;
@@ -1240,6 +1269,23 @@ pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
 /// [`write_manifest_to_disk`] through `fs`, which replaces the manifest all or nothing
 /// ([`Fs::replace_atomic`]; on `std` that is `replace_file_content`, failpoints included).
 pub(crate) fn write_manifest_to_disk_in(fs: &dyn Fs, manifest: &LevelManifest) -> Result<()> {
+	let content = encode_manifest(manifest)?;
+	write_encoded_manifest_in(fs, &manifest.path, &content)
+}
+
+/// Replaces the manifest at `path` with `content`, which [`encode_manifest`] made, all or nothing
+/// ([`Fs::replace_atomic`]). It takes no lock: a writer holds the tree's `manifest_io` across the
+/// encode and this write, and only the bytes and the path, so that readers of the manifest in
+/// memory are not held up by the write and its fsync.
+pub(crate) fn write_encoded_manifest_in(fs: &dyn Fs, path: &Path, content: &[u8]) -> Result<()> {
+	fs.replace_atomic(path, content)?;
+	tracing::debug!("Manifest written successfully to {:?}", path);
+	Ok(())
+}
+
+/// The bytes [`write_manifest_to_disk_in`] writes for `manifest`, sealed if the database is
+/// encrypted.
+pub(crate) fn encode_manifest(manifest: &LevelManifest) -> Result<Vec<u8>> {
 	let next_table_id = manifest.next_table_id.load(Ordering::SeqCst);
 	let total_tables: usize = manifest.levels.get_levels().iter().map(|l| l.tables.len()).sum();
 
@@ -1283,13 +1329,10 @@ pub(crate) fn write_manifest_to_disk_in(fs: &dyn Fs, manifest: &LevelManifest) -
 	// An encrypted database's manifest is sealed here, on every write and under a salt drawn
 	// by this write: a failed write that is tried again seals again, and never reuses a key.
 	// Failing to seal writes nothing.
-	let content = match &manifest.encryption {
-		Some(context) => seal_manifest(context, &buf)?,
-		None => buf,
-	};
-	fs.replace_atomic(&manifest.path, &content)?;
-	tracing::debug!("Manifest written successfully to {:?}", manifest.path);
-	Ok(())
+	match &manifest.encryption {
+		Some(context) => seal_manifest(context, &buf),
+		None => Ok(buf),
+	}
 }
 
 /// Sweeps any temporary manifest files (`.tmp_*`) left behind in the manifest directory of `fs`.

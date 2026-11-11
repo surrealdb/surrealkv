@@ -210,6 +210,7 @@ fn build_l0_store(
 		immutable_memtables: Arc::new(RwLock::new(ImmutableMemtables::default())),
 		vlog: None,
 		manifest_uncertain: Arc::new(AtomicBool::new(false)),
+		manifest_io: Arc::new(parking_lot::RwLock::new(())),
 		snapshot_tracker: SnapshotTracker::new(),
 		visible_seq_num: Arc::new(AtomicU64::new(u64::MAX)),
 		after_horizon_hook: None,

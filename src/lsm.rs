@@ -14,9 +14,10 @@ use crate::compaction::CompactionStrategy;
 use crate::error::{BackgroundErrorHandler, Result, WriteStallReason};
 use crate::levels::{
 	check_manifest_before_open,
+	encode_manifest,
 	plan_orphan_cleanup,
 	resolve_encryption_in,
-	write_manifest_to_disk_in,
+	write_encoded_manifest_in,
 	LevelManifest,
 	ManifestChangeSet,
 };
@@ -153,6 +154,16 @@ pub trait CompactionOperations: Send + Sync {
 /// tables to the removal of what it made obsolete, and takes the locks above under it, and a
 /// restore holds it exclusively. Nothing waits for it while holding any of them.
 ///
+/// `manifest_io` serializes the writers of the manifest file, and the manifest's `log_number`, from
+/// the encode of a change to its apply in memory (see `LevelManifest::encode_with_changeset`). It
+/// is held across the write and fsync of the file, which none of the three locks above is, so
+/// readers are not held up by it. A checkpoint holds it shared while it copies the manifest file,
+/// so checkpoints run side by side and no writer replaces the file under one. It comes after
+/// `flush_lock` and `compactions`, which the flushes and compactions that take it hold, and before
+/// `active_memtable`: nothing waits for it while holding `active_memtable`, `level_manifest` or
+/// `immutable_memtables`. Opening a tree and a restore write the manifest without it: nothing else
+/// writes then, and a restore holds `flush_lock` and `compactions` exclusively.
+///
 /// `rotations`, which serializes the rotations of the memtable and the WAL with a restore, comes
 /// before `active_memtable`, and after `flush_lock` and `compactions`, which a restore takes first
 /// and a rotation never takes. A rotation takes it with nothing else held, except the checkpoint
@@ -209,6 +220,11 @@ pub(crate) struct CoreInner {
 	/// checkpoint and the shutdown flush never flush one memtable twice and always take the
 	/// oldest one first, and a restore never replaces the manifest under a flush.
 	pub(crate) flush_lock: parking_lot::Mutex<()>,
+
+	/// Held exclusively by every writer of the manifest file from the encode of its change to the
+	/// apply of that change in memory, and shared by a checkpoint while it copies the file. See
+	/// the lock order.
+	pub(crate) manifest_io: Arc<parking_lot::RwLock<()>>,
 
 	/// Held shared by every compaction for its whole run, and exclusively by a restore. A
 	/// compaction names its inputs and takes the ids of its outputs from the manifest it picked
@@ -514,6 +530,7 @@ impl CoreInner {
 			active_memtable,
 			immutable_memtables,
 			flush_lock: parking_lot::Mutex::new(()),
+			manifest_io: Arc::new(parking_lot::RwLock::new(())),
 			compactions: parking_lot::RwLock::new(()),
 			compaction_serial: parking_lot::Mutex::new(()),
 			rotations: parking_lot::Mutex::new(()),
@@ -869,31 +886,35 @@ impl CoreInner {
 		let mut changeset = ManifestChangeSet::default();
 		changeset.new_tables.push((0, Arc::clone(&table)));
 
-		// Step 4: Apply changeset atomically
+		// Step 3: Make the changeset durable, and only then apply it, so that the manifest is
+		// never written under a lock that readers need (see `manifest_io`).
+		let _manifest_io = self.manifest_io.write();
 		// Lock order: level_manifest → immutable_memtables
-		let mut manifest = self.level_manifest.write()?;
-		let mut memtable_lock = self.immutable_memtables.write()?;
+		let (path, content, log_number) = {
+			let manifest = self.level_manifest.read()?;
+			let memtable_lock = self.immutable_memtables.read()?;
 
-		// A memtable queued ahead of this one (a checkpoint can rotate while the shutdown flush
-		// runs) keeps its WAL segment: `log_number` only moves forward, so passing the segment
-		// would lose the memtable if the process died before its flush.
-		let log_number = Self::hold_log_number(
-			memtable_lock.log_number_after(Some(table_id), wal_number),
-			manifest.get_log_number(),
-			self.group_wal_pin.load(Ordering::Acquire).min(hold),
-		);
-		changeset.log_number = Some(log_number);
+			// A memtable queued ahead of this one (a checkpoint can rotate while the shutdown
+			// flush runs) keeps its WAL segment: `log_number` only moves forward, so passing the
+			// segment would lose the memtable if the process died before its flush. A memtable
+			// queued after this read is tagged with a newer segment than this one.
+			let log_number = Self::hold_log_number(
+				memtable_lock.log_number_after(Some(table_id), wal_number),
+				manifest.get_log_number(),
+				self.group_wal_pin.load(Ordering::Acquire).min(hold),
+			);
+			changeset.log_number = Some(log_number);
 
-		tracing::debug!(
-			"Changeset prepared: table_id={}, log_number={} (WAL #{:020} flushed)",
-			table_id,
-			log_number,
-			wal_number
-		);
+			tracing::debug!(
+				"Changeset prepared: table_id={}, log_number={} (WAL #{:020} flushed)",
+				table_id,
+				log_number,
+				wal_number
+			);
 
-		let rollback = manifest.apply_changeset(&changeset)?;
-		if let Err(e) = write_manifest_to_disk_in(&*self.opts.fs, &manifest) {
-			manifest.revert_changeset(rollback);
+			(manifest.path.clone(), manifest.encode_with_changeset(&changeset)?, log_number)
+		};
+		if let Err(e) = write_encoded_manifest_in(&*self.opts.fs, &path, &content) {
 			return Err(self.manifest_write_error(
 				e,
 				format!(
@@ -902,6 +923,12 @@ impl CoreInner {
 				),
 			));
 		}
+
+		// Step 4: Publish the table and drop the memtable in one step
+		// Lock order: level_manifest → immutable_memtables
+		let mut manifest = self.level_manifest.write()?;
+		let mut memtable_lock = self.immutable_memtables.write()?;
+		manifest.apply_changeset(&changeset)?;
 
 		// Remove successfully flushed memtable from immutables tracking. The
 		// Arc<MemTable> in `memtable` (function parameter) falls out of scope at
@@ -944,8 +971,23 @@ impl CoreInner {
 		if !self.manifest_uncertain.load(Ordering::Acquire) {
 			return Ok(());
 		}
-		let manifest = self.level_manifest.write()?;
-		write_manifest_to_disk_in(&*self.opts.fs, &manifest)
+		let manifest_io = self.manifest_io.write();
+		self.settle_manifest_held(&manifest_io)
+	}
+
+	/// [`Self::settle_manifest`] for a caller that holds `manifest_io`.
+	pub(crate) fn settle_manifest_held(
+		&self,
+		_manifest_io: &parking_lot::RwLockWriteGuard<'_, ()>,
+	) -> Result<()> {
+		if !self.manifest_uncertain.load(Ordering::Acquire) {
+			return Ok(());
+		}
+		let (path, content) = {
+			let manifest = self.level_manifest.read()?;
+			(manifest.path.clone(), encode_manifest(&manifest)?)
+		};
+		write_encoded_manifest_in(&*self.opts.fs, &path, &content)
 			.map_err(|e| self.manifest_write_error(e, "Failed to settle the manifest".into()))?;
 		self.manifest_uncertain.store(false, Ordering::Release);
 		Ok(())
@@ -1108,8 +1150,10 @@ impl CoreInner {
 		let mut changeset = ManifestChangeSet::default();
 		changeset.new_tables.push((0, Arc::clone(&created_table)));
 
+		// The changeset is made durable before it is applied (see `manifest_io`).
+		let manifest_io = self.manifest_io.write();
 		// Lock order: level_manifest -> immutable_memtables (matches flush_immutable_to_sst).
-		let mut manifest = self.level_manifest.write()?;
+		let manifest = self.level_manifest.read()?;
 
 		// Only advance `log_number` past `batch_wal_number` if no OLDER immutable
 		// memtable is still waiting to be flushed. `flush_immutable_to_sst` can bump
@@ -1132,23 +1176,25 @@ impl CoreInner {
 			));
 		}
 
-		let rollback = manifest.apply_changeset(&changeset)?;
-		if let Err(e) = write_manifest_to_disk_in(&*self.opts.fs, &manifest) {
-			manifest.revert_changeset(rollback);
+		let path = manifest.path.clone();
+		let content = manifest.encode_with_changeset(&changeset)?;
+		drop(manifest);
+		if let Err(e) = write_encoded_manifest_in(&*self.opts.fs, &path, &content) {
 			let error = self.manifest_write_error(
 				e,
 				format!(
 					"Failed to update the manifest for the direct L0 table table_id={table_id}"
 				),
 			);
-			drop(manifest);
 			if matches!(error, Error::ManifestWriteUncertain(_)) {
 				// The manifest on disk may list the table: write the one in memory again, which
 				// does not. Until that works the file stays.
-				progress.table_may_be_listed = self.settle_manifest().is_err();
+				progress.table_may_be_listed = self.settle_manifest_held(&manifest_io).is_err();
 			}
 			return Err(error);
 		}
+		self.level_manifest.write()?.apply_changeset(&changeset)?;
+		drop(manifest_io);
 
 		tracing::debug!(
 			"Direct-to-L0 flush completed: table_id={}, file_size={}",
@@ -1375,8 +1421,10 @@ impl CoreInner {
 		if !current() {
 			return Err(Error::PipelineStall);
 		}
+		// The changeset is made durable before it is applied (see `manifest_io`).
+		let _manifest_io = self.manifest_io.write();
 		// Lock order: level_manifest -> immutable_memtables (matches flush_immutable_to_sst).
-		let mut manifest = self.level_manifest.write()?;
+		let manifest = self.level_manifest.read()?;
 		if manifest.get_log_number() < below {
 			if self.immutable_memtables.read()?.iter().any(|entry| entry.wal_number < below) {
 				return Err(Error::Other(
@@ -1389,14 +1437,16 @@ impl CoreInner {
 				log_number: Some(below),
 				..Default::default()
 			};
-			let rollback = manifest.apply_changeset(&changeset)?;
-			if let Err(e) = write_manifest_to_disk_in(&*self.opts.fs, &manifest) {
-				manifest.revert_changeset(rollback);
+			let path = manifest.path.clone();
+			let content = manifest.encode_with_changeset(&changeset)?;
+			drop(manifest);
+			if let Err(e) = write_encoded_manifest_in(&*self.opts.fs, &path, &content) {
 				return Err(self.manifest_write_error(
 					e,
 					format!("Failed to move log_number past a failed commit group: {below}"),
 				));
 			}
+			self.level_manifest.write()?.apply_changeset(&changeset)?;
 			// The manifest in memory is on disk whole, whatever an earlier write left there.
 			self.manifest_uncertain.store(false, Ordering::Release);
 		}
@@ -1813,8 +1863,10 @@ impl CoreInner {
 			if flushed_count > 0 {
 				let current_wal = self.wal.read().get_active_log_number();
 
+				// The changeset is made durable before it is applied (see `manifest_io`).
+				let _manifest_io = self.manifest_io.write();
 				// A memtable rotated after the queue was read keeps its WAL segment.
-				let mut manifest = self.level_manifest.write()?;
+				let manifest = self.level_manifest.read()?;
 				let log_number =
 					self.immutable_memtables.read()?.log_number_after(None, current_wal);
 				let changeset = ManifestChangeSet {
@@ -1822,9 +1874,10 @@ impl CoreInner {
 					..Default::default()
 				};
 
-				let rollback = manifest.apply_changeset(&changeset)?;
-				if let Err(e) = write_manifest_to_disk_in(&*self.opts.fs, &manifest) {
-					manifest.revert_changeset(rollback);
+				let path = manifest.path.clone();
+				let content = manifest.encode_with_changeset(&changeset)?;
+				drop(manifest);
+				if let Err(e) = write_encoded_manifest_in(&*self.opts.fs, &path, &content) {
 					return Err(match e {
 						// A manifest that could not be sealed keeps the error of the key, and one
 						// that a pool had no file for keeps the type that says it passes.
@@ -1836,6 +1889,7 @@ impl CoreInner {
 						)),
 					});
 				}
+				self.level_manifest.write()?.apply_changeset(&changeset)?;
 
 				tracing::debug!(
 					"Updated manifest log_number to {} after immutable flushes",
