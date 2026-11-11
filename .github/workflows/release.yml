@@ -17,7 +17,9 @@ jobs:
   release:
     name: Process Release
     runs-on: ubuntu-latest
-
+    needs: semver
+    permissions:
+      contents: write  # required for creating tags and GitHub releases
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -44,21 +46,17 @@ jobs:
           git config user.name "github-actions[bot]"
           git config --add --bool push.autoSetupRemote true
 
-      - name: Extract version from branch name
+      - name: Extract version from Cargo.toml
         id: version
         run: |
-          BRANCH_NAME=$(git rev-parse --abbrev-ref HEAD)
-          VERSION="${BRANCH_NAME#release/}"
-          echo "Version from branch: $VERSION"
-          
-          # Validate version matches Cargo.toml
-          CARGO_VERSION=$(taplo get -f Cargo.toml "package.version")
-          if [ "$VERSION" != "$CARGO_VERSION" ]; then
-            echo "Error: Branch version ($VERSION) doesn't match Cargo.toml version ($CARGO_VERSION)"
-            exit 1
-          fi
-          
+          VERSION=$(taplo get -f Cargo.toml "package.version")
+          echo "Version from Cargo.toml: $VERSION"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create and push tag
+        run: |
+          git tag -a "v${{ steps.version.outputs.version }}" -m "Release version ${{ steps.version.outputs.version }}"
+          git push origin "v${{ steps.version.outputs.version }}"
 
       - name: Publish surrealkv-compat-v1
         env:
@@ -84,11 +82,6 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish -p surrealkv-cli
-
-      - name: Create and push tag
-        run: |
-          git tag -a "v${{ steps.version.outputs.version }}" -m "Release version ${{ steps.version.outputs.version }}"
-          git push origin "v${{ steps.version.outputs.version }}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
