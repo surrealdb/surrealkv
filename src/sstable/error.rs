@@ -43,6 +43,12 @@ pub enum SSTableError {
 	IntegerOverflowValueEnd {
 		offset: usize,
 	},
+	/// A reconstructed internal key is shorter than the trailer and timestamp
+	/// every internal key carries, so the block is malformed.
+	KeyTooShort {
+		offset: usize,
+		len: usize,
+	},
 	DecodedLengthsExceedBounds {
 		offset: usize,
 		i: usize,
@@ -187,6 +193,16 @@ impl fmt::Display for SSTableError {
 				offset,
 			} => {
 				write!(f, "Integer overflow calculating value_end at offset {}", offset)
+			}
+			SSTableError::KeyTooShort {
+				offset,
+				len,
+			} => {
+				write!(
+					f,
+					"Internal key at offset {} is {} bytes, shorter than its 16-byte trailer and timestamp",
+					offset, len
+				)
 			}
 			SSTableError::DecodedLengthsExceedBounds {
 				offset,

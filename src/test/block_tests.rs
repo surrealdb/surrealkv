@@ -785,3 +785,34 @@ fn test_prev_at_first_entry() {
 	assert!(!result, "prev() at first entry should return false");
 	assert!(!iter.valid(), "Iterator should be invalid after prev() at first entry");
 }
+
+#[test]
+fn test_short_internal_key_is_rejected_as_malformed() {
+	use crate::error::Error;
+	use crate::sstable::error::SSTableError;
+
+	let o = make_opts(None);
+	let mut builder = BlockWriter::new(
+		o.block_size,
+		o.block_restart_interval,
+		Arc::clone(&o.internal_comparator),
+	);
+	// A corrupt or truncated block can decode to an internal key shorter than
+	// its trailer and timestamp. A 3-byte key stands in for such a block.
+	builder.add(b"abc", b"v").unwrap();
+	let block = Block::new(builder.finish().unwrap(), Arc::clone(&o.internal_comparator));
+	let mut iter = block.iter().unwrap();
+
+	let err = iter.seek_to_first().expect_err("a short internal key must be rejected");
+	assert!(
+		matches!(err, Error::SSTable(SSTableError::KeyTooShort { .. })),
+		"expected KeyTooShort, got {err:?}"
+	);
+	assert!(!iter.valid(), "a short key must never be reported as a valid position");
+
+	// seek() and advance() reach the same check rather than panicking.
+	let target = InternalKey::new(b"abc".to_vec(), 0, InternalKeyKind::Set, 0).encode();
+	assert!(iter.seek(&target).is_err());
+	iter.reset();
+	assert!(iter.advance().is_err());
+}

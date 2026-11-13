@@ -90,7 +90,7 @@ use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
 
 use crate::error::{Error, Result};
 use crate::sstable::error::SSTableError;
-use crate::{Comparator, InternalKey, InternalKeyRef, LSMIterator};
+use crate::{Comparator, InternalKey, InternalKeyRef, LSMIterator, INTERNAL_KEY_SUFFIX_SIZE};
 
 /// Raw block data as a byte vector.
 pub(crate) type BlockData = Vec<u8>;
@@ -725,6 +725,16 @@ impl BlockIterator {
 		self.current_key.truncate(shared_prefix);
 		self.current_key.extend_from_slice(&self.block[self.offset + i..key_end]);
 
+		// Every internal key carries the trailer and the timestamp, so a shorter
+		// key means a corrupt or truncated block. It is rejected here, before an
+		// accessor computes where the trailer starts.
+		if self.current_key.len() < INTERNAL_KEY_SUFFIX_SIZE {
+			return Err(Error::from(SSTableError::KeyTooShort {
+				offset: self.offset,
+				len: self.current_key.len(),
+			}));
+		}
+
 		self.offset = key_end;
 
 		// Track value location
@@ -804,7 +814,9 @@ impl LSMIterator for BlockIterator {
 impl BlockIterator {
 	/// Checks if the iterator is positioned on a valid entry.
 	pub(crate) fn is_valid(&self) -> bool {
-		!self.current_key.is_empty()
+		// A key shorter than the trailer and timestamp is never surfaced as
+		// valid, so no accessor reads a suffix that is not there.
+		self.current_key.len() >= INTERNAL_KEY_SUFFIX_SIZE
 			&& self.current_value_offset_start != 0
 			&& self.current_value_offset_end != 0
 			&& self.offset <= self.restart_offset
