@@ -433,10 +433,15 @@ async fn absolute_consistency_refuses_the_open_and_names_the_segment_and_the_rec
 	.await;
 }
 
-/// Immediate commits: a sync mark of the segment says that the record whose value is missing was
-/// synced, and so was its value.
+/// Immediate commits: a sync mark of the segment says that every record but the last was synced,
+/// and so was its value, whether or not a later record happens to point into the value log too —
+/// the mark that a commit leaves is only written, and only confirmed synced itself, by the append
+/// of the commit after it (`Writer::write_sync_mark_unflushed`, `Writer::close_with_trailing_mark`),
+/// so of a segment that a process left without a further commit or a close, only the last record
+/// has no mark that reaches its end: refusing is not a question of what, if anything, is left of
+/// the value log after the record that failed.
 #[test(tokio::test)]
-async fn the_default_mode_ends_the_log_before_a_synced_value_that_is_missing_when_none_after_it_is_there(
+async fn the_default_mode_ends_the_log_before_a_synced_value_that_is_missing_only_when_it_is_the_last_record(
 ) {
 	within("tolerate torn tail, synced", async {
 		for case in cases() {
@@ -452,9 +457,11 @@ async fn the_default_mode_ends_the_log_before_a_synced_value_that_is_missing_whe
 
 				let (copy, opened) =
 					opened_in(&world, WalRecoveryMode::TolerateTornTail, case.vlog_file_size).await;
-				if !case.lost_its_tail {
-					// A synced value that is missing with values after it that are there is a
-					// hole in the log and not its end: the open says so and does not cut.
+				if case.first_failed != COMMITS - 1 {
+					// Every record but the last has a mark of a later commit that reaches its
+					// end, whether or not that later commit's own value is in the value log (it
+					// may, itself, not even exist in this segment, as the "lost its tail" cases
+					// show): the open refuses, and does not cut.
 					let Err(error) = opened else {
 						panic!("{what}: the open succeeded");
 					};
@@ -462,6 +469,10 @@ async fn the_default_mode_ends_the_log_before_a_synced_value_that_is_missing_whe
 					assert!(matches!(error, Error::Other(_)), "{what}: {text}");
 					assert!(text.contains("SalvageValidPrefix"), "{what}: {text}");
 					assert!(text.contains("sync mark"), "{what}: {text}");
+					assert!(
+						text.contains("Automatic truncation could discard durable data"),
+						"{what}: {text}"
+					);
 					assert!(text.contains(&format!("{segment_id:020}.wal")), "{what}: {text}");
 					assert_eq!(
 						copy.snapshot(),
@@ -470,6 +481,9 @@ async fn the_default_mode_ends_the_log_before_a_synced_value_that_is_missing_whe
 					);
 					continue;
 				}
+				// The last record has no mark that reaches its own end, because nothing was
+				// appended after it to confirm one: the process was abandoned right after it, as
+				// it is here, and no mark says it was synced, so the open cuts it, not refuses.
 				let tree = opened.unwrap_or_else(|e| panic!("{what}: {e}"));
 				assert_cut(&copy, &tree, &case, &segment, &original, &ends, &what);
 				tree.close().await.unwrap();
@@ -561,6 +575,10 @@ async fn the_default_mode_refuses_a_hole_below_the_last_sync_and_cuts_one_after_
 					let error =
 						opened.err().unwrap_or_else(|| panic!("{what}: the open succeeded"));
 					assert!(error.to_string().contains("sync mark"), "{what}: {error}");
+					assert!(
+						error.to_string().contains("Automatic truncation could discard durable data"),
+						"{what}: {error}"
+					);
 					assert_eq!(
 						copy.snapshot(),
 						before,
@@ -614,6 +632,89 @@ async fn the_default_mode_refuses_a_hole_in_a_segment_without_marks() {
 			let error = opened.err().unwrap_or_else(|| panic!("{what}: the open succeeded"));
 			assert!(error.to_string().contains("SalvageValidPrefix"), "{what}: {error}");
 			assert_eq!(copy.snapshot(), before, "{what}: the open left every file as it was");
+		}
+	})
+	.await;
+}
+
+/// A later record is not required to hold a value of its own for the sync marks to still prove
+/// that the segment was synced past a hole: whether a later record happens to point into the
+/// value log must not decide whether the hole is refused. Six commits of large (synced) values,
+/// each with a separated (vlog) VALUE, are followed by more commits whose value is small enough
+/// to stay inline: no later record points into the value log at all, yet the segment was still
+/// synced past the hole, as the sync marks (not whatever a later record happens to hold) say.
+#[test(tokio::test)]
+async fn the_default_mode_refuses_a_hole_below_the_last_sync_even_when_nothing_after_it_holds_a_value(
+) {
+	within("tolerate torn tail, inline tail after the hole", async {
+		const SYNCED: usize = 6;
+		const SMALL: usize = 10;
+		// (length of the values after the hole, durability of every commit, whether the open must
+		// refuse). The record that is damaged is always the last of the head (below), so whether
+		// it was synced depends only on `durability`, never on what the tail holds.
+		let cases = [
+			// Control: the values after the hole are separated (as the existing coverage already
+			// has them), and the hole is below a sync, so it is refused, as before.
+			(VALUE, Durability::Immediate, true),
+			// The regression itself: the values after the hole are inline, so no later record
+			// points into the value log, but the hole is still below a sync.
+			(SMALL, Durability::Immediate, true),
+			// Control: nothing was synced at all (the record that is damaged included), so the
+			// open must still cut, not refuse: nothing says any of it was made durable.
+			(SMALL, Durability::Eventual, false),
+		];
+		for (tail_value_len, durability, refused) in cases {
+			for world in World::all() {
+				let what =
+					format!("{}: tail value len {tail_value_len}, {durability:?}", world.name);
+				let tree = world.open(WalRecoveryMode::TolerateTornTail, BIG_FILES).await.unwrap();
+				commit_range(&tree, 0..SYNCED, VALUE, durability).await;
+				commit_range(&tree, SYNCED..COMMITS, tail_value_len, durability).await;
+				tree.abandon();
+				world.fs.abandon();
+				drop(tree);
+				let world = match world.dir {
+					Some(_) => world,
+					None => World {
+						fs: world.fs.simulate_crash(CrashMode::Prefix(usize::MAX)).unwrap(),
+						..world
+					},
+				};
+				let entries = world.entries();
+				// The head commits (0..SYNCED) are always separated; the missing value is the
+				// last of them, so nothing between it and the tail holds a value of its own, and
+				// whether the open refuses depends only on the tail, as it must.
+				let missing = SYNCED - 1;
+				assert!(entries.len() >= SYNCED, "{what}: an entry for every head commit");
+				let (segment_id, segment) = world.segment();
+				let ends = world.record_ends(&segment, segment_id);
+				let original = world.read(&segment);
+				lose_the_middle_of(&world, &entries[missing]);
+				let before = world.snapshot();
+
+				let (copy, opened) =
+					opened_in(&world, WalRecoveryMode::TolerateTornTail, BIG_FILES).await;
+				if refused {
+					let error =
+						opened.err().unwrap_or_else(|| panic!("{what}: the open succeeded"));
+					assert!(error.to_string().contains("sync mark"), "{what}: {error}");
+					assert!(
+						error.to_string().contains("Automatic truncation could discard durable data"),
+						"{what}: {error}"
+					);
+					assert_eq!(
+						copy.snapshot(),
+						before,
+						"{what}: the open left every file as it was"
+					);
+					continue;
+				}
+				let tree = opened.unwrap_or_else(|e| panic!("{what}: {e}"));
+				let report = tree.recovery_report();
+				assert_eq!(report.records_dropped, COMMITS - missing, "{what}: {report:?}");
+				assert_eq!(report.bytes_trimmed as usize, original.len() - ends[missing - 1]);
+				tree.close().await.unwrap();
+			}
 		}
 	})
 	.await;
