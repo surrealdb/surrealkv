@@ -725,7 +725,12 @@ fn the_calls_of_an_append_a_read_a_rotation_a_sync_and_a_removal() {
 	let opts = options(dir.path());
 	let fs = TestFs::new();
 	let vlog = open_in(&fs, Arc::clone(&opts));
-	assert_eq!(fs.take(), lines(&["read_dir vlog"]), "an empty directory");
+	assert_eq!(
+		fs.take(),
+		lines(&["read_dir vlog", "read_dir vlog"]),
+		"an empty directory; the second read_dir is the reclaim of torn files, which runs even \
+		 when there is no live file, and finds none here"
+	);
 
 	// The first append makes the file, and an append goes to the buffer, which is not a call.
 	let mut pointers = Vec::new();
@@ -807,11 +812,13 @@ fn the_calls_of_opening_a_log_that_has_files() {
 			"read_at 1.vlog 0 31",
 			"open_append_existing 2.vlog",
 			"read_at 2.vlog 0 31",
+			"read_dir vlog",
 			"len 2.vlog",
 			"read_at 2.vlog 0 6",
 		]),
 		"one open per file, and none for the writer; the newest is opened to append and is never \
-		 made if it has gone since the listing"
+		 made if it has gone since the listing; the extra read_dir is the reclaim of torn files, \
+		 which finds none here"
 	);
 	assert!(vlog.writer.read().is_some());
 }

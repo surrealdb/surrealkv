@@ -386,10 +386,12 @@ pub(crate) static EXCLUDED: &[Rule] = &[
 	rule("test::vlog_tests::a_plaintext_file_is_set_aside_only_for_the_start_of_its_own_header", Why::StdFiles),
 	rule("test::vlog_tests::a_plaintext_file_that_a_crash_left_without_its_header_is_set_aside", Why::StdFiles),
 	rule("test::vlog_tests::a_random_sequence_of_appends_failures_rollovers_and_syncs_matches_the_model", Why::StdFiles),
+	rule("test::vlog_tests::a_reload_accounts_for_torn_files_that_share_an_id_through_a_collision_suffix", Why::StdFiles),
 	rule("test::vlog_tests::a_reload_makes_the_reads_of_a_file_id_go_to_the_restored_file", Why::StdFiles),
 	rule("test::vlog_tests::a_sync_fsyncs_the_directory_once_for_the_files_created_since_the_last", Why::StdFiles),
 	rule("test::vlog_tests::a_sync_that_outlasts_a_reload_does_not_settle_what_came_after_it", Why::StdFiles),
 	rule("test::vlog_tests::a_sync_that_outlasts_a_reload_leaves_the_queued_file_that_has_the_id_it_fsynced", Why::StdFiles),
+	rule("test::vlog_tests::opening_a_log_whose_highest_id_is_the_most_a_u32_can_name_is_refused_not_wrapped", Why::StdFiles),
 	rule("test::vlog_tests::test_vlog_restart_continues_last_file", Why::StdFiles),
 	rule("test::vlog_tests::test_vlog_writer_reopen_append_only_behavior", Why::StdFiles),
 ];
