@@ -1918,6 +1918,487 @@ fn a_plaintext_file_that_a_crash_left_without_its_header_is_set_aside() {
 	}
 }
 
+/// A torn file holds no entry that is durable (see [`VLogFileHeader::is_torn`]), so nothing is
+/// lost by reclaiming all but the newest few: one crash below the threshold is kept in full, more
+/// crashes than the threshold leave only the newest ones, a reopen that finds no new torn file
+/// disturbs nothing further, and every value that was there before any of this stays reachable.
+/// Runs the same sequence on the disk and over a fresh in-memory pool, writing the torn bytes
+/// through the file system of `opts` either way, since only `std` has a `std::fs` of its own.
+#[test]
+fn torn_vlog_files_beyond_the_newest_few_are_reclaimed_at_open() {
+	use crate::vfs::{CreateOpts, FileSystem, Fs};
+	use crate::vlog::TORN_VLOG_FILES_KEPT;
+
+	if tfs::skip_listed() {
+		return;
+	}
+
+	fn write_bytes(fs: &dyn Fs, path: &Path, bytes: &[u8]) {
+		let file = fs.create_truncate(path, CreateOpts::default()).unwrap();
+		file.append(bytes).unwrap();
+		file.sync().unwrap();
+	}
+
+	fn torn_names(fs: &dyn Fs, dir: &Path) -> Vec<String> {
+		let mut names: Vec<String> = fs
+			.read_dir(dir)
+			.unwrap()
+			.into_iter()
+			.map(|entry| entry.name.to_string_lossy().into_owned())
+			.filter(|name| name.ends_with(".vlog.torn"))
+			.collect();
+		names.sort();
+		names
+	}
+
+	for (what, fs, dir) in [
+		("disk", crate::vfs::default_fs(), TempDir::new().unwrap().keep()),
+		("pool", FileSystem::memory().0, PathBuf::from("/db")),
+	] {
+		let opts = Arc::new(Options {
+			path: dir.clone(),
+			vlog_max_file_size: 1 << 20,
+			fs: Arc::clone(&fs),
+			..Default::default()
+		});
+		fs.create_dir_all(&opts.vlog_dir()).unwrap();
+
+		// A real entry before any crash: it must read back unchanged after every reopen below.
+		let pointer = {
+			let vlog = VLog::new_in(Arc::clone(&fs), Arc::clone(&opts)).unwrap();
+			let pointer = vlog.append(b"key", &value_of(1, 100)).unwrap();
+			vlog.sync().unwrap();
+			pointer
+		};
+		let header_len = VLogFileHeader::new(0, 0, 0).encode().len();
+		let mut newest = u64::from(pointer.file_id);
+
+		// Every torn file a crash below leaves, across every phase: the reclaim weighs them all
+		// together, by id, whichever loop made them.
+		let mut torn_ids = Vec::new();
+
+		// One crash, well below the threshold: the single torn file is kept, as the test above
+		// already covers for `std`; checked again here for the pool.
+		{
+			let torn_id = newest + 1;
+			write_bytes(&*fs, &opts.vlog_file_path(torn_id), &vec![0u8; header_len]);
+			torn_ids.push(torn_id);
+			let vlog = VLog::new_in(Arc::clone(&fs), Arc::clone(&opts)).unwrap();
+			assert_eq!(
+				torn_names(&*fs, &opts.vlog_dir()),
+				[format!("{torn_id:020}.vlog.torn")],
+				"{what}: one torn file, below the threshold, is kept"
+			);
+			assert_eq!(vlog.get(&pointer).unwrap(), value_of(1, 100), "{what}");
+			let next = vlog.append(b"next", &value_of(2, 100)).unwrap();
+			vlog.sync().unwrap();
+			newest = u64::from(next.file_id);
+		}
+
+		// More crashes than the threshold, one reopen at a time: every torn file this leaves is
+		// kept until the count passes the threshold, and only the newest ones stay once it does.
+		for _ in 0..TORN_VLOG_FILES_KEPT + 2 {
+			let torn_id = newest + 1;
+			write_bytes(&*fs, &opts.vlog_file_path(torn_id), &vec![0u8; header_len]);
+			torn_ids.push(torn_id);
+			let vlog = VLog::new_in(Arc::clone(&fs), Arc::clone(&opts)).unwrap();
+			let kept: Vec<String> = torn_ids
+				.iter()
+				.rev()
+				.take(TORN_VLOG_FILES_KEPT)
+				.map(|id| format!("{id:020}.vlog.torn"))
+				.collect();
+			let mut kept_sorted = kept.clone();
+			kept_sorted.sort();
+			assert_eq!(
+				torn_names(&*fs, &opts.vlog_dir()),
+				kept_sorted,
+				"{what}: only the newest {TORN_VLOG_FILES_KEPT} torn files of {torn_ids:?} stay"
+			);
+			let next = vlog.append(b"next", &value_of(2, 100)).unwrap();
+			vlog.sync().unwrap();
+			newest = u64::from(next.file_id);
+		}
+		let after_threshold = torn_names(&*fs, &opts.vlog_dir());
+		assert_eq!(after_threshold.len(), TORN_VLOG_FILES_KEPT, "{what}");
+
+		// A reopen with no new torn file disturbs nothing further: the same ones stay.
+		{
+			let vlog = VLog::new_in(Arc::clone(&fs), Arc::clone(&opts)).unwrap();
+			assert_eq!(
+				torn_names(&*fs, &opts.vlog_dir()),
+				after_threshold,
+				"{what}: a reopen with no new torn file keeps what was already kept"
+			);
+			assert_eq!(
+				vlog.get(&pointer).unwrap(),
+				value_of(1, 100),
+				"{what}: the original entry is unchanged by any of this"
+			);
+		}
+	}
+}
+
+/// `u32::MAX` is refused as a next id, not wrapped to 0: nothing this log ever made is named 0,
+/// so a wrapped id would be free to collide with whatever it does next, which is worse than
+/// refusing the open outright. A torn file is enough to raise the floor there: the same
+/// `checked_add` guards whichever of a live or a torn file's id the floor came from.
+#[test]
+fn opening_a_log_whose_highest_id_is_the_most_a_u32_can_name_is_refused_not_wrapped() {
+	use crate::vlog::TORN_VLOG_FILES_KEPT;
+
+	if tfs::skip_listed() {
+		return;
+	}
+
+	let temp_dir = TempDir::new().unwrap();
+	let opts = Arc::new(Options {
+		path: temp_dir.path().to_path_buf(),
+		vlog_max_file_size: 1 << 20,
+		..Default::default()
+	});
+	crate::test::tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
+
+	// More torn files than the threshold alone, so a reclaim that ran anyway would be visible,
+	// and one of them, the newest, is named with the id nothing can be minted past.
+	for id in 1..TORN_VLOG_FILES_KEPT as u32 + 3 {
+		std::fs::write(opts.vlog_dir().join(format!("{id:020}.vlog.torn")), b"junk").unwrap();
+	}
+	std::fs::write(opts.vlog_dir().join(format!("{:020}.vlog.torn", u32::MAX)), b"junk").unwrap();
+	let before = names_in(&opts.vlog_dir());
+
+	let error = VLog::new(Arc::clone(&opts)).err().unwrap();
+	assert!(
+		error.to_string().contains("no id is left"),
+		"the open is refused, not opened with an id that wrapped: {error}"
+	);
+	assert_eq!(
+		names_in(&opts.vlog_dir()),
+		before,
+		"a refused open neither renamed a newly torn file (there was none to rename here) nor \
+		 reclaimed an old one: the id floor is checked before either runs"
+	);
+}
+
+/// A directory that holds only files already set aside under an earlier open has no live `.vlog`
+/// file for the listing to find, but the reclaim must still run: it is not conditioned on there
+/// being one. Runs on the disk and over a fresh in-memory pool.
+#[test]
+fn torn_vlog_files_are_reclaimed_even_when_no_live_vlog_file_remains() {
+	use crate::vfs::{CreateOpts, FileSystem, Fs};
+	use crate::vlog::TORN_VLOG_FILES_KEPT;
+
+	if tfs::skip_listed() {
+		return;
+	}
+
+	fn write_empty(fs: &dyn Fs, path: &Path) {
+		fs.create_truncate(path, CreateOpts::default()).unwrap();
+	}
+
+	fn torn_names(fs: &dyn Fs, dir: &Path) -> Vec<String> {
+		let mut names: Vec<String> = fs
+			.read_dir(dir)
+			.unwrap()
+			.into_iter()
+			.map(|entry| entry.name.to_string_lossy().into_owned())
+			.filter(|name| name.ends_with(".vlog.torn"))
+			.collect();
+		names.sort();
+		names
+	}
+
+	for (what, fs, dir) in [
+		("disk", crate::vfs::default_fs(), TempDir::new().unwrap().keep()),
+		("pool", FileSystem::memory().0, PathBuf::from("/db")),
+	] {
+		let opts = Arc::new(Options {
+			path: dir.clone(),
+			vlog_max_file_size: 1 << 20,
+			fs: Arc::clone(&fs),
+			..Default::default()
+		});
+		fs.create_dir_all(&opts.vlog_dir()).unwrap();
+
+		// No file here was ever live: every one of them is already named as an earlier open left
+		// it, well past the retention threshold. No append ever happened, so there is nothing
+		// for `load_files` to call `newest` about.
+		let extra = TORN_VLOG_FILES_KEPT + 2;
+		for id in 1..=extra {
+			write_empty(&*fs, &opts.vlog_dir().join(format!("{id:020}.vlog.torn")));
+		}
+		assert_eq!(torn_names(&*fs, &opts.vlog_dir()).len(), extra, "{what}: set up");
+
+		let vlog = VLog::new_in(Arc::clone(&fs), Arc::clone(&opts)).unwrap();
+		assert_eq!(
+			torn_names(&*fs, &opts.vlog_dir()).len(),
+			TORN_VLOG_FILES_KEPT,
+			"{what}: an open with no live file still reclaims what is past the threshold"
+		);
+
+		// The id floor also has to come from these files: nothing live ever set `next_file_id`
+		// past them.
+		let pointer = vlog.append(b"key", &value_of(1, 100)).unwrap();
+		assert!(
+			pointer.file_id as usize > extra,
+			"{what}: the first file this log ever writes must not reuse an id that a retained \
+			 torn file still holds (minted {}, highest torn id was {extra})",
+			pointer.file_id
+		);
+	}
+}
+
+/// `next_file_id` must never fall behind a torn file that is still on disk: once that file is no
+/// longer named `.vlog`, a cold reopen's listing of live files alone would otherwise let the
+/// counter mint an id a surviving `.vlog.torn` file already holds. Runs on the disk and over a
+/// fresh in-memory pool.
+#[test]
+fn a_new_vlog_file_never_reuses_the_id_of_a_torn_file_that_survived_a_cold_reopen() {
+	use crate::vfs::{CreateOpts, FileSystem, Fs};
+
+	if tfs::skip_listed() {
+		return;
+	}
+
+	fn write_bytes(fs: &dyn Fs, path: &Path, bytes: &[u8]) {
+		let file = fs.create_truncate(path, CreateOpts::default()).unwrap();
+		file.append(bytes).unwrap();
+		file.sync().unwrap();
+	}
+
+	fn torn_count(fs: &dyn Fs, dir: &Path) -> usize {
+		fs.read_dir(dir)
+			.unwrap()
+			.into_iter()
+			.filter(|entry| entry.name.to_string_lossy().ends_with(".vlog.torn"))
+			.count()
+	}
+
+	for (what, fs, dir) in [
+		("disk", crate::vfs::default_fs(), TempDir::new().unwrap().keep()),
+		("pool", FileSystem::memory().0, PathBuf::from("/db")),
+	] {
+		// Small enough that one entry already fills a file: the next append must roll over to a
+		// new one, which is the only thing that actually asks `next_file_id` for a fresh id.
+		let opts = Arc::new(Options {
+			path: dir.clone(),
+			vlog_max_file_size: 1,
+			fs: Arc::clone(&fs),
+			..Default::default()
+		});
+		fs.create_dir_all(&opts.vlog_dir()).unwrap();
+
+		// One real entry, in file 1, which is now past the size cap.
+		let pointer = {
+			let vlog = VLog::new_in(Arc::clone(&fs), Arc::clone(&opts)).unwrap();
+			let pointer = vlog.append(b"key", &value_of(1, 100)).unwrap();
+			vlog.sync().unwrap();
+			pointer
+		};
+		assert_eq!(pointer.file_id, 1, "{what}");
+
+		// A crash leaves file 2 without a complete header.
+		let header_len = VLogFileHeader::new(0, 0, 0).encode().len();
+		write_bytes(&*fs, &opts.vlog_file_path(2), &vec![0u8; header_len]);
+
+		// This open sets file 2 aside and advances past it in memory, but the process ends
+		// without appending anything: nothing durable remembers that 2 was ever handed out.
+		{
+			let vlog = VLog::new_in(Arc::clone(&fs), Arc::clone(&opts)).unwrap();
+			assert_eq!(torn_count(&*fs, &opts.vlog_dir()), 1, "{what}: file 2 was set aside");
+			drop(vlog);
+		}
+
+		// A cold reopen: only file 1 is live now, so its listing alone says nothing about id 2.
+		// File 1 is already past the size cap, so this append rolls over to a new file.
+		let vlog = VLog::new_in(Arc::clone(&fs), Arc::clone(&opts)).unwrap();
+		let next = vlog.append(b"next", &value_of(2, 100)).unwrap();
+		assert_ne!(
+			next.file_id, 2,
+			"{what}: the new file must not be minted under the id of a torn file that is still \
+			 on disk"
+		);
+		vlog.sync().unwrap();
+		assert_eq!(vlog.get(&pointer).unwrap(), value_of(1, 100), "{what}");
+		assert_eq!(vlog.get(&next).unwrap(), value_of(2, 100), "{what}");
+	}
+}
+
+/// A strict pool has a hard cap on how many files it keeps open at once, and a rename does not
+/// free the slot of the file it renames: every torn file a crash leaves kept it pinned, with
+/// nothing ever giving it back. Reclaiming the old ones frees their slots for the log's own
+/// files, which a pool this small would otherwise refuse outright.
+#[test]
+fn reclaiming_torn_vlog_files_frees_their_slots_in_a_strict_pool() {
+	use crate::vfs::pool::{PoolConfig, PoolFs};
+	use crate::vfs::{mem::MemRaw, CreateOpts, Fs};
+	use crate::vlog::TORN_VLOG_FILES_KEPT;
+
+	if tfs::skip_listed() {
+		return;
+	}
+
+	// Exactly as many slots as the threshold keeps, plus one: enough for what reclaim leaves
+	// behind, plus the log's own first file, and no more. All of them provisioned from the
+	// start, so creating a file up to that count never waits on a refill.
+	let max_files = TORN_VLOG_FILES_KEPT + 1;
+	let (fs, _report) = PoolFs::mount_sync(MemRaw::new(), PoolConfig::strict(max_files, max_files))
+		.expect("mount a strict pool");
+	let fs: Arc<dyn Fs> = fs;
+
+	let opts = Arc::new(Options {
+		path: PathBuf::from("/db"),
+		vlog_max_file_size: 1 << 20,
+		fs: Arc::clone(&fs),
+		..Default::default()
+	});
+	fs.create_dir_all(&opts.vlog_dir()).unwrap();
+
+	// Fill every slot the pool has with an already-torn file: as many as the pool allows, and
+	// more than the retention threshold alone. Nothing here is live, so there is still no file
+	// for the log's own write to use.
+	for id in 1..=max_files {
+		fs.create_truncate(
+			&opts.vlog_dir().join(format!("{id:020}.vlog.torn")),
+			CreateOpts::default(),
+		)
+		.unwrap();
+	}
+
+	// The pool is at its cap: one more file, of any name, is refused.
+	let probe = fs
+		.create_truncate(&opts.vlog_dir().join("probe"), CreateOpts::default())
+		.map(|_| ())
+		.map_err(|e| (crate::vfs::is_pool_full(&e) || crate::vfs::is_pool_exhausted(&e), e));
+	assert!(matches!(&probe, Err((true, _))), "set up: the pool has no free slot left, {probe:?}");
+
+	// Opening the log reclaims every torn file past the threshold, freeing their slots, so its
+	// own first file, which needs one of its own, is not refused.
+	let vlog = VLog::new_in(Arc::clone(&fs), Arc::clone(&opts)).unwrap();
+	assert_eq!(
+		fs.read_dir(&opts.vlog_dir())
+			.unwrap()
+			.into_iter()
+			.filter(|entry| entry.name.to_string_lossy().ends_with(".vlog.torn"))
+			.count(),
+		TORN_VLOG_FILES_KEPT,
+		"the open actually removed the excess torn files, not merely closed a handle"
+	);
+	let pointer = vlog
+		.append(b"key", &value_of(1, 100))
+		.expect("a slot a reclaimed torn file held is free for the log's own file");
+	vlog.sync().unwrap();
+	assert_eq!(vlog.get(&pointer).unwrap(), value_of(1, 100));
+}
+
+/// The control for the test above: with only as many slots as the threshold keeps, and that many
+/// torn files already there, there is nothing to reclaim, so the log's own first file is refused
+/// exactly as it would be without the fix. This is what rules out the slot in the test above
+/// having come from something the open does regardless of reclaiming anything, such as closing a
+/// handle it only opened to look.
+#[test]
+fn a_strict_pool_with_nothing_past_the_threshold_to_reclaim_still_refuses_a_new_file() {
+	use crate::vfs::pool::{PoolConfig, PoolFs};
+	use crate::vfs::{mem::MemRaw, CreateOpts, Fs};
+	use crate::vlog::TORN_VLOG_FILES_KEPT;
+
+	if tfs::skip_listed() {
+		return;
+	}
+
+	// Exactly as many slots as the threshold keeps, and no more: nothing for the reclaim to do,
+	// and no slack for the log's own file either.
+	let max_files = TORN_VLOG_FILES_KEPT;
+	let (fs, _report) = PoolFs::mount_sync(MemRaw::new(), PoolConfig::strict(max_files, max_files))
+		.expect("mount a strict pool");
+	let fs: Arc<dyn Fs> = fs;
+
+	let opts = Arc::new(Options {
+		path: PathBuf::from("/db"),
+		vlog_max_file_size: 1 << 20,
+		fs: Arc::clone(&fs),
+		..Default::default()
+	});
+	fs.create_dir_all(&opts.vlog_dir()).unwrap();
+
+	for id in 1..=max_files {
+		fs.create_truncate(
+			&opts.vlog_dir().join(format!("{id:020}.vlog.torn")),
+			CreateOpts::default(),
+		)
+		.unwrap();
+	}
+
+	// The open itself succeeds: there is nothing wrong with the directory, only nothing spare in
+	// it. Reclaim finds nothing past the threshold to remove.
+	let vlog = VLog::new_in(Arc::clone(&fs), Arc::clone(&opts)).unwrap();
+	assert_eq!(
+		fs.read_dir(&opts.vlog_dir())
+			.unwrap()
+			.into_iter()
+			.filter(|entry| entry.name.to_string_lossy().ends_with(".vlog.torn"))
+			.count(),
+		max_files,
+		"nothing was past the threshold, so nothing was reclaimed"
+	);
+
+	// With nothing reclaimed, every slot stays spoken for: the log's own first file is refused,
+	// not made at the cost of one of the retained torn files.
+	let error = vlog.append(b"key", &value_of(1, 100)).err().unwrap();
+	assert!(
+		matches!(error, crate::Error::FilePoolExhausted) || error.is_storage_full(),
+		"{error:?}"
+	);
+}
+
+/// `reload` goes through `load_files` exactly as the first open does, and two files that collide
+/// on a torn name because they share an id (`<id>.vlog.torn` and `<id>.vlog.torn.1`, see
+/// `sealed::set_aside_in`) must not confuse the id floor: whichever of the two `parse_torn_vlog_name`
+/// is asked about first, the floor they together set is the same, and the id is still never used
+/// again.
+#[test]
+fn a_reload_accounts_for_torn_files_that_share_an_id_through_a_collision_suffix() {
+	if tfs::skip_listed() {
+		return;
+	}
+
+	let temp_dir = TempDir::new().unwrap();
+	let opts = Arc::new(Options {
+		path: temp_dir.path().to_path_buf(),
+		vlog_max_file_size: 1 << 20,
+		..Default::default()
+	});
+	crate::test::tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
+
+	let pointer = {
+		let vlog = VLog::new(Arc::clone(&opts)).unwrap();
+		let pointer = vlog.append(b"key", &value_of(1, 100)).unwrap();
+		vlog.sync().unwrap();
+		pointer
+	};
+	assert_eq!(pointer.file_id, 1);
+
+	let vlog = VLog::new(Arc::clone(&opts)).unwrap();
+	assert_eq!(vlog.get(&pointer).unwrap(), value_of(1, 100));
+
+	// A restore brings in a directory that already holds two torn files under the same id, one
+	// of them set aside a second time because the plain name was already taken.
+	let held = vlog.hold_writer();
+	std::fs::write(opts.vlog_dir().join("00000000000000000005.vlog.torn"), b"junk").unwrap();
+	std::fs::write(opts.vlog_dir().join("00000000000000000005.vlog.torn.1"), b"junk").unwrap();
+	vlog.reload(held).unwrap();
+
+	assert_eq!(
+		vlog.next_file_id.load(Ordering::SeqCst),
+		6,
+		"the id floor is past both, not just one of them"
+	);
+	let pointer = vlog.append(b"key", &value_of(2, 100)).unwrap();
+	assert_eq!(pointer.file_id, 6, "the new file does not land on the id either of them holds");
+	vlog.sync().unwrap();
+	assert_eq!(vlog.get(&pointer).unwrap(), value_of(2, 100));
+}
+
 /// Only the start of the header of the newest file is taken for a header that was cut off:
 /// anything else, or such a start in an older file, may be damage, and is an error that leaves
 /// the directory as it is.

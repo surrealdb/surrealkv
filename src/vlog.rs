@@ -1394,6 +1394,70 @@ fn entry_bound(
 	Ok(None)
 }
 
+/// How many torn value-log files a log keeps, of all of them together: the newest, by id, on
+/// every file system. A torn file holds no entry that is durable (see [`VLogFileHeader::is_torn`]
+/// and [`sealed::is_torn`]), so none of them needs to stay for recovery; what is kept, as for
+/// [`wal::recovery::QUARANTINE_COPIES_KEPT`](crate::wal::recovery::QUARANTINE_COPIES_KEPT), is a
+/// trail for someone looking into repeated crashes, not evidence recovery depends on.
+pub(crate) const TORN_VLOG_FILES_KEPT: usize = 3;
+
+/// The id a torn value-log file's name was made of, if `name` is one: `<id>.vlog.torn`, or
+/// `<id>.vlog.torn.1` and so on if the plain name was already taken (see
+/// [`sealed::set_aside_in`]).
+fn parse_torn_vlog_name(name: &str) -> Option<u32> {
+	let id_part = match name.strip_suffix(".vlog.torn") {
+		Some(id_part) => id_part,
+		None => {
+			let (base, attempt) = name.rsplit_once(".vlog.torn.")?;
+			attempt.parse::<u32>().ok()?;
+			base
+		}
+	};
+	(id_part.len() == 20 && id_part.bytes().all(|b| b.is_ascii_digit()))
+		.then(|| id_part.parse().ok())
+		.flatten()
+}
+
+/// The torn value-log files of `dir`, with the id of the file each was made of.
+fn torn_vlog_files_in(fs: &dyn Fs, dir: &Path) -> Result<Vec<(u32, PathBuf)>> {
+	let mut found = Vec::new();
+	for entry in fs.read_dir(dir)? {
+		if entry.kind != vfs::EntryKind::File {
+			continue;
+		}
+		let name = entry.name.to_string_lossy();
+		if let Some(id) = parse_torn_vlog_name(&name) {
+			found.push((id, dir.join(&entry.name)));
+		}
+	}
+	Ok(found)
+}
+
+/// Removes the torn value-log files of `dir` but the [`TORN_VLOG_FILES_KEPT`] newest by id.
+/// Called once a log has opened and set aside every file a crash left it without a header for
+/// this time, see [`VLog::load_files`]. Best effort, like
+/// [`VLog::cleanup_obsolete_files`](VLog::cleanup_obsolete_files): a file that could not be
+/// removed is found again, and removed, by the next open, so a failure here does not fail the
+/// open.
+fn reclaim_torn_vlog_files_in(fs: &dyn Fs, dir: &Path) {
+	let mut found = match torn_vlog_files_in(fs, dir) {
+		Ok(found) => found,
+		Err(e) => {
+			tracing::warn!("Could not list the torn VLog files of {dir:?}: {e}");
+			return;
+		}
+	};
+	// Newest first, by id: ids are never reused, so this is also creation order.
+	found.sort_by(|(a, _), (b, _)| b.cmp(a));
+	for (_, path) in found.into_iter().skip(TORN_VLOG_FILES_KEPT) {
+		match fs.remove_file(&path) {
+			Ok(()) => tracing::debug!("Removed the old torn VLog file {path:?}"),
+			Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+			Err(e) => tracing::warn!("Could not remove the torn VLog file {path:?}: {e}"),
+		}
+	}
+}
+
 impl VLog {
 	/// The encryption the log's files are sealed with, if it is configured with any.
 	fn encryption(&self) -> Option<&EncryptionContext> {
@@ -1548,12 +1612,11 @@ impl VLog {
 
 	/// Pre-fills the file_handles cache with all existing VLog files
 	fn prefill_file_handles(&self) -> Result<()> {
+		// `load_files` sets `next_file_id` itself, past every id it found, live or torn: it is
+		// the only one that knows about both.
 		let Some(newest) = self.load_files()? else {
 			return Ok(());
 		};
-
-		// Found existing files, set next_file_id to one past the highest existing file ID
-		self.next_file_id.store(newest.id + 1, Ordering::SeqCst);
 
 		if newest.sealed {
 			// A sealed file is never appended to again. Its key is the one of the writer that
@@ -1600,8 +1663,10 @@ impl VLog {
 	/// the crash cut off before its header was complete, or whose header is all zeros, and which
 	/// therefore holds no entry that is durable. An fsync of a file writes its header with its
 	/// entries, and a file is synced before a table, or a segment of the log that another
-	/// follows, names an entry of it. Such a file is set aside under another name, never
-	/// deleted. If it is the newest file, it is reported as one that is never appended to and is
+	/// follows, names an entry of it. Such a file is set aside under another name; the newest few
+	/// of all the files this is ever done to are kept, for someone to look into, and the others
+	/// are reclaimed here (see [`reclaim_torn_vlog_files_in`]). If it is the newest file, it is
+	/// reported as one that is never appended to and is
 	/// no longer there, so that its id is not used again: the id of any other file is below the
 	/// newest, and is not used again either. Only a header that is no longer than a header and is
 	/// incomplete, or that is all zeros, counts: whatever else fails to authenticate is an error
@@ -1620,25 +1685,48 @@ impl VLog {
 			Err(e) => return Err(e.into()),
 		};
 
-		// Which file is the newest has to be known before any is opened
+		// Which file is the newest has to be known before any is opened. A file that an earlier
+		// open already set aside is not found here, by name, but its id must still count towards
+		// the next one: nothing else remembers that it was ever handed out, and the file itself,
+		// kept for `TORN_VLOG_FILES_KEPT`, is still on disk under its `.torn` name.
 		let mut found = Vec::new();
-		for entry in entries {
+		let mut already_torn_max_id = None;
+		for entry in &entries {
 			// Look for VLog files, by name and not by type, as it always was. The length is the
 			// length of the file that the path leads to: where the listing took it from the entry
 			// (`DirEntry::metadata`, which does not follow a link) a link gave the length of the
 			// link itself, which is not the length of anything in the log. A link to nothing
 			// fails here with `NotFound`, where it failed at the open that followed.
-			if let Some(file_id) = self.opts.extract_vlog_file_id(&entry.name.to_string_lossy()) {
+			let name = entry.name.to_string_lossy();
+			if let Some(file_id) = self.opts.extract_vlog_file_id(&name) {
 				let path = self.path.join(&entry.name);
 				let len = self.fs.file_len(&path)?;
 				found.push((file_id, path, len));
+			} else if let Some(file_id) = parse_torn_vlog_name(&name) {
+				already_torn_max_id = already_torn_max_id.max(Some(file_id));
 			}
 		}
 		// A listing has no order.
 		found.sort_by_key(|(file_id, ..)| *file_id);
-		let Some(newest_id) = found.iter().map(|(file_id, ..)| *file_id).max() else {
-			return Ok(None);
-		};
+		let newest_id = found.iter().map(|(file_id, ..)| *file_id).max();
+
+		// One past the highest id this ever handed out, whether a live file still carries it or
+		// only a torn one, kept, still does: an id that `next_file_id` mints again while that
+		// file is still there would collide with it. A directory with neither holds none, and
+		// numbers its first file from 1, as it always did. The highest id a `u32` can name is
+		// refused rather than wrapped: a wrapped id of 0 is not a file name this ever made, and
+		// would be free to collide with whatever this log does next. Checked here, before
+		// anything below renames or removes a file, so a refusal leaves the directory as it was,
+		// like every other failure of this function does.
+		let next = [newest_id, already_torn_max_id].into_iter().flatten().max();
+		let next = next.map_or(Ok(1), |id| {
+			id.checked_add(1).ok_or_else(|| {
+				Error::Other(format!(
+					"VLog file id {id} is the highest a file can be named: no id is left for \
+					 the next one"
+				))
+			})
+		})?;
 
 		let mut newest = None;
 		// The files that a crash left without a complete header. Nothing is renamed until every
@@ -1650,7 +1738,7 @@ impl VLog {
 		let mut file_handles = self.file_handles.write();
 
 		for (file_id, file_path, file_size) in found {
-			let is_newest = file_id == newest_id;
+			let is_newest = Some(file_id) == newest_id;
 			// A file of an encrypted log has its header synced when it is made: only the newest
 			// can be cut off in it.
 			let can_be_torn = is_newest || self.encryption().is_none();
@@ -1725,14 +1813,17 @@ impl VLog {
 		// Every other file opened, so no key was refused and nothing is in doubt but these files.
 		for (file_id, file_path) in &torn {
 			self.set_aside(*file_id, file_path)?;
-			if *file_id == newest_id {
+			if Some(*file_id) == newest_id {
 				newest = Some(Newest {
-					id: newest_id,
+					id: *file_id,
 					sealed: true,
 					file: None,
 				});
 			}
 		}
+		reclaim_torn_vlog_files_in(&*self.fs, &self.path);
+
+		self.next_file_id.store(next, Ordering::SeqCst);
 
 		Ok(newest)
 	}
@@ -1853,8 +1944,8 @@ impl VLog {
 			self.generation.store(crate::cache::next_instance_id(), Ordering::SeqCst);
 		}
 
-		let highest = self.load_files()?;
-		self.next_file_id.store(highest.map_or(1, |newest| newest.id + 1), Ordering::SeqCst);
+		// `load_files` sets `next_file_id` itself, past every id it found, live or torn.
+		self.load_files()?;
 		self.active_writer_id.store(0, Ordering::SeqCst);
 		// The files were copied in, and neither they nor the directory entries are known to be
 		// on disk: the first sync covers them.

@@ -834,7 +834,8 @@ fn a_name_the_log_set_aside_is_not_read_as_a_file() {
 	std::fs::write(opts.vlog_dir().join("00000000000000000009.vlog.torn"), b"junk").unwrap();
 	let vlog = VLog::new(Arc::clone(&opts)).unwrap();
 	assert_eq!(vlog.get(&pointers[0]).unwrap(), b"value");
-	assert_eq!(vlog.next_file_id.load(Ordering::SeqCst), 4);
+	// Not 4: id 9 is still on disk under its `.torn` name, and must not be handed out again.
+	assert_eq!(vlog.next_file_id.load(Ordering::SeqCst), 10);
 }
 
 #[test]
