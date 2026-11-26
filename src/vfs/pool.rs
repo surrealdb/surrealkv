@@ -3093,6 +3093,20 @@ mod tests {
 	}
 
 	#[test]
+	fn closing_the_pool_persists_an_unsynced_file_creation() {
+		let (fs, raw) = strict_pool(1, 8);
+		let path = p("/new");
+		fs.create_new(path, CreateOpts::default()).unwrap();
+		assert!(raw.unflushed_ops() > 0, "the new file header is still pending");
+
+		fs.pool().unwrap().close().unwrap();
+
+		let image = raw.crash(CrashMode::LoseUnsynced);
+		let reopened = mounted(&image, PoolConfig::strict(0, 8));
+		assert!(reopened.exists(path));
+	}
+
+	#[test]
 	fn dropping_the_last_reference_closes_every_handle() {
 		let (fs, raw) = strict_pool(4, 16);
 		assert!(raw.open_handles() >= 5);
