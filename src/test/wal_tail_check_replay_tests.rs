@@ -134,26 +134,56 @@ fn a_log_whose_values_are_there_is_replayed_whole_by_the_serial_and_the_parallel
 }
 
 #[test]
-fn the_last_segment_ends_before_the_first_value_that_is_missing_whatever_the_number_of_segments() {
+fn salvage_ends_the_last_segment_before_the_first_value_that_is_missing_whatever_the_number_of_segments(
+) {
 	for segments in [1, 3] {
-		for mode in [WalRecoveryMode::SalvageValidPrefix, WalRecoveryMode::TolerateTornTail] {
-			let dir = TempDir::new().unwrap();
-			let (vlog, pointers) = build(dir.path(), segments);
-			// The value log ends in the middle of the seventh entry, which is in the last segment.
-			cut_value_log(dir.path(), &pointers[6], 20);
+		let dir = TempDir::new().unwrap();
+		let (vlog, pointers) = build(dir.path(), segments);
+		// The value log ends in the middle of the seventh entry, which is in the last segment.
+		cut_value_log(dir.path(), &pointers[6], 20);
 
-			let replayed = replay(dir.path(), Some(&vlog), mode).unwrap();
-			let what = format!("{segments} segments, {mode:?}");
-			assert_eq!(replayed.keys(), (0..6).collect::<Vec<_>>(), "{what}");
-			assert_eq!(replayed.max_seq, Some(6), "{what}: the last record that is kept");
-			assert_eq!(replayed.report.records_dropped, 3, "{what}");
-			assert_eq!(replayed.report.quarantined_files.len(), 1, "{what}");
-			assert!(replayed.report.bytes_trimmed > 0, "{what}");
+		let mode = WalRecoveryMode::SalvageValidPrefix;
+		let replayed = replay(dir.path(), Some(&vlog), mode).unwrap();
+		let what = format!("{segments} segments, {mode:?}");
+		assert_eq!(replayed.keys(), (0..6).collect::<Vec<_>>(), "{what}");
+		assert_eq!(replayed.max_seq, Some(6), "{what}: the last record that is kept");
+		assert_eq!(replayed.report.records_dropped, 3, "{what}");
+		assert_eq!(replayed.report.quarantined_files.len(), 1, "{what}");
+		assert!(replayed.report.bytes_trimmed > 0, "{what}");
 
-			// The log that is left holds what was kept, and replays whole.
-			let again = replay(dir.path(), None, WalRecoveryMode::AbsoluteConsistency).unwrap();
-			assert_eq!(again.keys(), (0..6).collect::<Vec<_>>(), "{what}");
-		}
+		// The log that is left holds what was kept, and replays whole.
+		let again = replay(dir.path(), None, WalRecoveryMode::AbsoluteConsistency).unwrap();
+		assert_eq!(again.keys(), (0..6).collect::<Vec<_>>(), "{what}");
+	}
+}
+
+/// `build` closes the WAL, whose trailing mark then says the whole segment was synced (see
+/// `Writer::close_with_trailing_mark`): the default mode refuses the missing value below it,
+/// whatever record follows, rather than cutting it as `SalvageValidPrefix` does above.
+#[test]
+fn the_default_mode_refuses_the_last_segment_whatever_the_number_of_segments() {
+	for segments in [1, 3] {
+		let dir = TempDir::new().unwrap();
+		let (vlog, pointers) = build(dir.path(), segments);
+		cut_value_log(dir.path(), &pointers[6], 20);
+
+		let mode = WalRecoveryMode::TolerateTornTail;
+		let what = format!("{segments} segments, {mode:?}");
+		let error = replay(dir.path(), Some(&vlog), mode)
+			.err()
+			.unwrap_or_else(|| panic!("{what}: the replay succeeded"));
+		let text = error.to_string();
+		assert!(text.contains("sync mark"), "{what}: {text}");
+		assert!(
+			text.contains("Automatic truncation could discard durable data"),
+			"{what}: {text}"
+		);
+
+		// The log is untouched, and replays whole under the strictest mode too.
+		let again = replay(dir.path(), Some(&vlog), WalRecoveryMode::AbsoluteConsistency)
+			.err()
+			.unwrap_or_else(|| panic!("{what}: the replay succeeded"));
+		assert!(again.to_string().contains("value log"), "{what}: {again}");
 	}
 }
 

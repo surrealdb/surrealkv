@@ -1,12 +1,12 @@
 //! The check of the last segment of an encrypted log against the value log.
 //!
 //! What a sealed entry can be held to without the key is its length and the checksum of what is
-//! stored, which the check does for it. The records of the segment are authenticated when they are
-//! read, so the modes act as they do for a plaintext log: the default mode ends the segment before
-//! the first record whose value is missing if no value after it is there, and refuses a hole,
-//! `SalvageValidPrefix` ends it before the record whatever follows, and `AbsoluteConsistency` fails
-//! the open. A segment that is cut is written again under a new salt, and the one that it was is
-//! kept.
+//! stored, which the check does for it. A sealed segment carries no plaintext sync marks, so
+//! `synced_to` can never tell a value that was synced from one that was not: the default mode
+//! refuses a missing value whatever follows it, as it does a plaintext segment without marks.
+//! `SalvageValidPrefix` ends the segment before the record whatever follows, and
+//! `AbsoluteConsistency` fails the open. A segment that is cut is written again under a new salt,
+//! and the one that it was is kept.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -111,14 +111,8 @@ fn keys(tree: &Tree, kept: usize, what: &str) {
 	}
 }
 
-/// What the three modes do with an encrypted log whose value log is damaged from `first_failed`:
-/// `lost_its_tail` is whether no value after that record is in the value log.
-async fn the_modes(
-	suite: CipherSuite,
-	damage: fn(&Path, &[(Batch, usize)]),
-	first_failed: usize,
-	lost_its_tail: bool,
-) {
+/// What the three modes do with an encrypted log whose value log is damaged from `first_failed`.
+async fn the_modes(suite: CipherSuite, damage: fn(&Path, &[(Batch, usize)]), first_failed: usize) {
 	let what = format!("{suite:?}, from record {first_failed}");
 	let enc = context(suite);
 	let (_dir, path) = crashed(&enc).await;
@@ -158,8 +152,9 @@ async fn the_modes(
 		copy_dir(&path, &db);
 		let before = snapshot(copy.path());
 
-		// The default mode ends the segment where the value log lost its tail, and refuses a hole.
-		if mode == WalRecoveryMode::TolerateTornTail && !lost_its_tail {
+		// The default mode always refuses a missing value of a sealed segment: nothing in it can
+		// say whether the value was synced, whatever follows the record that failed.
+		if mode == WalRecoveryMode::TolerateTornTail {
 			let error = Tree::new(options(&db, &enc, mode))
 				.err()
 				.unwrap_or_else(|| panic!("{what}: the open succeeded"));
@@ -206,7 +201,8 @@ async fn the_modes(
 }
 
 #[test(tokio::test)]
-async fn an_encrypted_log_whose_value_log_lost_its_tail_ends_before_the_first_missing_value() {
+async fn an_encrypted_log_whose_value_log_lost_its_tail_is_refused_by_the_default_mode_and_cut_by_salvage(
+) {
 	within("sealed, cut value log", async {
 		for suite in SUITES {
 			the_modes(
@@ -218,7 +214,6 @@ async fn an_encrypted_log_whose_value_log_lost_its_tail_ends_before_the_first_mi
 					std::fs::write(&file, &bytes[..pointer.offset as usize + 10]).unwrap();
 				},
 				8,
-				true,
 			)
 			.await;
 		}
@@ -241,7 +236,6 @@ async fn an_encrypted_log_whose_value_log_has_a_hole_is_refused_by_the_default_m
 				std::fs::write(&file, &bytes).unwrap();
 			},
 			3,
-			false,
 		)
 		.await;
 	})
